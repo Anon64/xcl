@@ -4978,6 +4978,14 @@ static uint xcl_cap = 1u << 16;
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
                 load_sgprs(&mut h);
+                // a folded dispatch (`IO_GROUP_LIMIT`): the console's group in X, the groups
+                // past its count left out (the whole group returns)
+                let _ = writeln!(
+                    h,
+                    "    uint3 xcl_gid = gid;\n    {{\n        uint xcl_gl = io.Load({}u);\n        if (xcl_gl != 0u) {{\n            uint xcl_f = gid.x + gid.y * {}u;\n            if (xcl_f >= xcl_gl) return;\n            xcl_gid = uint3(xcl_f, 0u, gid.z);\n        }}\n    }}",
+                    super::IO_GROUP_LIMIT * 4,
+                    super::FOLD_X
+                );
                 // a program with a loop: the dispatch's share of loop passes for a group
                 // (`IO_LOOP_BUDGET`, 0 = not known) among its threads
                 if body.contains(LOOP_CAP_INIT) {
@@ -4994,7 +5002,7 @@ static uint xcl_cap = 1u << 16;
                 for (k, c) in ["x", "y", "z"].iter().enumerate() {
                     if cs.tgid[k] {
                         if sg.contains(&next) {
-                            let _ = writeln!(h, "    {} = gid.{c};", sname(next).unwrap());
+                            let _ = writeln!(h, "    {} = xcl_gid.{c};", sname(next).unwrap());
                         }
                         next += 1;
                     }
