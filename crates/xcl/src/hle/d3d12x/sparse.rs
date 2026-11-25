@@ -2664,6 +2664,23 @@ pub fn remapped(tiles: &[usize]) {
     REMAPPING.store(true, Ordering::Release);
 }
 
+/// The physical page the GPU-view tiles `tiles` show moved from `from` to `to` (both 64 KiB
+/// aligned; `whole`: its bytes were copied there): the tiles linked over `from` follow it now,
+/// with their video memory (`State::retarget`). Called on the moving thread (kernelx, AWAY held)
+/// before the memory at `from` can go. The state's lock only when tiles show `from` (it gives way
+/// to submits).
+pub unsafe fn moved(tiles: &[usize], from: usize, to: usize, whole: bool) {
+    if tiles.is_empty() || from == 0 || to == 0 || !lock_sources(&SOURCES).shows(from, from + TILE) {
+        return;
+    }
+    let mut g = lock_in_turn(&STATE, &SUBMITS_WAITING);
+    forget_released(&mut g);
+    let Some(s) = g.as_mut() else { return };
+    for &w in tiles {
+        s.retarget(w, from, to, whole);
+    }
+}
+
 /// The GPU-view tiles linked again so far: [to show what the page mappings put there (or nothing),
 /// that followed their page].
 static VIEW_TILES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -3071,6 +3088,32 @@ impl State {
             Under::NoView => !self.unlink_mirror(*g),
         });
         self.later.extend(want);
+    }
+
+    /// Window tile `w`, linked over `from`, follows its page to `to` (`moved`): the link moves. With
+    /// video memory and `whole` (the page's 64 KiB were copied to `to`) its entry keeps its pool
+    /// tile, gen and sent hashes – nothing is cleared or filled: the known write kernelx notes at
+    /// `to` has the next scan send what differs, and a copy back recorded before lands at `to`.
+    /// Not `whole` (a page never used, not committed at `to`): its video memory is parked and it
+    /// waits to be filled from `to` (`later`), as one with no video memory does.
+    fn retarget(&mut self, w: usize, from: usize, to: usize, whole: bool) {
+        if self.mirror_src.get(&w) != Some(&from) || from == to {
+            return;
+        }
+        self.unlink_kept(w);
+        self.link_mirror(w, to);
+        VIEW_TILES[1].fetch_add(1, Ordering::Relaxed);
+        match self.mapped.get_mut(&w).filter(|e| e.src == from) {
+            Some(e) if whole => {
+                e.src = to;
+                e.holes = 0;
+            }
+            Some(_) => {
+                self.park(w);
+                self.later.push_back((w, to));
+            }
+            None => self.later.push_back((w, to)),
+        }
     }
 
     /// The tiles whose GPU-view page the queue's page mappings changed (`remaps`, from `remapped`;
@@ -5749,6 +5792,68 @@ mod tests {
             assert_eq!(crate::hle::kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
             v.take_remaps(2);
             v.submit(&[]);
+        }
+    }
+
+    /// A tile follows its page when the page moves (`retarget`): the link moves, and its pool
+    /// tile, gen and sent hashes stay, with nothing cleared or filled; a scan of the new place
+    /// sends nothing when its bytes are the same and the chunk written when they differ; a copy
+    /// back recorded before the move lands at the new place; a page never used, not committed at
+    /// its new place, gives the video memory up.
+    #[test]
+    fn a_tile_follows_its_page_without_being_filled_again() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+        unsafe {
+            let Some(mut v) = Views::new(173) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let Some((mut pages, h)) = home_pages(1) else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
+            let (w, buf) = (v.w, v.buf.clone());
+            let bytes = fill_tile(h, 70);
+            map_pages_at(w, &[[0, 0, 1]], h, 1);
+            v.ask(1);
+            v.submit(&[]);
+            assert!(v.gpu_bytes(&buf, 0, TILE) == bytes, "the page at its home");
+            // its bytes copied to another place (as kernelx moves a page), and the tile follows
+            let r = VirtualAlloc(std::ptr::null(), 2 * TILE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(r != 0 && r % TILE == 0 && !VirtualAlloc(r as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            std::ptr::copy_nonoverlapping(h as *const u8, r as *mut u8, TILE);
+            let e = &v.s.mapped[&w];
+            let (pool, gen, sent) = (e.pool, e.gen, e.sent.clone());
+            let (fills, followed) = (v.s.counts.fills, page_tiles()[1]);
+            v.s.retarget(w, h, r, true);
+            let e = &v.s.mapped[&w];
+            assert_eq!((e.src, e.holes, e.pool, e.gen), (r, 0, pool, gen), "the link moves, the video memory stays");
+            assert!(e.sent == sent, "and what was sent");
+            assert_eq!(v.s.mirror_src[&w], r);
+            assert!(!v.s.mirrors.contains_key(&h) && v.s.mirrors[&r] == vec![w]);
+            assert!(v.s.fill.is_empty() && v.s.later.is_empty() && v.s.to_zero.range((w, 0)..(w + TILE, 0)).next().is_none(), "nothing cleared or filled");
+            assert!(page_tiles()[1] > followed);
+            v.s.retarget(w, h, r + TILE, true);
+            assert_eq!(v.s.mirror_src[&w], r, "a tile linked elsewhere stays");
+
+            // the new place's pages written (kernelx's known write): the same bytes, nothing sent
+            let dirty: Vec<usize> = (0..PAGES_PER_TILE).map(|i| r + i * PAGE).collect();
+            v.submit(&dirty);
+            assert_eq!(v.s.counts.fills, fills, "no fill");
+            assert!(v.s.mapped[&w].sent == sent, "nothing sent");
+            // a chunk that differs goes up
+            *((r + 3 * PAGE + 0x40) as *mut u64) ^= 0xFFFF;
+            v.submit(&[r + 3 * PAGE]);
+            assert!(v.s.mapped[&w].sent != sent);
+            assert!(v.gpu_bytes(&buf, 0, TILE) == std::slice::from_raw_parts(r as *const u8, TILE), "the chunk written");
+            // a copy back recorded before the move lands at the new place
+            let back = [0x5Au8; 256];
+            v.s.copy_back(back.as_ptr() as *mut u8, w + 0x200, 0, 256, gen);
+            assert_eq!(std::slice::from_raw_parts((r + 0x200) as *const u8, 256), &back[..]);
+
+            // a page never used: not committed at its new place, no video memory for it
+            v.s.retarget(w, r, r + TILE, false);
+            assert!(!v.s.mapped.contains_key(&w) && v.s.parked.contains_key(&w) && v.s.later.contains(&(w, r + TILE)));
+            v.submit(&[]);
+            assert!(!v.s.mapped.contains_key(&w) && v.s.mirror_src[&w] == r + TILE, "linked, with no video memory until its page is written");
+
+            assert_eq!(crate::hle::kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            v.take_remaps(1);
+            assert_ne!(VirtualFree(r as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 

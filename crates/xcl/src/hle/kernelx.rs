@@ -829,9 +829,13 @@ unsafe fn page_placed(page: usize, at: usize, home: bool, whole: bool) {
     }
     let tile = at != 0 && (home || freeing_is_seen(at));
     let Some((from, shown)) = mirrors::page_at(page, at, tile) else { return };
-    // (its bytes appear or go: a change of what the tiles over it show)
-    if from == 0 || at == 0 {
+    // (its bytes appear or go: a change of what the tiles over it show; and a place no tile may
+    // show: they are linked again, to nothing)
+    if from == 0 || at == 0 || !tile {
         crate::hle::d3d12x::sparse::remapped(&shown);
+    } else {
+        // (the tiles over the place it left follow it, before that memory can go)
+        crate::hle::d3d12x::sparse::moved(&shown, from, at, whole);
     }
     if whole {
         crate::hle::d3d12x::title_textures::note_known_write(at, PHYS_PAGE);
