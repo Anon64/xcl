@@ -47,14 +47,21 @@ fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
     }
     // the text before the start's barrier, and after it
     let at_start = |d: &str| d.split_at(d.find("@dx.op.barrier(i32 80, i32 9)").expect("the start's barrier")).0.to_string();
+    // the value (`%N`) the first line of `pre` that `hit` accepts defines
+    fn def(pre: &str, hit: impl Fn(&str) -> bool) -> Option<String> {
+        pre.lines().find(|l| hit(l)).and_then(|l| l.trim().split_once(" = ")).map(|(n, _)| n.to_string())
+    }
+    // a zero stored through that address in `pre`
+    fn zeroed(pre: &str, at: Option<String>) -> bool {
+        at.is_some_and(|p| pre.contains(&format!("store i32 0, i32 addrspace(3)* {p},")))
+    }
     // without LDS: slots and counters of their own (one console wave: 4 slot words, 2 counters),
     // the counters zeroed before the start's barrier
     let d = dis(64, &code).unwrap();
     assert!(d.contains("@xcl_xs = external addrspace(3) global [4 x i32]") && d.contains("@xcl_xc = external addrspace(3) global [2 x i32]"), "the spin storage:
 {d}");
     let pre = at_start(&d);
-    let zero = pre.find("addrspace(3)* @xcl_xc, i32 0, i32 %").map(|i| &pre[i..]);
-    assert!(zero.is_some_and(|z| z.contains("store i32 0,")), "the counters zeroed before the start's barrier:
+    assert!(zeroed(&pre, def(&pre, |l| l.contains("addrspace(3)* @xcl_xc, i32 0, i32 %"))), "the counters zeroed before the start's barrier:
 {d}");
     // a mesh program's compute pass of one console wave (48 or 64 threads) exchanges the same way
     for threads in [48, 64] {
@@ -65,8 +72,7 @@ fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
         assert!(d.contains("@xcl_xc = external addrspace(3) global [2 x i32]") && d.matches("atomicrmw").count() >= 3, "mesh, {threads} threads: the exchange's counters:
 {d}");
         let pre = at_start(&d);
-        let zero = pre.find("addrspace(3)* @xcl_xc, i32 0, i32 %").map(|i| &pre[i..]);
-        assert!(zero.is_some_and(|z| z.contains("store i32 0,")), "mesh, {threads} threads: the counters zeroed before the start's barrier:
+        assert!(zeroed(&pre, def(&pre, |l| l.contains("addrspace(3)* @xcl_xc, i32 0, i32 %"))), "mesh, {threads} threads: the counters zeroed before the start's barrier:
 {d}");
     }
     // with the program's LDS the counters live in its top words
@@ -84,7 +90,9 @@ fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
     // 8192 - 4 - 2 - 1 = 8185), and the program's LDS clamped below the slots (8184)
     let pre = at_start(&d);
     let rest = &d[pre.len()..];
-    assert!(pre.contains("@xcl_lds, i32 0, i32 8191") && pre.contains(", 8189") && pre[pre.find(", 8189").unwrap()..].contains("store i32 0,"), "the top word and the counters zeroed before the start's barrier:
+    let index = def(&pre, |l| l.ends_with(", 8189"));
+    let counter = index.and_then(|i| def(&pre, |l| l.contains("@xcl_lds, i32 0, i32 ") && l.ends_with(&format!(" {i}"))));
+    assert!(pre.contains("@xcl_lds, i32 0, i32 8191") && zeroed(&pre, counter), "the top word and the counters zeroed before the start's barrier:
 {d}");
     assert!(rest.contains(", 8185"), "the slots from word 8185:
 {d}");
