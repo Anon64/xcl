@@ -148,6 +148,14 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
     Some(l)
 }
 
+/// The addresses of the root views (root CBV / SRV / UAV) among `args`, packed by `l`.
+pub(super) fn root_views<'a>(l: &'a Layout, args: &'a [u8]) -> impl Iterator<Item = u64> + 'a {
+    l.params.iter().filter_map(move |p| match *p {
+        Param::Descriptor { at } => args.get(at as usize..at as usize + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())),
+        _ => None,
+    })
+}
+
 /// The user SGPRs of a dispatch: s[0:1] = `table_at` (where the bytes of `args` past the
 /// inline part are), from s4 the inline part of `args` (all arguments packed by `l`).
 pub fn user_data(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
@@ -869,6 +877,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             continue;
                         }
                         let user_sgprs = super::real::pso_user_sgprs(real);
+                        // (the list is submitted after this: its root views in a GPU view get their tiles there)
+                        super::bind::want_root_views(layout.as_deref(), &table, super::view_want::Path::RootView);
                         let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {

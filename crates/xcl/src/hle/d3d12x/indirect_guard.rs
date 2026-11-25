@@ -301,6 +301,11 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     // title's buffer is a resource of its own over the same video memory.)
     let delta = real::buffer_delta(args);
     let title = real::console_buffer(args).and_then(|(p, _)| Some(p + args_off.checked_sub(delta)? as usize));
+    // (in a GPU view: its window, which has the arguments once their tiles are asked for; the
+    // program reads them on the GPU only)
+    if let Some(t) = title {
+        super::bind::want_view(super::view_want::Path::MemoryOp, t as u64, 5 * 4);
+    }
     let va = title.and_then(real::uma_va_of).filter(|v| v % 4 == 0).unwrap_or(shown);
     let shown = if compare() { shown } else { va };
     let g = guard_of(l)?;

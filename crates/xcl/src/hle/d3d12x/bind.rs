@@ -308,6 +308,61 @@ fn note_address(va: u64) {
     }
 }
 
+/// Bytes asked for at a root view's address in a GPU view (`view_want`). A root view names an
+/// address and no size, and no lookup by address says which of the title's buffers it lies in.
+const ROOT_VIEW_BYTES: u64 = 64 << 10;
+
+/// The view windows of unified memory as one range (start, bytes; 0 bytes: none, as in every
+/// layout below 16 windows). The layout is fixed when unified memory is made, so an address the
+/// title gives costs one compare to be told apart from a GPU view.
+pub(super) fn view_span() -> (u64, u64) {
+    static SPAN: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *SPAN.get_or_init(|| crate::gpu::uma::get().map_or((0, 0), view_span_of))
+}
+
+/// `view_span` of `u` (its view windows follow each other).
+pub(super) fn view_span_of(u: &crate::gpu::uma::Uma) -> (u64, u64) {
+    let mut views = (0..u.shader_windows()).filter(|&k| u.is_view_window(k)).map(|k| u.window(k));
+    let Some((start, bytes)) = views.next() else { return (0, 0) };
+    let end = views.last().map_or(start + bytes, |(at, bytes)| at + bytes);
+    (start as u64, (end - start) as u64)
+}
+
+/// Whether `va` lies in `span` (a `view_span`).
+pub(super) fn in_span((start, bytes): (u64, u64), va: u64) -> bool {
+    va.wrapping_sub(start) < bytes
+}
+
+/// Whether `va` lies in a view window.
+pub(super) fn in_views(va: u64) -> bool {
+    in_span(view_span(), va)
+}
+
+/// `view_want::want` for an address the title gave the GPU: one compare for any other address.
+pub(super) fn want_view(path: super::view_want::Path, va: u64, len: u64) -> bool {
+    in_views(va) && super::view_want::want(path, va, len)
+}
+
+/// The root views of `args` (packed by `layout`) in the view windows `span`, and the bytes asked
+/// for at each.
+fn root_views_wanted<'a>(layout: &'a Layout, args: &'a [u8], span: (u64, u64)) -> impl Iterator<Item = (u64, u64)> + 'a {
+    console_list::root_views(layout, args).filter(move |&va| in_span(span, va)).map(|va| (va, ROOT_VIEW_BYTES))
+}
+
+/// A bind of the root arguments `args`: the tiles of the root views among them that lie in a GPU
+/// view are asked for (on `path`), before the list that reads them is submitted. Without view
+/// windows one compare a bind.
+pub(super) fn want_root_views(layout: Option<&Layout>, args: &[u8], path: super::view_want::Path) {
+    let span = view_span();
+    if span.1 == 0 {
+        return;
+    }
+    let Some(l) = layout else { return };
+    for (va, len) in root_views_wanted(l, args, span) {
+        super::view_want::want(path, va, len);
+    }
+}
+
 /// command signatures that change root arguments (they need the title's root signature)
 static ROOT_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
@@ -497,6 +552,7 @@ unsafe fn bind_two_pass_stage(
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let first = first_window(super::real::uma_window_va(0), u.shadowed())?;
     let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
+    want_root_views(layout.as_deref(), &args, super::view_want::Path::MeshStage);
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
@@ -637,11 +693,14 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let commands = (max as u64).saturating_mul(stride as u64);
-    super::real::uma_window_buffer(src, commands as usize).ok_or("the indirect arguments are not in one memory window")?;
+    // only the GPU reads them: in a GPU view too, once its tiles are asked for
+    want_view(super::view_want::Path::MemoryOp, src as u64, commands);
+    super::real::uma_window_buffer_gpu(src, commands as usize).ok_or("the indirect arguments are not in one memory window")?;
     let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
     let count_va = match count {
         Some(p) => {
-            super::real::uma_window_buffer(p, 4).ok_or("the indirect count is not in a memory window")?;
+            want_view(super::view_want::Path::MemoryOp, p as u64, 4);
+            super::real::uma_window_buffer_gpu(p, 4).ok_or("the indirect count is not in a memory window")?;
             Some(super::real::uma_va_of(p).ok_or("unified memory is not open on the GPU")?)
         }
         None => None,
@@ -986,7 +1045,9 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
     }
     let mut views = Vec::new();
     for &(slot, (va, bytes, stride), _) in &vbs {
-        let (s, at) = (stride as usize, va as usize + first_vertex as usize * stride as usize);
+        // (a buffer in a GPU view is read where the CPU has it, its CPU view)
+        let cpu = if in_views(va) { super::view_want::cpu(va) } else { va };
+        let (s, at) = (stride as usize, cpu as usize + first_vertex as usize * stride as usize);
         let len = rects * 3 * s;
         if va == 0 || s == 0 || s % 4 != 0 || first_vertex as usize * s + len > bytes as usize || !crate::gpu::shader::readable(at, len) {
             return false;
@@ -1592,6 +1653,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         let (layout, args) = if gfx { (&s.layout_gfx, &s.args_gfx) } else { (&s.layout, &s.args) };
         (layout.clone(), args.clone(), s.heaps)
     });
+    want_root_views(layout.as_deref(), &args, super::view_want::Path::RootView);
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or_else(|| {
@@ -2217,6 +2279,40 @@ void main(uint t : SV_GroupIndex) {
         }
         let io = two_pass_io(None, &[], 0x4_1234_5600, true, base, [0; 2]);
         assert_eq!((io[8], io[9]), (0x1234_5600, 4));
+    }
+
+    /// The root views of a bind that lie in a GPU view are asked for with `ROOT_VIEW_BYTES` each
+    /// (their size is not known); constants that look like such an address, tables, null and
+    /// addresses elsewhere are not, and nothing is without view windows.
+    #[test]
+    fn root_views_in_a_gpu_view_are_wanted_with_their_bytes() {
+        use crate::gpu::uma::{Uma, MAX_HEAP_WINDOWS, MAX_WINDOWS, VIEW_WINDOWS, WINDOW};
+        let u = Uma::for_runtime_windows(16 << 20, 16 << 20, MAX_HEAP_WINDOWS).expect("16-window aperture");
+        let span = view_span_of(&u);
+        assert_eq!(span.1, (VIEW_WINDOWS * WINDOW) as u64);
+        let g = u.view_reserve(1 << 20).expect("a GPU view") as u64;
+        assert!(in_span(span, g) && in_span(span, span.0 + span.1 - 1));
+        assert!(!in_span(span, span.0 - 1) && !in_span(span, span.0 + span.1) && !in_span(span, 0));
+        let layout = Layout {
+            params: vec![Param::Constants { at: 0, count: 2 }, Param::Descriptor { at: 8 }, Param::Table { at: 16 }, Param::Descriptor { at: 20 }, Param::Descriptor { at: 28 }, Param::Descriptor { at: 36 }],
+            size: 44,
+            ..Default::default()
+        };
+        let mut args = Vec::new();
+        for q in [g + 0x200, g + 0x100] {
+            args.extend_from_slice(&q.to_le_bytes());
+        }
+        args.extend_from_slice(&(g as u32).to_le_bytes());
+        for q in [0x7_1234_0000u64, 0, g + 0x3_0000] {
+            args.extend_from_slice(&q.to_le_bytes());
+        }
+        let wanted: Vec<(u64, u64)> = root_views_wanted(&layout, &args, span).collect();
+        assert_eq!(wanted, vec![(g + 0x100, ROOT_VIEW_BYTES), (g + 0x3_0000, ROOT_VIEW_BYTES)]);
+        assert_eq!(ROOT_VIEW_BYTES, 64 << 10);
+        assert_eq!(root_views_wanted(&layout, &args, (0, 0)).count(), 0, "no view windows");
+        let four = Uma::for_runtime_windows(16 << 20, 16 << 20, MAX_WINDOWS).expect("4-window aperture");
+        assert_eq!(view_span_of(&four), (0, 0));
+        assert_eq!(u.view_release(g as usize), Some(1 << 20));
     }
 
     /// A list a deferred split records into next (`inherit_for_split`) leaves the two-pass record
