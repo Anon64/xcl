@@ -4172,7 +4172,7 @@ mod tests {
     fn an_address_keeps_the_page_the_title_mapped_there_last() {
         let null = std::ptr::null_mut();
         unsafe {
-            let Some(_) = crate::gpu::uma::get() else { return };
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
             let mut n = 2usize;
             let mut pages = [0usize; 2];
             assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
@@ -4283,11 +4283,11 @@ mod tests {
     #[test]
     fn gpu_view_pages_record_the_physical_page_mapped_into_them() {
         use mirrors::{apply_batches, resolve, shown_at, shows, touched, Mapped, Shows, PAGE};
-        const SIZE: usize = 43 * PAGE;
+        const SIZE: usize = 199 * PAGE;
         let g = 0x7270_0000_0000usize;
         let null = std::ptr::null_mut();
         unsafe {
-            let Some(_) = crate::gpu::uma::get() else { return };
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
             let mut n = 3usize;
             let mut pages = [0usize; 3];
             assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
@@ -4383,7 +4383,7 @@ mod tests {
         let g = 0x7280_0000_0000usize;
         let null = std::ptr::null_mut();
         unsafe {
-            let Some(_) = crate::gpu::uma::get() else { return };
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
             let mut n = 2usize;
             let mut pages = [0usize; 2];
             assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
@@ -4558,7 +4558,7 @@ mod tests {
         let (lo, hi, all) = (g, g + SIZE, usize::MAX);
         let null = std::ptr::null_mut();
         unsafe {
-            let Some(_) = crate::gpu::uma::get() else { return };
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
             let mut n = 3usize;
             let mut pages = [0usize; 3];
             assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
@@ -4630,7 +4630,7 @@ mod tests {
         let g = 0x72A0_0000_0000usize;
         let null = std::ptr::null_mut();
         unsafe {
-            let Some(_) = crate::gpu::uma::get() else { return };
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
             let mut n = 1usize;
             let mut pages = [0usize; 1];
             assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
@@ -4689,7 +4689,7 @@ mod tests {
         let null = std::ptr::null_mut();
         let kept = || KEPT_GOING.with(|s| s.take());
         unsafe {
-            let Some(_) = crate::gpu::uma::get() else { return };
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
             let mut n = 2usize;
             let mut pages = [0usize; 2];
             assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);

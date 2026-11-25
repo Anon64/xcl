@@ -1835,6 +1835,47 @@ mod tests {
         assert_eq!(cpu_range_in(g + 0x40, 0x100, view), Some(g + 0x40), "unpaired: as it was (and refused where it is written)");
     }
 
+    /// A range over GPU-view pages the queue's page mappings keep apart is refused (it would be
+    /// written into another page's bytes); one inside a single page is reached where that page is
+    /// kept, and one over pages never named at the CPU view, as before.
+    #[test]
+    fn a_range_over_gpu_view_pages_kept_apart_is_refused() {
+        use crate::hle::d3d12x::view_want::cpu_run;
+        use crate::hle::kernelx::{self, mirrors::{self, PAGE}};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return crate::gpu::recomp::runner::skip_test("no unified memory");
+            }
+            // a pair of views of a size of the test's own, and two physical pages at their home:
+            // the pool
+            let size = 229 * PAGE;
+            let c = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let g = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(c != 0 && g != 0);
+            mirrors::reserved(c, size, 0x2040_2000, 0x04);
+            assert!(mirrors::reserved(g, size, 0x2040_2000, 0x801));
+            let (mut n, mut pages) = (2usize, [0usize; 2]);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let home = kernelx::MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages.as_mut_ptr()) as usize;
+            assert_ne!(home, 0);
+            // pool page 1 at view page 0, pool page 0 at view page 1: kept apart
+            let ranges: [[u32; 3]; 2] = [[0, 1, 1], [0, 0, 1]];
+            let batch = [g as u64, 2, ranges.as_ptr() as u64];
+            assert!(mirrors::apply_batches(1, batch.as_ptr() as usize, home, 2).is_some());
+            let view = |a: usize| (g..g + size).contains(&a);
+            assert_eq!(cpu_run(g as u64, 2 * PAGE as u64), None);
+            assert_eq!(cpu_range_in(g + PAGE - 8, 16, view), None, "over two pages kept apart");
+            assert_eq!(cpu_range_in(g + 8, 16, view), Some(home + PAGE + 8), "inside one: where it is kept");
+            assert_eq!(cpu_range_in(g + PAGE + 8, 16, view), Some(home + 8));
+            assert_eq!(cpu_range_in(g + 2 * PAGE, 2 * PAGE, view), Some(c + 2 * PAGE), "pages never named: the CPU view");
+            kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr());
+            mirrors::released(c);
+            VirtualFree(c as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(g as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
     #[test]
     fn a_memory_queue_inflates_zlib_and_reports_through_status_and_errors() {
         unsafe {

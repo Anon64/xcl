@@ -3140,9 +3140,11 @@ pub(super) mod tests {
             refresh(queue.as_raw());
             assert_eq!(read_r8(dev, &queue, &paged), vec![0x62; 64 * 64], "a clean pool page newly mapped");
             std::ptr::write_bytes(home as *mut u8, 0x62, PAGE);
+            let reread = rereads();
             map_pages(g, &[[0, 0, 1]], home, 2);
             refresh(queue.as_raw());
             assert_eq!(read_r8(dev, &queue, &paged), vec![0x62; 64 * 64], "equal bytes in the old and the new page");
+            assert!(rereads() > reread, "read again for the mapping, equal bytes or not");
             map_pages(g, &[[2, 0, 1]], home, 2);
             refresh(queue.as_raw());
             assert_eq!(read_r8(dev, &queue, &paged), vec![0; 64 * 64], "unmapped: nothing");
@@ -3292,7 +3294,7 @@ pub(super) mod tests {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
         let _guard = TEST_LOCK.lock().unwrap();
         unsafe {
-            let Some(_) = crate::gpu::uma::get() else { return };
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
             let (cpu, gpu, pages, home) = paged_views(179 * PAGE, 2);
             std::ptr::write_bytes(home as *mut u8, 0x5A, PAGE);
             assert_eq!(VirtualAlloc(cpu as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, cpu);
@@ -3335,7 +3337,7 @@ pub(super) mod tests {
         // (no submit looks while a texture of no resource is in the table)
         let _refresh = REFRESH.lock().unwrap();
         unsafe {
-            let Some(_) = crate::gpu::uma::get() else { return };
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
             let (cpu, gpu, pages, home) = paged_views(181 * PAGE, 2);
             map_pages(gpu, &[[0, 0, 1]], home, 2);
             recheck_gpu_view_sources();
@@ -3399,7 +3401,7 @@ pub(super) mod tests {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
         let _guard = TEST_LOCK.lock().unwrap();
         unsafe {
-            let Some(_) = crate::gpu::uma::get() else { return };
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
             let (cpu, gpu, pages, home) = paged_views(191 * PAGE, 1);
             assert_eq!(VirtualAlloc((cpu + PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, cpu + PAGE);
             std::ptr::write_bytes(home as *mut u8, 0x21, PAGE);
