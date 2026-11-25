@@ -2715,7 +2715,8 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
         return r as *mut c_void;
     }
     let mut r = std::ptr::null_mut();
-    let hr = super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r);
+    // (in COMMON, not the state the title made the memory's buffer in: `depth_uav` keeps that)
+    let hr = super::depth_uav::by_address(|| super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r));
     if hr < 0 || r.is_null() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 8 {

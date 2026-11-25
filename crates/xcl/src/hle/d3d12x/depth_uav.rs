@@ -72,6 +72,9 @@ struct Cell {
 struct Inner {
     /// registered objects of this buffer
     members: u32,
+    /// the PC state of the first object a title's creation call made (not the object of a view
+    /// by address, which is made in COMMON: `by_address`)
+    made_in: Option<u32>,
     /// [depth, stencil]
     twins: [Option<Twin>; 2],
 }
@@ -169,7 +172,13 @@ fn register(res: usize, x: &[u8; 0x38], at: Option<usize>, pc_state: u32) -> boo
         .entry(key)
         .or_insert_with(|| Arc::new(Cell { key, console_format: u32_at(x, 0x20), twinned: AtomicBool::new(false), inner: Mutex::new(Inner::default()) }))
         .clone();
-    cell.inner.lock().unwrap().members += 1;
+    {
+        let mut inner = cell.inner.lock().unwrap();
+        inner.members += 1;
+        if inner.made_in.is_none() && !BY_ADDRESS.with(std::cell::Cell::get) {
+            inner.made_in = Some(pc_state);
+        }
+    }
     let gone = match OBJECTS.insert(res, Object { cell, state: pc_state }) {
         None => {
             REGISTERED.fetch_add(1, Ordering::Relaxed);
@@ -181,6 +190,20 @@ fn register(res: usize, x: &[u8; 0x38], at: Option<usize>, pc_state: u32) -> boo
     drop(g);
     drop(gone);
     true
+}
+
+thread_local! {
+    /// this thread is making the object of a view by address (`by_address`)
+    static BY_ADDRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f` makes the object of a view by address (`real::resource_at`): XCL makes it in COMMON, so
+/// its state is not the one the title made the buffer in.
+pub(super) fn by_address<R>(f: impl FnOnce() -> R) -> R {
+    BY_ADDRESS.with(|b| b.set(true));
+    let r = f();
+    BY_ADDRESS.with(|b| b.set(false));
+    r
 }
 
 /// One object of `cell` is gone; the last one takes the Cell with it, and its twins, which the
@@ -254,6 +277,8 @@ pub(super) unsafe fn resolve_uav(dev: *mut c_void, res: *mut c_void, rd: Option<
                 let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
                 inner.twins[1] = Some(Twin { res: t, n });
                 o.cell.twinned.store(true, Ordering::Relaxed);
+                // (the state of the title's object; that of the UAV's own when the title made none)
+                let state = inner.made_in.unwrap_or(o.state);
                 if n <= 8 || n.is_power_of_two() {
                     crate::xlog_info!(
                         "D3D12.X: depth UAV twin #{n}: the stencil plane of a {}x{}x{} depth buffer (PC format {}, console format {}) at {:#x} is an R8 texture; the buffer was made in state {:#x}",
@@ -263,7 +288,7 @@ pub(super) unsafe fn resolve_uav(dev: *mut c_void, res: *mut c_void, rd: Option<
                         key.format,
                         o.cell.console_format,
                         key.at,
-                        o.state
+                        state
                     );
                 }
                 raw
@@ -467,6 +492,15 @@ pub(super) fn kept(res: usize) -> bool {
     OBJECTS.contains(res)
 }
 
+/// (tests) The state line L2 gives for the buffer `res` is in, and whether that buffer has a
+/// title address.
+#[cfg(test)]
+pub(super) fn made_in(res: usize) -> Option<(Option<u32>, Option<usize>)> {
+    let o = OBJECTS.get(res)?;
+    let made_in = o.cell.inner.lock().unwrap().made_in;
+    Some((made_in, o.cell.key.placed.then_some(o.cell.key.at)))
+}
+
 /// (tests) The stencil twin of the buffer `res` is in.
 #[cfg(test)]
 pub(super) fn twin_of(res: usize) -> Option<usize> {
@@ -668,6 +702,24 @@ mod tests {
         forget(own);
         forget(c);
         assert!(!in_cells(&co.key) && cell_of(c).is_none());
+    }
+
+    #[test]
+    fn the_state_a_buffer_was_made_in_is_that_of_the_titles_object() {
+        let (view, title, at) = (0x7B10_0000_1000usize, 0x7B10_0000_2000usize, 0x2_1000_0000usize);
+        let x = desc(3, 2560, 1440, 45, 1, 6);
+        // the object of a view by address comes first and is made in COMMON: not the buffer's state
+        assert!(by_address(|| register(view, &x, Some(at), 0)));
+        assert_eq!(made_in(view), Some((None, Some(at))));
+        assert!(!BY_ADDRESS.with(std::cell::Cell::get), "the mark ends with the call");
+        assert!(register(title, &x, Some(at), 0x10));
+        assert_eq!(made_in(view), Some((Some(0x10), Some(at))), "the title's object gives it");
+        // a later object, or one made by address again, does not change it
+        assert!(by_address(|| register(view, &x, Some(at), 0)));
+        assert_eq!(made_in(title), Some((Some(0x10), Some(at))));
+        forget(view);
+        forget(title);
+        assert!(cell_of(title).is_none());
     }
 
     #[test]
