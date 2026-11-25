@@ -678,8 +678,8 @@ pub fn init() -> Result<String, String> {
         DEVICE.store(raw as usize, Ordering::Release);
         // a thread looks for the removal too: a title whose threads all wait (for pipelines
         // being built, for a fence) submits and presents nothing, and the report of the faulting
-        // address would never be written. It also times the calls into the driver and takes a
-        // stop asked for from outside (`watch`).
+        // address would never be written. It also times the calls into the driver; a thread of
+        // its own takes a stop asked for from outside, from here on (`watch`).
         super::watch::start();
         *ADAPTER.lock().unwrap() = name.clone();
         Ok(name)
@@ -8385,8 +8385,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // own work in the submission. Where that takes long, it is not the title's time
     // (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
-    // (not while a call into the driver stands still: `watch`)
-    super::watch::wait_while_stalled();
+    // (not while a stop for a driver error is being handled: `watch`)
+    super::watch::wait_while_held();
     // textures in title memory the CPU wrote since: uploaded again first
     let submit_t0 = std::time::Instant::now();
     super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
