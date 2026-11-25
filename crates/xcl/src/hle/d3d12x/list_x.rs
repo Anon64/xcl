@@ -105,7 +105,12 @@ unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
 /// The type of a list XCL keeps state for (`on_create`), without a call to the list; None for
 /// any other
 pub(super) fn tracked_list_type(list: *mut c_void) -> Option<D3D12_COMMAND_LIST_TYPE> {
-    LISTS.lock().unwrap().as_ref()?.get(&(list as usize))?.list_type
+    recording(list as usize).lock().unwrap().as_ref()?.get(&(list as usize))?.list_type
+}
+
+/// A compute pipeline (a built one) on `list`, past the hook of a title's SetPipelineState.
+pub(super) unsafe fn set_compute_pipeline(list: *mut c_void, pso: *mut c_void) {
+    pc::<unsafe extern "system" fn(*mut c_void, *mut c_void)>(list, PC_SET_PIPELINE_STATE)(list, pso);
 }
 
 pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
@@ -304,7 +309,7 @@ struct Bindings {
 
 /// Whether `list` draws rect lists now, and the title's vertex buffers (slot, (address, bytes, stride)).
 pub(super) fn rect_list_state(list: *mut c_void) -> Option<Vec<(u32, (u64, u32, u32), Option<D3D12_VERTEX_BUFFER_VIEW>)>> {
-    let g = LISTS.lock().unwrap();
+    let g = recording(list as usize).lock().unwrap();
     let b = &g.as_ref()?.get(&(list as usize))?.bindings;
     b.rect_list.then(|| b.vertex_titles.iter().map(|(&k, &v)| (k, v, b.vertex_buffers.get(&k).copied())).collect())
 }
@@ -437,7 +442,7 @@ pub(super) fn watch_dsv(dsv: usize) {
 }
 
 fn with_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
-    let mut g = LISTS.lock().unwrap();
+    let mut g = recording(list as usize).lock().unwrap();
     f(&mut g.get_or_insert_with(HashMap::new).entry(list as usize).or_default().bindings);
 }
 
@@ -702,7 +707,26 @@ struct QueueInfo {
     ty: D3D12_COMMAND_LIST_TYPE,
 }
 
-static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
+/// What XCL keeps of each list, in parts by list with a lock each (a cache line apart): a title
+/// records many lists at once, and most recorded calls look here.
+static LISTS: [Part; 64] = [const { Part(Mutex::new(None)) }; 64];
+
+#[repr(align(64))]
+struct Part(Mutex<Option<HashMap<usize, ListState>>>);
+
+/// The part `list` is in.
+fn recording(list: usize) -> &'static Mutex<Option<HashMap<usize, ListState>>> {
+    &LISTS[super::sharded::part(list, LISTS.len())].0
+}
+
+/// `f` with what is kept of every list.
+fn every_list(mut f: impl FnMut(&mut ListState)) {
+    for p in &LISTS {
+        if let Some(m) = p.0.lock().unwrap().as_mut() {
+            m.values_mut().for_each(&mut f);
+        }
+    }
+}
 static LIVE_QUEUES: Mutex<Vec<QueueInfo>> = Mutex::new(Vec::new());
 /// Number of lists with at least one pending `Wait32/64BitValueX` (fast-path guard for ExecuteCommandLists).
 static PENDING_WAIT_LISTS: AtomicUsize = AtomicUsize::new(0);
@@ -732,13 +756,11 @@ pub(super) fn on_queue_release(queue: usize) {
     scratch.collect_released();
     drop(scratch);
     LIVE_QUEUES.lock().unwrap().retain(|q| q.queue != queue);
-    if let Some(m) = LISTS.lock().unwrap().as_mut() {
-        for s in m.values_mut() {
-            if s.last_queue == Some(queue) {
-                s.last_queue = None;
-            }
+    every_list(|s| {
+        if s.last_queue == Some(queue) {
+            s.last_queue = None;
         }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -781,7 +803,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     // (of a list that was here before and whose release was not seen: the GPU may still use it)
     release_copy_scratch(key);
     let old = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(key).lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let old = m.remove(&key);
         if let Some(ref old) = old {
@@ -806,7 +828,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(list, static_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+                if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                     s.native_bias = static_bias;
                 }
             }
@@ -819,7 +841,7 @@ pub(super) fn on_release(list: usize) {
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
-    let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
+    let old = recording(list).lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
@@ -837,7 +859,7 @@ pub(super) fn on_release(list: usize) {
 pub(super) fn clear_segment_state(list: usize) {
     super::alloc_pool::forget_list(list);
     super::title_textures::list_reset(list);
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
+    if let Some(s) = recording(list).lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
         s.clear_sparse_writes();
@@ -852,18 +874,16 @@ pub(super) fn clear_segment_state(list: usize) {
 
 #[cfg(test)]
 pub(super) fn has_list_state(list: usize) -> bool {
-    LISTS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&list))
+    recording(list).lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&list))
 }
 
 /// Forget a released command allocator so `KickoffX` will not reset a list with a dead allocator.
 pub(super) fn on_allocator_release(alloc: usize) {
-    if let Some(m) = LISTS.lock().unwrap().as_mut() {
-        for s in m.values_mut() {
-            if s.allocator == alloc {
-                s.allocator = 0;
-            }
+    every_list(|s| {
+        if s.allocator == alloc {
+            s.allocator = 0;
         }
-    }
+    });
 }
 
 /// Track `SetPipelineState` on a command list (for `RSSetDepthBiasX` and `KickoffX`),
@@ -872,7 +892,7 @@ pub(super) fn on_allocator_release(alloc: usize) {
 pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
     let key = list as usize;
     let sync_target = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(key).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
         // Keep the title-visible base PSO key when `bind_abi` re-binds its resolved background PSO.
         if s.bound_pso == 0 || pso == s.bound_pso || super::pso_async::resolve(s.bound_pso) != pso {
@@ -908,11 +928,11 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
     };
     if let Some((target, has_override)) = sync_target {
         if try_native_depth_bias(list, target) {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+            if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                 s.native_bias = target;
             }
         } else if has_override {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+            if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                 s.pso_dirty = true;
             }
             DEPTH_BIAS_USED.store(true, Ordering::Release);
@@ -924,7 +944,7 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
 pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
     let key = list as usize;
     let is_bundle = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(key).lock().unwrap();
         if let Some(s) = g.get_or_insert_with(HashMap::new).get_mut(&key) {
             s.bound_pso = pso;
             s.depth_bias = None;
@@ -943,7 +963,7 @@ pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(list, static_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+                if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                     s.native_bias = static_bias;
                 }
             }
@@ -975,11 +995,9 @@ pub(super) unsafe fn note_queue_for_lists(queue: usize, lists: &[*mut c_void]) {
             }
         }
     }
-    let mut g = LISTS.lock().unwrap();
-    let m = g.get_or_insert_with(HashMap::new);
     for &l in lists {
         if !l.is_null() {
-            m.entry(l as usize).or_default().last_queue = Some(queue);
+            recording(l as usize).lock().unwrap().get_or_insert_with(HashMap::new).entry(l as usize).or_default().last_queue = Some(queue);
         }
     }
 }
@@ -995,7 +1013,7 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
 }
 
 fn note_write(list: usize, va: u64, size: u64) {
-    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
+    recording(list).lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
 }
 
 /// A PC copy into `[offset, offset + n)` of console buffer `dst` whose memory the GPU only has
@@ -1055,7 +1073,7 @@ impl WriteTraceRing {
 static WRITE_TRACE: Mutex<WriteTraceRing> = Mutex::new(WriteTraceRing::new());
 
 fn record_write_trace(list: *mut c_void, va: u64, value: u64, flags: u32, what: &'static str) {
-    let ty = LISTS
+    let ty = recording(list as usize)
         .lock()
         .unwrap()
         .as_ref()
@@ -1794,7 +1812,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
         return;
     }
     let (lty, last_q) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         s.push_write64_signal(va, value);
         (s.list_type, s.last_queue)
@@ -1984,11 +2002,9 @@ pub(super) unsafe fn signal_write64_fences(queue: *mut c_void, lists: &[*mut c_v
         return;
     }
     let pairs: Vec<(u64, u64)> = {
-        let g = LISTS.lock().unwrap();
-        let Some(m) = g.as_ref() else { return };
         let mut out = Vec::new();
         for &l in lists {
-            if let Some(s) = m.get(&(l as usize)) {
+            if let Some(s) = recording(l as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(l as usize))) {
                 out.extend_from_slice(&s.write64_signals);
             }
         }
@@ -2209,11 +2225,9 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
         return;
     }
     let (ranges, imms): (Vec<(usize, usize)>, Vec<(usize, u64, u8)>) = {
-        let g = LISTS.lock().unwrap();
-        let Some(m) = g.as_ref() else { return };
         let (mut out, mut imm) = (Vec::new(), Vec::new());
         for &l in lists {
-            if let Some(s) = m.get(&(l as usize)) {
+            if let Some(s) = recording(l as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(l as usize))) {
                 out.extend_from_slice(&s.sparse_writes);
                 imm.extend_from_slice(&s.sparse_imm);
             }
@@ -2231,9 +2245,8 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
 /// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
 pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void]) {
     let writes: Vec<super::cpu_writes::Write> = {
-        let g = LISTS.lock().unwrap();
-        let Some(m) = g.as_ref() else { return };
-        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.cpu_writes.iter().cloned()).collect()
+        let of = |&l: &*mut c_void| recording(l as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(l as usize))).map(|s| s.cpu_writes.clone());
+        lists.iter().filter_map(of).flatten().collect()
     };
     super::cpu_writes::after(queue, writes);
 }
@@ -2248,11 +2261,13 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
         return;
     }
     let per_list: Vec<(Vec<PendingWait>, Vec<(u64, u64)>)> = {
-        let g = LISTS.lock().unwrap();
         lists
             .iter()
             .map(|&l| {
-                g.as_ref()
+                recording(l as usize)
+                    .lock()
+                    .unwrap()
+                    .as_ref()
                     .and_then(|m| m.get(&(l as usize)))
                     .map(|s| (s.pending_waits.clone(), s.write64_signals.clone()))
                     .unwrap_or_default()
@@ -2621,7 +2636,7 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
     let (Some((d, _)), Some(at)) = (real::uma_window_buffer(va as usize, n as usize), real::uma_va_of(va as usize)) else {
         // the title's own memory: written by the CPU once the GPU is there
         if super::cpu_writes::writable(va as usize, n as usize) {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+            if let Some(s) = recording(list as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
                 s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
                 return;
             }
@@ -2635,7 +2650,7 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         // that runs late does not take the CPU's view of it back (`sparse::IMM_KEEP_MAX`)
         let counter = words.len() == 2 && SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&va)).is_some_and(|c| !c.non_monotonic && c.recorded_max != 0);
         let bytes = n as u8 | if counter { super::sparse::IMM_KEEP_MAX } else { 0 };
-        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().note_imm(va, value, bytes);
+        recording(list as usize).lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().note_imm(va, value, bytes);
     } else {
         note_write(list as usize, va, n);
     }
@@ -2736,7 +2751,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
         as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
     } else if let Some((rb, base)) = readback {
         // Queue the CPU copy only if the list is tracked; otherwise avoid emitting an unused resolve.
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else {
             return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
         };
@@ -2792,7 +2807,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         return None;
     }
     let (alloc, last_queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, ended_early, written_ranges, bindings) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let s = g.as_mut()?.get_mut(&(list as usize))?;
         if s.allocator == 0 {
             return None;
@@ -2871,7 +2886,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     };
 
     let old_next = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(next_pc as usize).lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let old = m.remove(&(next_pc as usize));
         if let Some(ref o) = old {
@@ -2922,7 +2937,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
             if target.is_zero() {
                 applied_native = true;
             } else if try_native_depth_bias(next_pc, target) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
+                if let Some(s) = recording(next_pc as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
                     s.native_bias = target;
                 }
                 applied_native = true;
@@ -2930,7 +2945,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         } else if bound_pso == 0 {
             if let Some(b) = depth_bias {
                 if device_x::dynamic_depth_bias_supported(dev_raw as *mut c_void) && try_native_depth_bias(next_pc, b) {
-                    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
+                    if let Some(s) = recording(next_pc as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
                         s.native_bias = b;
                     }
                     applied_native = true;
@@ -2938,7 +2953,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
             }
         }
         if depth_bias.is_some() && !applied_native {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
+            if let Some(s) = recording(next_pc as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
                 s.pso_dirty = true;
             }
             DEPTH_BIAS_USED.store(true, Ordering::Release);
@@ -2955,7 +2970,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
             let pb_raw = pb.as_raw() as usize;
             transition(next_pc, pb_raw, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
             pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(next_pc, PC_SET_PREDICATION)(next_pc, pb_raw, 0, op);
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
+            if let Some(s) = recording(next_pc as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
                 s.pred_in_state = true;
             }
         }
@@ -2997,7 +3012,7 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
         return warn(&N, what, format_args!("NEVER comparison at {va:#x} (skipped to avoid hang)"));
     }
     let need_split = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         if s.has_prior_write(va, n) {
             return;
@@ -3009,7 +3024,7 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
         true
     };
     let target = if need_split { try_split_for_wait(list).unwrap_or(list) } else { list };
-    let mut g = LISTS.lock().unwrap();
+    let mut g = recording(target as usize).lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
     let after_write64 = !s.write64_signals.is_empty();
     s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64 });
@@ -3054,7 +3069,7 @@ pub(super) unsafe extern "system" fn write32_bottom_of_shader_x(this: *mut c_voi
 
 /// command list #68 OMSetDepthBounds(min, max) (PC #62)
 pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: f32, max: f32) {
-    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().depth_bounds = Some((min, max));
+    recording(this as usize).lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().depth_bounds = Some((min, max));
     pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(this, PC_OM_SET_DEPTH_BOUNDS)(this, min, max);
 }
 
@@ -3112,7 +3127,7 @@ pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, ds
 
 /// Return `list`'s dedicated 256-byte predication buffer, creating it lazily in `COMMON` state.
 unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
-    if let Some(p) = LISTS
+    if let Some(p) = recording(list as usize)
         .lock()
         .unwrap()
         .as_ref()
@@ -3139,7 +3154,7 @@ unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
     dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).ok()?;
     let buf = buf?;
     let (raw, extra) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         if let Some(existing) = s.pred_buf.as_ref() {
             (existing.as_raw() as usize, Some(buf))
@@ -3160,7 +3175,7 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
         return;
     }
     let pb = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else {
             return;
         };
@@ -3182,7 +3197,7 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
     }
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+    if let Some(s) = recording(list as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.predication = None;
         s.pred_in_state = false;
     }
@@ -3193,7 +3208,7 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
 unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb: usize, op: D3D12_PREDICATION_OP) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP);
     let f = pc::<F>(this, PC_SET_PREDICATION);
-    let (was_active, was_in_state) = LISTS
+    let (was_active, was_in_state) = recording(this as usize)
         .lock()
         .unwrap()
         .as_ref()
@@ -3212,7 +3227,7 @@ unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb
     transition(this, pb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
     f(this, pb, 0, op);
     PREDICATION_USED.store(true, Ordering::Release);
-    if let Some(s) = LISTS.lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&(this as usize)) {
+    if let Some(s) = recording(this as usize).lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&(this as usize)) {
         s.predication = Some(op);
         s.pred_in_state = true;
     }
@@ -3234,7 +3249,7 @@ pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: 
         let f = pc::<F>(this, PC_SET_PREDICATION);
         f(this, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         let pb = {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(this as usize).lock().unwrap();
             g.as_mut().and_then(|m| m.get_mut(&(this as usize))).and_then(|s| {
                 s.predication = None;
                 if s.pred_in_state {
@@ -3285,7 +3300,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
     let dev_raw = device_of(this).map_or(0, |d| d.as_raw() as usize);
     let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(this as usize).lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
             if once(&NO_QUEUE, 4) {
                 crate::xlog_info!("D3D12.X: KickoffX – list allocator unknown, deferring to Close + ExecuteCommandLists");
@@ -3386,7 +3401,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let target = if let Some((primary, _, reclaimed)) = kickoff_split {
         let (ended_early, pred_buf_obj, bindings_copy) = {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(this as usize).lock().unwrap();
             if let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) {
                 (std::mem::take(&mut s.occlusion.ended_early), s.pred_buf.clone(), s.bindings.clone())
             } else {
@@ -3399,7 +3414,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             super::bind::reset(seg as *mut c_void, 0, 0);
             clear_segment_state(seg);
         }
-        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
+        if let Some(s) = recording(primary as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
             s.allocator = alloc;
             s.bound_pso = bound_pso;
             s.depth_bias = depth_bias;
@@ -3431,13 +3446,13 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
     reset_copy_scratch(target);
-    let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
+    let bindings = recording(target as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(target, &b, ty);
     }
 
     // Reset() cleared the PC list's native RSSetDepthBias state to (0, 0, 0) and bound init_pso.
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+    if let Some(s) = recording(target as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
         s.native_bias = DepthBias::ZERO;
         s.using_fallback_pso = false;
         s.pso_dirty = false;
@@ -3450,7 +3465,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             if target_bias.is_zero() {
                 applied_native = true;
             } else if try_native_depth_bias(target, target_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+                if let Some(s) = recording(target as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
                     s.native_bias = target_bias;
                 }
                 applied_native = true;
@@ -3458,7 +3473,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         } else if bound_pso == 0 {
             if let Some(b) = depth_bias {
                 if device_x::dynamic_depth_bias_supported(dev_raw as *mut c_void) && try_native_depth_bias(target, b) {
-                    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+                    if let Some(s) = recording(target as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
                         s.native_bias = b;
                     }
                     applied_native = true;
@@ -3466,7 +3481,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             }
         }
         if depth_bias.is_some() && !applied_native {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+            if let Some(s) = recording(target as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
                 s.pso_dirty = true;
             }
             DEPTH_BIAS_USED.store(true, Ordering::Release);
@@ -3481,7 +3496,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let (Some(op), Some(pb)) = (predication, pred_buf) {
         transition(target, pb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
         pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(target, PC_SET_PREDICATION)(target, pb, 0, op);
-        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+        if let Some(s) = recording(target as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
             s.pred_in_state = true;
         }
     }
@@ -3508,7 +3523,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     let key = this as usize;
 
     let (bound_pso, is_bundle) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(key).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
         (s.bound_pso, s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE))
     };
@@ -3524,7 +3539,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     if can_native {
         let target = if bias.is_zero() { DepthBias::ZERO } else { bias };
         let (need_restore_base, need_native_call) = {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(key).lock().unwrap();
             let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
             s.depth_bias = if bias.is_zero() { None } else { Some(bias) };
             s.pso_dirty = false;
@@ -3540,14 +3555,14 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
             return;
         }
         if try_native_depth_bias(this, target) {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+            if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                 s.native_bias = target;
             }
             return;
         }
         // ID3D12GraphicsCommandList9 unavailable: fall through to patched-PSO fallback.
         if !bias.is_zero() {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+            if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                 s.pso_dirty = true;
             }
             DEPTH_BIAS_USED.store(true, Ordering::Release);
@@ -3556,7 +3571,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     }
 
     let restore = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(key).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
         if bias.is_zero() {
             let was_active = s.depth_bias.take().is_some();
@@ -3588,7 +3603,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
         return;
     }
     let (bound_pso, bias) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else {
             return;
         };
@@ -3619,7 +3634,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
     };
     let resolved = super::pso_async::resolve_for_bind(target);
     pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+    if let Some(s) = recording(list as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
     }
 }
@@ -3746,7 +3761,7 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
         return;
     }
     let (vbs, ib) = {
-        let g = LISTS.lock().unwrap();
+        let g = recording(list as usize).lock().unwrap();
         let Some(b) = g.as_ref().and_then(|m| m.get(&(list as usize))).map(|s| &s.bindings) else { return };
         (b.vertex_titles.values().copied().collect::<Vec<_>>(), b.index_title)
     };
@@ -3864,6 +3879,7 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
+    super::bind::heaps_changed(this);
     if heaps.is_null() || n == 0 {
         // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heap again
         // before a translated draw or dispatch reads the memory windows from it)
@@ -3932,7 +3948,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
 
 /// command list #47 IASetIndexBuffer(view) (PC #43): the address is the title's
 pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, view: *const D3D12_INDEX_BUFFER_VIEW) {
-    let mut g = LISTS.lock().unwrap();
+    let mut g = recording(this as usize).lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
     if view.is_null() {
         s.index_buffer = None;
@@ -3943,7 +3959,7 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
     s.bindings.index_title = Some((v.BufferLocation, v.SizeInBytes, v.Format.0));
     drop(g);
     v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "index buffer", true);
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+    if let Some(s) = recording(this as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
         s.index_buffer = Some(v);
     }
     set_index_buffer(this, Some(&v));
@@ -3964,7 +3980,7 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     let Some(list) = super::bind::prepare_indexed_draw(this, count, 1, 0, 0) else {
         return;
     };
-    let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
+    let bound = recording(this as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
     sync_title_buffers(this, None, 0, 0, 2);
     let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu_va(this, va, count.saturating_mul(stride) as usize, "DrawIndexedX indices", false), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
@@ -3998,7 +4014,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     let ext = *(this as *const usize);
     let resolved = super::pso_async::resolve_for_bind(pso);
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
-    let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
+    let ty = recording(this as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
     let mut on = alloc;
     let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
         on = pc_alloc;
@@ -4011,7 +4027,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
 
     reset_copy_scratch(this);
     let is_bundle = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(this as usize).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
         s.allocator = alloc;
         s.bound_pso = pso;
@@ -4038,7 +4054,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+                if let Some(s) = recording(this as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
                     s.native_bias = static_bias;
                 }
             }
@@ -4397,7 +4413,7 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
 pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
     if is_occlusion(ty) {
-        let outer = LISTS
+        let outer = recording(this as usize)
             .lock()
             .unwrap()
             .get_or_insert_with(HashMap::new)
@@ -4421,7 +4437,7 @@ pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usiz
 /// command list #29 EndQuery(heap, type, index) (PC #53)
 pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
     if is_occlusion(ty) {
-        let forward = LISTS
+        let forward = recording(this as usize)
             .lock()
             .unwrap()
             .get_or_insert_with(HashMap::new)
@@ -4626,7 +4642,7 @@ mod tests {
 
         unsafe { on_create(list, 0x111, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
         {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(key).lock().unwrap();
             let s = g.as_mut().unwrap().get_mut(&key).unwrap();
             s.allocator = 0x111;
             s.bound_pso = 0x222;
@@ -4650,7 +4666,7 @@ mod tests {
         let failed_backing = super::super::alloc_pool::recording_backing_for_test(key);
         assert_eq!(object[0], ext);
         {
-            let g = LISTS.lock().unwrap();
+            let g = recording(key).lock().unwrap();
             let s = g.as_ref().unwrap().get(&key).unwrap();
             assert_eq!((s.allocator, s.bound_pso), (0x111, 0x222));
             assert_eq!(s.depth_bias, Some(DepthBias::new(-3.5, 0.25, 2.0)));
@@ -4671,7 +4687,7 @@ mod tests {
         let successful_backing = super::super::alloc_pool::recording_backing_for_test(key);
         assert_eq!(object[0], ext);
         {
-            let g = LISTS.lock().unwrap();
+            let g = recording(key).lock().unwrap();
             let s = g.as_ref().unwrap().get(&key).unwrap();
             assert_eq!((s.allocator, s.bound_pso), (0x333, 0x555));
             assert!(s.depth_bias.is_none() && s.index_buffer.is_none() && s.depth_bounds.is_none());
@@ -4683,7 +4699,7 @@ mod tests {
         );
         assert_eq!(super::super::console_list::take_pending_for_test(0x111), vec![0x4444]);
 
-        LISTS.lock().unwrap().as_mut().unwrap().remove(&key);
+        recording(key).lock().unwrap().as_mut().unwrap().remove(&key);
         super::super::bind::remove_state_for_test(list);
         unsafe {
             super::super::alloc_pool::forget(0x111);
@@ -4723,7 +4739,7 @@ mod tests {
         let held_for_pc = super::super::console_list::take_pending_for_test(pc);
         let held_for_title = super::super::console_list::take_pending_for_test(title);
 
-        LISTS.lock().unwrap().as_mut().unwrap().remove(&key);
+        recording(key).lock().unwrap().as_mut().unwrap().remove(&key);
         super::super::bind::remove_state_for_test(list);
         super::super::alloc_pool::stand_in_for_test(title, title);
         unsafe {
@@ -4828,7 +4844,7 @@ mod tests {
             on_create(l2, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
         }
         {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(l1 as usize).lock().unwrap();
             let s = g.as_mut().unwrap().get_mut(&(l1 as usize)).unwrap();
             s.push_wait(PendingWait {
                 va,
@@ -4898,7 +4914,7 @@ mod tests {
             on_set_pipeline_state(l, 0xBBB);
         }
         {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(key).lock().unwrap();
             let s = g.as_mut().unwrap().get_mut(&key).unwrap();
             assert_eq!(s.bound_pso, 0xBBB);
             assert!(!s.pso_dirty);
@@ -4908,7 +4924,7 @@ mod tests {
         // Switching to a non-dynamic PSO while depth bias is active keeps pso_dirty for fallback
         unsafe { on_set_pipeline_state(l, 0xCCC) };
         {
-            let g = LISTS.lock().unwrap();
+            let g = recording(key).lock().unwrap();
             let s = g.as_ref().unwrap().get(&key).unwrap();
             assert_eq!(s.bound_pso, 0xCCC);
             assert!(s.pso_dirty);
@@ -4916,7 +4932,7 @@ mod tests {
         // ClearState resets depth bias, native_bias, and dirty flag
         unsafe { on_clear_state(l, 0xDDD) };
         {
-            let g = LISTS.lock().unwrap();
+            let g = recording(key).lock().unwrap();
             let s = g.as_ref().unwrap().get(&key).unwrap();
             assert_eq!(s.bound_pso, 0xDDD);
             assert!(s.depth_bias.is_none());
@@ -4962,7 +4978,7 @@ mod tests {
                 // without rounding to i32 or dirtying the patched-PSO fallback cache.
                 set_depth_bias_x(raw, -125.75, 0.05, 1.25);
                 {
-                    let g = LISTS.lock().unwrap();
+                    let g = recording(key).lock().unwrap();
                     let s = g.as_ref().unwrap().get(&key).unwrap();
                     assert_eq!(s.depth_bias, Some(DepthBias::new(-125.75, 0.05, 1.25)));
                     assert_eq!(s.native_bias, DepthBias::new(-125.75, 0.05, 1.25));
@@ -4974,7 +4990,7 @@ mod tests {
                 // Resetting depth bias to 0 updates native_bias to ZERO without touching fallback cache.
                 set_depth_bias_x(raw, 0.0, 0.0, 0.0);
                 {
-                    let g = LISTS.lock().unwrap();
+                    let g = recording(key).lock().unwrap();
                     let s = g.as_ref().unwrap().get(&key).unwrap();
                     assert!(s.depth_bias.is_none());
                     assert_eq!(s.native_bias, DepthBias::ZERO);
@@ -4984,7 +5000,7 @@ mod tests {
                 // Binding a dynamic PSO with non-zero static bias syncs native_bias to its static bias.
                 on_set_pipeline_state(raw, pso_dyn_static);
                 {
-                    let g = LISTS.lock().unwrap();
+                    let g = recording(key).lock().unwrap();
                     let s = g.as_ref().unwrap().get(&key).unwrap();
                     assert_eq!(s.native_bias, static_bias);
                     assert!(!s.pso_dirty);
@@ -4993,7 +5009,7 @@ mod tests {
                 // Switching back to a zero-static-bias dynamic PSO restores native_bias to ZERO.
                 on_set_pipeline_state(raw, pso_dyn_zero);
                 {
-                    let g = LISTS.lock().unwrap();
+                    let g = recording(key).lock().unwrap();
                     let s = g.as_ref().unwrap().get(&key).unwrap();
                     assert_eq!(s.native_bias, DepthBias::ZERO);
                     assert!(!s.pso_dirty);
@@ -5004,7 +5020,7 @@ mod tests {
             on_set_pipeline_state(raw, pso_static_only);
             set_depth_bias_x(raw, -50.0, 0.0, 0.0);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(key).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&key).unwrap();
                 assert_eq!(s.depth_bias, Some(DepthBias::new(-50.0, 0.0, 0.0)));
                 assert!(s.pso_dirty);
@@ -5016,7 +5032,7 @@ mod tests {
             on_create(b_raw, 0x100, pso_dyn_zero, D3D12_COMMAND_LIST_TYPE_BUNDLE);
             set_depth_bias_x(b_raw, -75.0, 0.0, 0.0);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(b_raw as usize).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&(b_raw as usize)).unwrap();
                 assert!(s.pso_dirty);
                 assert_eq!(s.native_bias, DepthBias::ZERO);
@@ -5076,7 +5092,7 @@ mod tests {
             assert_eq!(calls.borrow().last(), Some(&(key, -1000.5, 0.05, 1.5)));
             assert_eq!(device_x::depth_bias_cache_len(), cache_before);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(key).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&key).unwrap();
                 assert!(!s.pso_dirty);
                 assert_eq!(s.native_bias, DepthBias::new(-1000.5, 0.05, 1.5));
@@ -5098,7 +5114,7 @@ mod tests {
             allow.set(false);
             set_depth_bias_x(l, -42.5, 0.0, 0.0);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(key).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&key).unwrap();
                 assert!(s.pso_dirty);
                 assert_eq!(s.depth_bias, Some(DepthBias::new(-42.5, 0.0, 0.0)));
@@ -5111,7 +5127,7 @@ mod tests {
             set_depth_bias_x(l, -10.0, 0.0, 0.0);
             assert_eq!(calls.borrow().len(), n_before);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(key).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&key).unwrap();
                 assert!(s.pso_dirty);
             }
@@ -5265,7 +5281,7 @@ mod tests {
                 _ => assert!(bound.is_empty()),
             }
         }
-        LISTS.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
+        recording(list as usize).lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
     }
 
     #[test]
@@ -5447,7 +5463,7 @@ mod tests {
         let list_ptr = &*fake as *const FakeRtList as *mut c_void;
 
         let restore = || {
-            let b = LISTS.lock().unwrap().as_ref().unwrap().get(&(list_ptr as usize)).unwrap().bindings.clone();
+            let b = recording(list_ptr as usize).lock().unwrap().as_ref().unwrap().get(&(list_ptr as usize)).unwrap().bindings.clone();
             unsafe { restore_bindings(list_ptr, &b, D3D12_COMMAND_LIST_TYPE_DIRECT) };
         };
 
@@ -5611,7 +5627,7 @@ mod tests {
             // Seed ListState with fake dedicated predication resource and verify initial rejections.
             on_create(list_ptr, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
             {
-                let mut g = LISTS.lock().unwrap();
+                let mut g = recording(list_key).lock().unwrap();
                 let s = g.as_mut().unwrap().get_mut(&list_key).unwrap();
                 s.pred_buf = Some(ID3D12Resource::from_raw(pb_raw as *mut c_void));
             }
@@ -5667,7 +5683,7 @@ mod tests {
             }
             *fake.ty.lock().unwrap() = D3D12_COMMAND_LIST_TYPE_DIRECT;
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(list_key).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&list_key).unwrap();
                 assert_eq!(s.predication, Some(D3D12_PREDICATION_OP_EQUAL_ZERO));
                 assert!(s.pred_in_state);
@@ -5789,7 +5805,7 @@ mod tests {
             write64_bottom_x(list_ptr, bottom_va + 4, 0, 0, BOTTOM_TIMESTAMPS);
             write64_bottom_x(list_ptr, 0, 0, 0, BOTTOM_TIMESTAMPS);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(list_ptr as usize).lock().unwrap();
                 assert!(g.as_ref().unwrap()[&(list_ptr as usize)].cpu_writes.is_empty());
             }
 
@@ -5797,7 +5813,7 @@ mod tests {
             write64_top_x(list_ptr, top_va, 0, TOP_TIMESTAMPS);
             write64_bottom_x(list_ptr, bottom_va, 0, 0, BOTTOM_TIMESTAMPS);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(list_ptr as usize).lock().unwrap();
                 assert_eq!(g.as_ref().unwrap()[&(list_ptr as usize)].cpu_writes.len(), 2);
             }
 

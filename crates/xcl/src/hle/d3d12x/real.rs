@@ -32,12 +32,23 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows_sys::core::GUID;
 
 use super::layout::{self, Iface};
+use super::sharded::Sharded;
 use crate::stubs;
 use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, E_OUTOFMEMORY, S_FALSE, S_OK};
 
 const DLL: &str = "d3d12_xs.dll";
 const EXTRA_SLOTS: usize = 64;
 const MAX_SCAN: usize = 512;
+
+/// Where `$method` is in the PC interface `$iface` and every later version of it, looked up once
+/// (`slot_of` asks for an object's class, by name, under one lock: a title records thousands of
+/// these calls a frame on many threads).
+macro_rules! pc_slot {
+    ($iface:literal, $method:literal) => {{
+        static SLOT: OnceLock<usize> = OnceLock::new();
+        *SLOT.get_or_init(|| layout::find($iface).and_then(|i| layout::slot(i, $method)).expect("method in layout"))
+    }};
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
@@ -198,6 +209,25 @@ pub fn uma_window_vas() -> Vec<u64> {
     UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
 }
 
+/// the windows' addresses again, for what asks for every draw and dispatch (0: no such window)
+static UMA_WINDOW_VAS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// how many there are
+static UMA_WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `uma_window_vas()[k]`, without its lock.
+pub(super) fn uma_window_va(k: usize) -> Option<u64> {
+    (k < UMA_WINDOWS.load(Ordering::Acquire)).then(|| UMA_WINDOW_VAS[k].load(Ordering::Relaxed))
+}
+
+fn set_uma_windows(bufs: Vec<(usize, u64)>) {
+    UMA_WINDOWS.store(0, Ordering::Release);
+    for (at, b) in UMA_WINDOW_VAS.iter().zip(&bufs) {
+        at.store(b.1, Ordering::Relaxed);
+    }
+    UMA_WINDOWS.store(bufs.len().min(UMA_WINDOW_VAS.len()), Ordering::Release);
+    *UMA_BUFFER.lock().unwrap() = bufs;
+}
+
 /// The window buffer holding `len` bytes at UMA address `p`, and their offset in it.
 pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
     let u = crate::gpu::uma::get()?;
@@ -213,7 +243,7 @@ pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
 pub fn uma_va_of(p: usize) -> Option<u64> {
     let u = crate::gpu::uma::get()?;
     let k = u.window_of(p)?;
-    Some(*uma_window_vas().get(k)? + (p - u.window(k).0) as u64)
+    Some(uma_window_va(k)? + (p - u.window(k).0) as u64)
 }
 
 /// What the start-up check of the coherent UMA windows found (`check_uma_import`): empty – not
@@ -431,7 +461,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
             crate::xlog_info!("D3D12.X: memory windows from the shared descriptor heap (no per-access switch)");
         }
     }
-    *UMA_BUFFER.lock().unwrap() = bufs;
+    set_uma_windows(bufs);
 }
 
 pub fn stats() -> D3d12Stats {
@@ -1590,7 +1620,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     // the PC's Map only on a resource it can map: on a reserved one or one without CPU pages it is
     // an invalid call (debug layer 824 / 822) that the runtime answers with E_INVALIDARG
     let hr = if pc_can_map(this) {
-        let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
+        let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Resource", "Map")));
         f(this, sub, range, data)
     } else {
         E_INVALIDARG
@@ -1621,7 +1651,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
 /// Every console resource is CPU-visible memory, a PC texture only in a CPU-visible heap.
 unsafe extern "system" fn res_write_to_subresource(this: *mut c_void, sub: u32, dst_box: *const D3D12_BOX, data: *const c_void, row_pitch: u32, depth_pitch: u32) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_BOX, *const c_void, u32, u32) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "WriteToSubresource")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Resource", "WriteToSubresource")));
     let hr = f(this, sub, dst_box, data, row_pitch, depth_pitch);
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static FAILED: AtomicU64 = AtomicU64::new(0);
@@ -1658,7 +1688,7 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
     if UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
         return;
     }
-    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Resource", "Unmap")));
     f(this, sub, range)
 }
 
@@ -1729,10 +1759,10 @@ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
 /// A pipeline state is gone: drop what XCL keeps by its address (a later pipeline may get the
 /// same address and must not inherit its root signature or compute pass).
 /// compute pipelines that run a translated console shader
-static TRANSLATED_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static TRANSLATED_COMPUTE: Sharded<()> = Sharded::new();
 
 /// graphics pipelines built from translated console shaders
-static TRANSLATED_GRAPHICS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static TRANSLATED_GRAPHICS: Sharded<()> = Sharded::new();
 
 /// Whether `pso` is a graphics pipeline of translated console shaders.
 /// `XCL_TRACE_FRAME`: the console VS and PS (their dump names' hashes) of a translated PSO.
@@ -1758,7 +1788,7 @@ pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
 }
 
 pub fn is_translated_graphics(pso: usize) -> bool {
-    pso != 0 && TRANSLATED_GRAPHICS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+    pso != 0 && TRANSLATED_GRAPHICS.contains(pso)
 }
 
 /// graphics pipelines given the generated rect list GS (`rect_list_gs`)
@@ -1781,7 +1811,7 @@ fn note_rect_list_gs(pso: usize, copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect
 
 /// Whether `pso` runs a translated console compute shader.
 pub fn is_translated_compute(pso: usize) -> bool {
-    pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+    pso != 0 && TRANSLATED_COMPUTE.contains(pso)
 }
 
 /// compute pipelines the title made from a console shader that runs untranslated: a background
@@ -1810,7 +1840,7 @@ pub(super) fn register_console_compute_for_test(pso: usize) {
 #[cfg(test)]
 pub(super) fn register_translated_compute_for_test(pso: usize) {
     if pso != 0 {
-        TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        TRANSLATED_COMPUTE.insert(pso, ());
     }
 }
 
@@ -1824,7 +1854,7 @@ pub(super) fn register_rect_list_gs_for_test(pso: usize) {
 #[cfg(test)]
 pub(super) fn register_translated_graphics_for_test(pso: usize) {
     if pso != 0 {
-        TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        TRANSLATED_GRAPHICS.insert(pso, ());
     }
 }
 
@@ -1834,24 +1864,16 @@ pub(super) fn forget_pso_for_test(pso: usize) {
 }
 
 fn forget_pso(pso: usize) {
-    if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
-        s.remove(&pso);
-    }
+    TRANSLATED_COMPUTE.remove(pso);
     if let Some(s) = CONSOLE_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
-    if let Some(s) = TRANSLATED_GRAPHICS.lock().unwrap().as_mut() {
-        s.remove(&pso);
-    }
+    TRANSLATED_GRAPHICS.remove(pso);
     if let Some(s) = RECT_LIST_GS.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
-    if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
-        m.remove(&pso);
-    }
-    if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
-        m.remove(&pso);
-    }
+    PSO_RS.remove(pso);
+    PSO_USER_SGPRS.remove(pso);
     if let Some(m) = PSO_SHADERS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
@@ -2667,11 +2689,11 @@ macro_rules! as_usize {
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     super::list_x::before_close(this);
     let ext = *(this as *const usize);
-    let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
+    let f: RefFn = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "Close")));
     let hr = f(this) as HRESULT;
     preserve_vtable(this, ext);
     if hr < 0 {
-        let ty: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "GetType")));
+        let ty: RefFn = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "GetType")));
         crate::xlog_warn!("D3D12.X: command list {this:p} (type {}) Close → {:#x}", ty(this), hr as u32);
     }
     hr
@@ -2681,7 +2703,7 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, initial_state: *mut c_void) -> HRESULT {
     let ext = *(this as *const usize);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
-        std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
+        std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "Reset")));
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
@@ -2831,12 +2853,18 @@ macro_rules! creator {
                     crate::xlog_info!("D3D12.X: {} for interface {asked} (not on the PC) – made as {}", $method, super::layout::guid_string(&iid));
                 }
             }
-            if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+            if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !is_own_object($kind) {
                 adopt(*ppv, $kind);
             }
             hr
         }
     };
+}
+
+/// XCL's own lists, allocators, buffers and fences (made in `title_textures::own_work`) stay the
+/// PC's: the title never sees them, and what a hook does for a title's object is paid on its submit.
+fn is_own_object(kind: Kind) -> bool {
+    matches!(kind, Kind::CommandList | Kind::CommandAllocator | Kind::Resource | Kind::Fence) && super::title_textures::is_own_work()
 }
 
 creator!(dev_create_command_queue, "CreateCommandQueue", Kind::CommandQueue, [a1]);
@@ -3548,28 +3576,28 @@ unsafe fn shader_bytes<'a>(b: &D3D12_SHADER_BYTECODE) -> Option<&'a [u8]> {
 
 /// Root signature of every pipeline built from translated console shaders (static samplers
 /// make it per pipeline): the draw binds it instead of the title's.
-static PSO_RS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+static PSO_RS: Sharded<usize> = Sharded::new();
 
 fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
     if !pso.is_null() {
-        PSO_RS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, rs as usize);
+        PSO_RS.insert(pso as usize, rs as usize);
     }
 }
 
 /// user SGPRs of the console CS of a translated compute pipeline
-static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+static PSO_USER_SGPRS: Sharded<u32> = Sharded::new();
 
 /// How many user SGPRs the console compute shader of a translated pipeline has (None: not
 /// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
 pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
     let pso = super::pso_async::resolve(pso);
-    PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
+    PSO_USER_SGPRS.get(pso)
 }
 
 /// The root signature a translated pipeline state was created with.
 pub fn pso_root_signature(pso: usize) -> Option<usize> {
     let pso = super::pso_async::resolve(pso);
-    PSO_RS.lock().unwrap().as_ref()?.get(&pso).copied()
+    PSO_RS.get(pso)
 }
 
 /// ABI root signatures with static samplers, by sampler set (owned here, never released).
@@ -4030,7 +4058,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+        PSO_USER_SGPRS.insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
     PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (record, 0));
@@ -4850,7 +4878,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
-    TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    TRANSLATED_GRAPHICS.insert(*ppv as usize, ());
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::gpu_profile::on() && !super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
@@ -5183,7 +5211,7 @@ unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID
 
 unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+        TRANSLATED_COMPUTE.insert(*ppv as usize, ());
     }
 }
 
@@ -5211,7 +5239,9 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     // a console shader the recompiler could not take must not reach the driver: AMD's shader
     // compiler crashes on the stripped DXIL (NOBC bitcode) instead of rejecting it
     let hr = if console.is_some() { E_INVALIDARG } else { finish_pso(this, f, desc, riid, ppv) };
-    if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+    // (a program of XCL's own that the driver refuses is not one that does nothing: its user has
+    // another way)
+    if hr >= 0 || super::title_textures::is_own_work() || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return hr;
     }
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
@@ -5951,7 +5981,7 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
         let iid = pc_iid(Kind::RootSignature);
         hr = f(this, mask, blob, len, &iid, ppv);
     }
-    if hr < 0 {
+    if hr < 0 && !super::title_textures::is_own_work() {
         // console root signature rejected → empty one so the title keeps going
         let desc = D3D12_ROOT_SIGNATURE_DESC { Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, ..Default::default() };
         let mut ser = None;
@@ -6006,7 +6036,7 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
 /// ClearRenderTargetView: as on the PC (`XCL_TRACE_FRAME`: the colours logged)
 unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *const [f32; 4], n: u32, rects: *const c_void) {
     type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearRenderTargetView")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "ClearRenderTargetView")));
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -6021,7 +6051,7 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
     if super::present::trace_frame() {
@@ -6052,14 +6082,14 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "SetPipelineState")));
     f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
     super::list_x::on_set_pipeline_state(this, pso as usize);
 }
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "ClearState")));
     f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
     super::list_x::on_clear_state(this, pso as usize);
     super::bind::clear_state(this, pso as usize);
@@ -6068,14 +6098,14 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icount: u32, sv: u32, si: u32) {
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawInstanced")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "DrawInstanced")));
     f(this, vcount, icount, sv, si);
 }
 
 unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u32, inst: u32, si: u32, bv: i32, sinst: u32) {
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawIndexedInstanced")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "DrawIndexedInstanced")));
     f(this, icount, inst, si, bv, sinst);
 }
 
@@ -6091,7 +6121,7 @@ unsafe extern "system" fn cl_execute_indirect(
 ) {
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "ExecuteIndirect")));
     f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off);
 }
 
@@ -6335,10 +6365,12 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
 pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
     const PC_GET_COMPLETED_VALUE: usize = 8;
     let p = fence.as_raw();
-    let f: unsafe extern "system" fn(*mut c_void) -> u64 = if is_adopted(p) {
-        std::mem::transmute(orig_fn(p, slot_of(p, "GetCompletedValue")))
+    // (a fence XCL holds a reference to: no need to ask Windows whether it can be read, as
+    // `is_adopted` does)
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = if is_ext(vt(p) as usize) {
+        std::mem::transmute(orig_fn(p, PC_GET_COMPLETED_VALUE))
     } else {
-        std::mem::transmute(*(*(p as *const *const usize)).add(PC_GET_COMPLETED_VALUE))
+        std::mem::transmute(*vt(p).add(PC_GET_COMPLETED_VALUE))
     };
     f(p)
 }
@@ -6346,7 +6378,7 @@ pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
 /// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back
 /// asynchronously (`sparse::readback_after_execute`): the copies back the value covers land first.
 unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
-    let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, slot_of(this, "GetCompletedValue")));
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Fence", "GetCompletedValue")));
     let v = f(this);
     super::sparse::settle_readbacks_try();
     v
@@ -6382,7 +6414,7 @@ unsafe extern "system" fn fence_wait_fired(ctx: *mut c_void, _timed_out: bool) {
 /// (a blocking wait) settles them after it.
 unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
     use windows_sys::Win32::System::Threading::{CreateEventW, RegisterWaitForSingleObject, UnregisterWaitEx, INFINITE, WT_EXECUTEONLYONCE};
-    let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetEventOnCompletion")));
+    let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Fence", "SetEventOnCompletion")));
     if event.is_null() || !super::sparse::readbacks_async() {
         let hr = f(this, value, event);
         if event.is_null() {
@@ -6415,7 +6447,7 @@ unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value
 
 /// Fence::Signal (CPU)
 unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT {
-    let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
+    let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Fence", "Signal")));
     let hr = f(this, value);
     super::fence_x::note_cpu_signal(this as usize);
     hr
@@ -6423,7 +6455,7 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
 
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12CommandQueue", "ExecuteCommandLists")));
     if n == 0 || lists.is_null() {
         f(this, n, lists);
         stop_if_device_removed();
