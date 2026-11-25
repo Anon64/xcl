@@ -9,8 +9,8 @@ static PIECES: AtomicU64 = AtomicU64::new(0);
 static DISPATCHES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn log_counts() {
-    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued",
-        PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed));
+    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued, {} MiB of scratch held",
+        PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed), SCRATCH_HELD.load(Ordering::Relaxed) >> 20);
 }
 
 struct PipelineBuilder {
@@ -108,8 +108,39 @@ pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12Pi
 
 struct Recording {
     scratch: ID3D12Resource,
+    /// its size, taken from `SCRATCH_HELD`
+    bytes: u64,
     first: ID3D12PipelineState,
     chain: Arc<Chain>,
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        SCRATCH_HELD.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// The scratch of every chained dispatch whose allocator has not been reset yet. Each dispatch
+/// makes its own (a new committed buffer, released at its allocator's Reset or Release).
+static SCRATCH_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// `XCL_DIRECT_SPLIT_SCRATCH_MB`: how much scratch the chained dispatches not yet released may
+/// hold together (default 1024 MiB); a dispatch past it runs the whole program.
+fn scratch_cap() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| std::env::var("XCL_DIRECT_SPLIT_SCRATCH_MB").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1024).saturating_mul(1 << 20))
+}
+
+/// Takes `bytes` from `held` when they fit under `cap`.
+fn reserve(held: &AtomicU64, bytes: u64, cap: u64) -> bool {
+    let mut h = held.load(Ordering::Acquire);
+    loop {
+        let Some(n) = h.checked_add(bytes).filter(|&n| n <= cap) else { return false };
+        match held.compare_exchange_weak(h, n, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => h = now,
+        }
+    }
 }
 
 static RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Arc<Recording>>>>> = LazyLock::new(Default::default);
@@ -157,17 +188,59 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
         super::super::alloc_pool::recording_backing(list.as_raw() as usize).unwrap_or(0)
     } else { allocator };
     let size = grid.into_iter().try_fold(u64::from(chain.words) * 4, |s, n| s.checked_mul(n as u64));
-    let scratch = size.filter(|&n| n <= u32::MAX as u64 + 1 && allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
-        .and_then(|n| scratch_buffer(&chain.builder.device, n));
+    let bytes = size.filter(|&n| n <= u32::MAX as u64 + 1 && allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE);
+    let bytes = bytes.filter(|&n| {
+        let fits = reserve(&SCRATCH_HELD, n, scratch_cap());
+        if !fits {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let k = N.fetch_add(1, Ordering::Relaxed);
+            if k < 4 || k.is_power_of_two() {
+                crate::xlog_info!("compute split: {} MiB of scratch held by chained dispatches not yet released (XCL_DIRECT_SPLIT_SCRATCH_MB {}): a dispatch that needs {} MiB more runs the whole program ({} so far)",
+                    SCRATCH_HELD.load(Ordering::Relaxed) >> 20, scratch_cap() >> 20, n.div_ceil(1 << 20), k + 1);
+            }
+        }
+        fits
+    });
+    let scratch = bytes.and_then(|n| {
+        let made = scratch_buffer(&chain.builder.device, n);
+        if made.is_none() {
+            SCRATCH_HELD.fetch_sub(n, Ordering::AcqRel);
+        }
+        made
+    });
     let Some(scratch) = scratch else {
         bind(list, &chain.whole()?);
         list.Dispatch(x, y, z);
         return Ok(());
     };
-    let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
-    let held = Arc::new(Recording { scratch, first, chain });
+    let bytes = bytes.unwrap_or(0);
+    let Some(first) = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).cloned() else {
+        SCRATCH_HELD.fetch_sub(bytes, Ordering::AcqRel);
+        return Err("first compute piece".into());
+    };
+    let held = Arc::new(Recording { scratch, bytes, first, chain });
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     pso::record_dispatch_chain(list, grid, &held.scratch, std::iter::once(&held.first).chain(&held.chain.tail), |p| bind(list, p));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scratch budget: what fits is taken, what would go past it is not, and what was given
+    /// back fits again.
+    #[test]
+    fn scratch_is_taken_up_to_its_cap() {
+        let held = AtomicU64::new(0);
+        assert!(reserve(&held, 600, 1000));
+        assert!(!reserve(&held, 401, 1000), "past the cap");
+        assert_eq!(held.load(Ordering::Relaxed), 600, "nothing taken past the cap");
+        assert!(reserve(&held, 400, 1000), "up to the cap");
+        held.fetch_sub(600, Ordering::Relaxed);
+        assert!(reserve(&held, 600, 1000), "given back");
+        assert!(!reserve(&held, u64::MAX, u64::MAX), "no overflow");
+        assert_eq!(held.load(Ordering::Relaxed), 1000);
+    }
 }
