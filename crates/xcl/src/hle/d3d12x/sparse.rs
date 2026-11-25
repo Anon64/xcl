@@ -2024,6 +2024,8 @@ pub unsafe fn settle_readbacks_within(ms: u64) -> bool {
     if RB_PENDING.load(Ordering::Acquire) == 0 {
         return true;
     }
+    // (`XCL_LOOK_STATS=2`: the time a title's thread spends here when it looks at a fence)
+    let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::FenceSettle));
     let t0 = std::time::Instant::now();
     loop {
         if let Ok(mut g) = STATE.try_lock() {

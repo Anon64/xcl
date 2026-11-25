@@ -49,6 +49,8 @@ static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
+    // (`XCL_LOOK_STATS=2`: a frame's time on the thread that submits, added up)
+    let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::Present));
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
@@ -315,6 +317,7 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
     }
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);
     LAST_BOUNDARY_MS.store(now_ms(), Ordering::Relaxed);
+    let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::Present));
     unsafe { present_now(Duration::from_millis(4), None) };
 }
 
@@ -690,7 +693,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         return; // swap chain is bound to the first queue we presented from
     }
     // wait for the previous copy so the allocator can be reused
-    if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 100) {
+    let waited = {
+        let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::PresentCopyWait));
+        fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 100)
+    };
+    if let Err(e) = waited {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
             crate::xlog_error!("present: previous copy: {e}");
