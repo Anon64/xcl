@@ -138,6 +138,23 @@ pub(super) fn sent(known: &Known, changed: Option<&[(usize, usize)]>, to: &Sent,
     k.again.is_some()
 }
 
+/// Uploads of `old` that may not have run yet can land over those of `new`, a texture over the same
+/// video memory.
+pub(super) fn inherit(new: &Known, old: &Known) {
+    let unfinished: Vec<Sent> = old.lock().unwrap().last.iter().filter(|s| !s.done()).cloned().collect();
+    let mut k = new.lock().unwrap();
+    for s in unfinished {
+        match k.last.iter_mut().find(|o| o.queue == s.queue) {
+            Some(o) => {
+                if s.value > o.value {
+                    *o = s;
+                }
+            }
+            None => k.last.push(s),
+        }
+    }
+}
+
 /// What a texture has to send again.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Again {
@@ -469,9 +486,10 @@ struct Hashes<'a> {
 }
 
 impl Hashes<'_> {
-    /// `b` was read at `from` and goes up: what is known of its pages is that (a page read in part
-    /// is not known: its next write goes up). Neighbours of a changed page are read with it, and a
-    /// title may write on between the comparison and here; what is kept is what the PC texture gets.
+    /// `b` was read at `from` and is about to go up: what is known of its pages is that (a page read
+    /// in part is not known: its next write goes up). Neighbours of a changed page are read with it,
+    /// and a title may write on between the comparison and here; what is kept is what the PC texture
+    /// gets, or older than that (a write from here on is compared with it at the next look).
     fn note(&self, from: usize, b: &[u8]) {
         let first = self.src / PAGE * PAGE;
         let mut p = from / PAGE * PAGE;
@@ -533,8 +551,8 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let (it, c) = (&items[p.item], &items[p.item].tex.texels().unwrap().chain);
                     let from = it.src + p.slice * c.slice_bytes + c.block_at(p.level, bx.start, *by);
                     read(from, bx.len() * c.layout.block_bytes, |b| {
-                        c.detile_blocks(b, p.level, p.slice, *by, bx.clone(), p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize);
                         note(p.item, from, b);
+                        c.detile_blocks(b, p.level, p.slice, *by, bx.clone(), p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize);
                     });
                 }
                 Work::Tail { pieces: range } => {
@@ -542,10 +560,10 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let (it, c) = (&items[first.item], &items[first.item].tex.texels().unwrap().chain);
                     let from = it.src + first.slice * c.slice_bytes;
                     read(from, c.layout.block_bytes, |b| {
+                        note(first.item, from, b);
                         for p in &pieces[range.clone()] {
                             c.detile_blocks(b, p.level, p.slice, 0, 0..1, p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize);
                         }
-                        note(first.item, from, b);
                     });
                 }
                 Work::Rows { piece, y } => {
@@ -555,11 +573,11 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let (stride, row) = (l.pitch << e, (p.rect.x1 - p.rect.x0) << e);
                     let from = it.src + p.slice * c.slice_bytes + l.offset + y.start * stride + (p.rect.x0 << e);
                     read(from, y.len() * stride - (p.rect.x0 << e), |b| {
+                        note(p.item, from, b);
                         for (n, y) in y.clone().enumerate() {
                             let dst = to.0.add(p.at as usize + (y - p.rect.y0) * p.footprint.RowPitch as usize);
                             std::ptr::copy_nonoverlapping(b[n * stride..][..row].as_ptr(), dst, row);
                         }
-                        note(p.item, from, b);
                     });
                 }
                 Work::Volume { pieces: range } => {
@@ -567,6 +585,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let it = &items[first.item];
                     let s = it.tex.texels().unwrap();
                     read(it.src, s.size() as usize, |b| {
+                        note(first.item, it.src, b);
                         for p in &pieces[range.clone()] {
                             let (l, row) = (&s.chain.levels[p.level], p.rect.x1 * s.bpe as usize);
                             let data = s.chain.detile_volume(b, p.level);
@@ -574,7 +593,6 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                                 std::ptr::copy_nonoverlapping(r.as_ptr(), to.0.add(p.at as usize + n * p.footprint.RowPitch as usize), row);
                             }
                         }
-                        note(first.item, it.src, b);
                     });
                 }
             }
@@ -1095,6 +1113,13 @@ mod tests {
             assert!(sent(&known, Some(&[(0, 64)]), &at(own, &fo, 5), 0));
             forget(&known);
             assert_eq!(take_again(&known, other, own), Again::Nothing);
+            // another texture over the same video memory takes them over
+            assert!(!sent(&Known::default(), None, &at(own, &fo, 6), 0));
+            let over: Known = Default::default();
+            inherit(&over, &known);
+            assert!(sent(&over, None, &at(own, &fo, 7), 0), "behind the other queue's, which is still to run");
+            assert_eq!(take_again(&over, own, 0), Again::NotYet);
+            assert_eq!(take_again(&over, other, own), Again::Now(Change::All));
             // nothing pending: nothing overtaken
             for (f, v) in [(&fd, 9), (&fo, 9), (&fx, 9)] {
                 f.Signal(v).unwrap();
