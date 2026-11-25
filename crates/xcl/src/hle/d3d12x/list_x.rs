@@ -392,10 +392,12 @@ fn read_back(va: u64) -> bool {
 }
 
 /// `XCL_TRACE_FRAME`: the fixed-function state a list last set (topology, first viewport and
-/// scissor, render targets) as text.
+/// scissor, render targets) as text, and what the bound DSV names (`XCL_DUMP_TARGETS` keeps that).
 pub(super) fn state_summary(list: *mut c_void) -> String {
     let mut out = String::new();
+    let mut dsv = None;
     with_bindings(list, |b| {
+        dsv = b.render_targets.as_ref().and_then(|rt| rt.dsv);
         let vp = b.viewports.first().map(|v| (v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth));
         let sc = b.scissors.first().map(|r| (r.left, r.top, r.right, r.bottom));
         out = format!(
@@ -408,6 +410,16 @@ pub(super) fn state_summary(list: *mut c_void) -> String {
             b.render_targets.as_ref().and_then(|rt| rt.dsv).map_or(String::new(), |d| format!(", DSV {d:#x}"))
         );
     });
+    // (after the bindings' lock: the map has its own; the resource is taken with a reference of
+    // its own there, since another CreateDepthStencilView at the handle releases the map's)
+    if let Some(x) = dsv.and_then(super::present::rtv_resource).and_then(|r| unsafe { super::present::view_resource(r) }) {
+        let d = unsafe { x.GetDesc() };
+        // flags: the resource's; the view's (1 read-only depth, 2 read-only stencil) when `depth_uav` keeps the DSV
+        out += &format!(" names {:#x} {}x{} PC format {} flags {:#x}", x.as_raw() as usize, d.Width, d.Height, d.Format.0, d.Flags.0);
+        if let Some(f) = dsv.and_then(super::depth_uav::dsv_flags) {
+            out += &format!(", view flags {f:#x}");
+        }
+    }
     out
 }
 
@@ -4711,11 +4723,28 @@ fn uav_clear_handles(gpu: Option<super::console_heap::Slot>, cpu: Option<super::
     }
 }
 
+/// The resource a ClearUnorderedAccessView* of `res` through the GPU slot `gpu` goes to the PC
+/// with: `res`, or the twin of a depth buffer the slot's view names (`depth_uav`). None: not
+/// done (what the view names is not known). Also for the clears of console-recorded lists.
+pub(super) fn uav_clear_resource(res: usize, gpu: Option<super::console_heap::Slot>) -> Option<usize> {
+    if !super::depth_uav::any() {
+        return Some(res);
+    }
+    let named = gpu.filter(|s| s.shared_srv != 0).map(|s| super::console_heap::names_of(&s).1);
+    match super::depth_uav::clear_target(res, named) {
+        super::depth_uav::Clear::AsIs => Some(res),
+        super::depth_uav::Clear::Twin(t) => Some(t),
+        super::depth_uav::Clear::NotDone => None,
+    }
+}
+
 /// command list #53 / #54 ClearUnorderedAccessViewUint / Float(GPU handle, CPU handle,
 /// resource, values[4], rects, rect list) (PC #49 / #50): console handles are addresses of
-/// console heap slots (heap #9 / #10), not PC descriptors
+/// console heap slots (heap #9 / #10), not PC descriptors. A depth buffer whose UAV views are
+/// views of its twin (`depth_uav`) is cleared through the twin the GPU slot's view names.
 unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usize, values: *const c_void, n: u32, rects: *const windows::Win32::Foundation::RECT) {
-    let (gpu, cpu) = match uav_clear_handles(super::console_heap::slot(gpu), super::console_heap::slot(cpu)) {
+    let gpu_slot = super::console_heap::slot(gpu);
+    let (gpu, cpu) = match uav_clear_handles(gpu_slot, super::console_heap::slot(cpu)) {
         UavClearHandles::Console { gpu, cpu } => (gpu, cpu),
         UavClearHandles::Pc => (gpu, cpu),
         UavClearHandles::Unusable => {
@@ -4726,6 +4755,7 @@ unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usi
             return;
         }
     };
+    let Some(res) = uav_clear_resource(res, gpu_slot) else { return };
     pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
 }
 

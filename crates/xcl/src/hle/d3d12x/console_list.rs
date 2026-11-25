@@ -818,15 +818,22 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let res = q(2) as *mut c_void;
                 let (gpu, cpu) = (super::console_heap::slot(q(0)), super::console_heap::slot(q(1)));
                 match (gpu, cpu, ID3D12Resource::from_raw_borrowed(&res)) {
-                    (Some(g), Some(c), Some(r)) if g.pc_gpu_uav != 0 => {
-                        let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: g.pc_gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
-                        if get(1) != 0 {
-                            let f = values.map(f32::from_bits);
-                            list.ClearUnorderedAccessViewFloat(gh, ch, r, &f, &[]);
+                    (Some(g), Some(c), Some(_)) if g.pc_gpu_uav != 0 => {
+                        // a view of a depth buffer's twin is cleared through the twin (as a direct
+                        // list's clear: `list_x::clear_uav`); None: not done
+                        let target = super::list_x::uav_clear_resource(res as usize, Some(g)).map(|t| t as *mut c_void);
+                        if let Some(r) = target.as_ref().and_then(|t| ID3D12Resource::from_raw_borrowed(t)) {
+                            let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: g.pc_gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
+                            if get(1) != 0 {
+                                let f = values.map(f32::from_bits);
+                                list.ClearUnorderedAccessViewFloat(gh, ch, r, &f, &[]);
+                            } else {
+                                list.ClearUnorderedAccessViewUint(gh, ch, r, &values, &[]);
+                            }
+                            out.clears += 1;
                         } else {
-                            list.ClearUnorderedAccessViewUint(gh, ch, r, &values, &[]);
+                            out.skipped += 1;
                         }
-                        out.clears += 1;
                     }
                     _ => out.skipped += 1,
                 }

@@ -1131,6 +1131,18 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag });
         }
     }
+    // and what each depth UAV twin holds (`depth_uav`; it rests in UNORDERED_ACCESS)
+    if dumping_targets {
+        for (tag, twin) in super::depth_uav::twins_to_dump() {
+            let d = twin.GetDesc();
+            p.list.ResourceBarrier(&[transition(&twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let copied = readback_copy(&p.list, &twin, &d);
+            p.list.ResourceBarrier(&[transition(&twin, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            if let Some((buffer, footprint)) = copied {
+                dumps.push(FrameDump { _source: twin, buffer, footprint, format: d.Format, tag });
+            }
+        }
+    }
     let mut composited = false;
     if resolved.len() > 1 {
         if p.compositor.is_none() {
@@ -1259,6 +1271,10 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
+                    if dump.tag.starts_with("twin") {
+                        super::depth_uav::log_values(&dump.buffer, &dump.footprint, &dump.tag);
+                        continue;
+                    }
                     if dump.tag.starts_with("target") {
                         super::targets::log_census(&dump.buffer, &dump.footprint, &dump.tag);
                     }

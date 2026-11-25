@@ -1977,6 +1977,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             super::sparse::forget_buffer(this as usize);
         }
         super::vram::forget(this as usize);
+        super::depth_uav::forget(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         // a buffer may be over a heap of pages that are freed next; a texture, and a buffer of XCL's
@@ -2322,6 +2323,9 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
         note_mixed_copy();
         return;
     }
+    if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 {
+        super::depth_uav::dsvs_copied(this, n, dst, src);
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, n, dst, src, ty);
 }
@@ -2337,6 +2341,9 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
         if !srcs.is_null() && ns > 0 && slot(*srcs).is_some() {
             note_mixed_copy();
             return;
+        }
+        if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 {
+            super::depth_uav::dsv_ranges_copied(this, nd, dsts, dsizes, ns, srcs, ssizes);
         }
         type F = unsafe extern "system" fn(*mut c_void, u32, *const u64, *const u32, u32, *const u64, *const u32, u32);
         let f: F = std::mem::transmute(orig_fn(this, 23));
@@ -2476,7 +2483,20 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if super::targets::enabled() {
         super::present::note_rtv(cpu as usize, res);
     }
-    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
+    // `XCL_TRACE_FRAME`: the first 64 DSVs of depth buffers at least 1920 wide (flags 1: read-only
+    // depth, 2: read-only stencil)
+    if super::present::trace_frame() {
+        if let Some(d) = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc()).filter(|d| d.Width >= 1920 && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 64 {
+                let (vf, flags) = copy.as_ref().map_or((0, 0), |c| (c.Format.0, c.Flags.0));
+                crate::xlog_info!("frame trace: CreateDepthStencilView {cpu:#x} → {res:p} {}x{} PC format {}, view format {vf}, flags {flags:#x}", d.Width, d.Height, d.Format.0);
+            }
+        }
+    }
+    let flags = copy.as_ref().map_or(0, |c| c.Flags.0 as u32);
+    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
+    super::depth_uav::note_dsv(cpu as usize, res as usize, flags);
 }
 
 /// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
@@ -2695,7 +2715,8 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
         return r as *mut c_void;
     }
     let mut r = std::ptr::null_mut();
-    let hr = super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r);
+    // (in COMMON, not the state the title made the memory's buffer in: `depth_uav` keeps that)
+    let hr = super::depth_uav::by_address(|| super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r));
     if hr < 0 || r.is_null() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -2949,12 +2970,20 @@ fn uav_companion_srv(
 }
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
+    let rd_opt = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
+    // a UAV of the stencil plane of a depth buffer with unordered access: a view of its twin
+    // (`depth_uav`), made the way a UAV of a texture with unordered access is
+    let null_why = match super::depth_uav::resolve_uav(this, res, rd_opt.as_ref(), desc.as_ref()) {
+        super::depth_uav::Resolve::Twin(twin, view) => return dev_create_uav_checked_x(this, twin, std::ptr::null_mut(), &view, cpu),
+        super::depth_uav::Resolve::Null(why) => Some(why),
+        super::depth_uav::Resolve::NotOurs => None,
+    };
     // the view's format as the PC's for the resource (B5G5R5A1 of a target made R8G8B8A8,
     // `device_x::pc_resource_desc`: an invalid call, the device removed)
     let mut copy = desc.as_ref().copied();
     if let Some(c) = copy.as_mut() {
-        if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
-            let rf = r.GetDesc().Format.0 as u32;
+        if let Some(rd) = rd_opt.as_ref() {
+            let rf = rd.Format.0 as u32;
             c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
         } else {
             c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(c.Format.0 as u32) as i32);
@@ -2966,7 +2995,6 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     super::present::note_use(res as usize, super::present::USE_UAV);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
-    let rd_opt = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
     if super::present::trace_frame() {
         if rd_opt.is_some_and(|d| d.Width >= 1920 && d.Flags.0 & 1 != 0) {
             let s = super::console_heap::slot(cpu);
@@ -2986,7 +3014,9 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     let pc_uav = |at: u64| {
         if no_uav {
             static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            if let Some(why) = null_why {
+                super::depth_uav::null_view(why);
+            } else if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
             }
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
@@ -3160,6 +3190,9 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         super::device_x::pc_initial_state_for_desc(orig_flags, pc_flags, state as u32)
     });
     let hr = dev_create_committed_resource(this, props, flags, desc, st as usize, clear, riid, ppv);
+    if hr >= 0 && pc_full.is_some() && !ppv.is_null() && !(*ppv).is_null() {
+        super::depth_uav::note_created(*ppv, &(console_desc as *const [u8; 0x38]).read_unaligned(), None, st);
+    }
     if hr < 0 {
         let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
         crate::xlog_warn!(
@@ -3613,7 +3646,11 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
             u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x2C), u(0x30)
         );
     }
-    hr3.unwrap_or(hr2)
+    let hr = hr3.unwrap_or(hr2);
+    if hr >= 0 && is_texture && !ppv.is_null() && !(*ppv).is_null() {
+        super::depth_uav::note_created(*ppv, &x, None, st);
+    }
+    hr
 }
 
 /// A texture the title placed in a heap by the console's size (`get_resource_allocation_info_x`
@@ -3641,10 +3678,15 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
     let h = pc_heap_desc(heap)?;
     let st = super::device_x::pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state as u32);
     let mut hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv);
+    let mut made_in = st;
     if hr < 0 && st != 0 {
         // as in the past-the-end fallback: a state the PC refuses for this desc (e.g. UAV
         // without the UAV flag) – COMMON rather than falling back to the overlapping placement
         hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, 0, clear, riid, ppv);
+        made_in = 0;
+    }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::depth_uav::note_created(*ppv, &x, None, made_in);
     }
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -10602,3 +10644,364 @@ void main() {
     }
 }
 
+#[cfg(test)]
+mod depth_uav_twin_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    /// Runs the test `name` of this module again in a child process with `XCL_DEPTH_UAV_TWIN=1`
+    /// and unified memory (the shared heap and the switch are the process's). True: this is the
+    /// child, which does the work.
+    fn in_child(name: &str) -> bool {
+        const CHILD: &str = "XCL_TEST_DEPTH_UAV_TWIN_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("hle::d3d12x::real::depth_uav_twin_tests::{name}"), "--nocapture"])
+            .env(CHILD, "1")
+            .env("XCL_DEPTH_UAV_TWIN", "1")
+            .env("XCL_UMA_MB", "64")
+            .env("XCL_COHERENT_MB", "64")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed ({:?}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        // a skip in the child is a skip of this test: its line goes where the suite's skips go
+        use std::io::Write;
+        for l in String::from_utf8_lossy(&output.stderr).lines().filter(|l| l.starts_with("SKIPPED")) {
+            let _ = writeln!(std::io::stderr(), "{l}");
+        }
+        false
+    }
+
+    /// An adopted WARP device with a DIRECT queue, allocator and list of the PC's, a DSV heap of
+    /// the PC's, a console view heap of 4 slots (in the shared heap), and a 16x16 console
+    /// D24_UNORM_S8_UINT with ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS made through
+    /// CreateCommittedResource, with a DSV. None: skipped.
+    struct Fixture {
+        dev: ID3D12Device,
+        queue: ID3D12CommandQueue,
+        _alloc: ID3D12CommandAllocator,
+        list: ID3D12GraphicsCommandList,
+        dsv_heap: ID3D12DescriptorHeap,
+        dsv: u64,
+        heap: ID3D12DescriptorHeap,
+        base: u64,
+        depth: ID3D12Resource,
+    }
+
+    impl Fixture {
+        unsafe fn new() -> Option<Fixture> {
+            use super::super::{console_heap, depth_uav};
+            use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+            if crate::gpu::uma::get().is_none() {
+                crate::gpu::recomp::runner::skip_test("no unified memory");
+                return None;
+            }
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                crate::gpu::recomp::runner::skip_test("no WARP device");
+                return None;
+            };
+            let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                crate::gpu::recomp::runner::skip_test("no WARP device");
+                return None;
+            };
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no WARP device");
+                return None;
+            }
+            let dev = dev.unwrap();
+            // the DSV heap and the list are the PC's; then the device as a title's
+            let dsv_heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0 })
+                .unwrap();
+            let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let d = dev.as_raw();
+            adopt(d, Kind::Device);
+
+            // a console view heap of 4 slots (in the shared heap)
+            let mut heap_raw = std::ptr::null_mut();
+            let hr = dev_create_descriptor_heap_x(d, &[0, 4, 1, 0],&ID3D12DescriptorHeap::IID as *const _ as *const GUID, &mut heap_raw);
+            assert!(hr >= 0 && !heap_raw.is_null(), "console view heap: {hr:#x}");
+            let heap = ID3D12DescriptorHeap::from_raw(heap_raw);
+            let base = console_heap::start(heap_raw as usize).expect("console heap start");
+
+            let console = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut raw = std::ptr::null_mut();
+            let hr = dev_create_committed_resource_x(
+                d,
+                &props as *const _ as usize,
+                0,
+                &console as *const _ as usize,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as usize,
+                0,
+                &ID3D12Resource::IID as *const _ as *const GUID,
+                &mut raw,
+            );
+            assert!(hr >= 0 && !raw.is_null(), "the depth buffer: {hr:#x}");
+            let depth = ID3D12Resource::from_raw(raw);
+            assert!(depth_uav::kept(raw as usize), "the buffer is kept");
+
+            dev_create_dsv_x(
+                d,
+                raw,
+                &D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT_D24_UNORM_S8_UINT, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default() },
+                dsv,
+            );
+            Some(Fixture { dev, queue, _alloc: alloc, list, dsv_heap, dsv, heap, base, depth })
+        }
+    }
+
+    fn uav(format: DXGI_FORMAT, plane: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: plane } },
+        }
+    }
+
+    /// A stencil UAV of a console depth buffer with unordered access, made through the device
+    /// calls (`XCL_DEPTH_UAV_TWIN=1`, the shared view heap): the slot's UAV and its companion SRV
+    /// name the buffer's R8 twin and the T# reads as 8-bit uint; a depth UAV stays a null view
+    /// with its reason; the DSV is known; the twin goes with the buffer. On WARP, in a child
+    /// process.
+    #[test]
+    fn gpu_a_stencil_uav_of_a_console_depth_buffer_is_a_view_of_its_twin() {
+        if !in_child("gpu_a_stencil_uav_of_a_console_depth_buffer_is_a_view_of_its_twin") {
+            return;
+        }
+        use super::super::{console_heap, depth_uav};
+        unsafe {
+            let Some(f) = Fixture::new() else { return };
+            let base = f.base;
+            let slot_cpu = |k: u64| base + k * console_heap::SLOT as u64;
+            let Fixture { dev, dsv_heap, dsv, heap, depth, .. } = f;
+            let (d, raw) = (dev.as_raw(), depth.as_raw());
+            assert_eq!(depth_uav::dsv_names(dsv as usize), Some(raw as usize), "the DSV is known");
+
+            let (made, alive, redirected, _) = depth_uav::counts();
+            dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_X24_TYPELESS_G8_UINT, 1), slot_cpu(0));
+            dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_R24_UNORM_X8_TYPELESS, 0), slot_cpu(1));
+            // a second stencil UAV takes the same twin
+            dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_R8_UINT, 0), slot_cpu(2));
+            let (made2, alive2, redirected2, nulls) = depth_uav::counts();
+            assert_eq!((made2 - made, alive2 - alive, redirected2 - redirected), (1, 1, 2), "one twin, two views of it");
+            assert_eq!(nulls, ["its depth plane has no twin yet"], "the depth view is a null view, with its reason");
+
+            let twin = depth_uav::twin_of(raw as usize).expect("a stencil twin");
+            let t = ID3D12Resource::from_raw_borrowed(&(twin as *mut c_void)).unwrap().GetDesc();
+            assert_eq!((t.Format, t.Width, t.Height, t.DepthOrArraySize, t.MipLevels), (DXGI_FORMAT_R8_TYPELESS, 16, 16, 1, 1));
+            assert!(t.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0);
+            assert_eq!(title_address(twin), None, "the twin is no title memory");
+            for k in [0, 2] {
+                let s = console_heap::slot(slot_cpu(k)).unwrap();
+                assert_ne!(s.shared_srv, 0, "slot {k} is in the shared heap");
+                assert_eq!(console_heap::names_of(&s), (twin, twin), "slot {k}: SRV and UAV of the twin");
+                let mut w = [0u32; 8];
+                std::ptr::copy_nonoverlapping(slot_cpu(k) as *const u32, w.as_mut_ptr(), 8);
+                assert_eq!((w[0], (w[1] >> 20) & 0x1FF), (s.index, 5), "slot {k}: the T# of an R8_UINT image");
+            }
+            let s = console_heap::slot(slot_cpu(1)).unwrap();
+            assert_eq!(console_heap::names_of(&s).1, 0, "the depth plane's UAV is a null view");
+
+            drop(heap);
+            drop(depth);
+            assert!(!depth_uav::kept(raw as usize), "the buffer is forgotten at its last release");
+            assert_eq!(depth_uav::counts().1, alive, "the twin goes with the buffer's Cell");
+            drop(dsv_heap);
+        }
+    }
+
+    /// A console depth buffer the title places at an address in unified memory
+    /// (CreatePlacedResourceX) and a stencil UAV of that memory made by address (device #71, on
+    /// XCL's own object there): the buffer is kept under its title address with the state it was
+    /// made in, and the view by address is a view of that buffer's twin. On WARP, in a child
+    /// process.
+    #[test]
+    fn gpu_a_stencil_uav_by_address_is_a_view_of_the_placed_buffers_twin() {
+        if !in_child("gpu_a_stencil_uav_by_address_is_a_view_of_the_placed_buffers_twin") {
+            return;
+        }
+        use super::super::{console_heap, depth_uav, device_x, vram};
+        unsafe {
+            let Some(f) = Fixture::new() else { return };
+            let d = f.dev.as_raw();
+            let Some(va) = crate::gpu::uma::get().and_then(|u| u.alloc(1 << 20, 0x1_0000)) else {
+                crate::gpu::recomp::runner::skip_test("no unified memory for the buffer");
+                return;
+            };
+            let va = va as u64;
+            let console = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let rdesc = &console as *const _ as *const u8;
+            let mut raw = std::ptr::null_mut();
+            let hr = device_x::create_placed_resource_x(
+                d,
+                va,
+                rdesc,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32,
+                std::ptr::null(),
+                &ID3D12Resource::IID as *const _ as *const GUID,
+                &mut raw,
+            );
+            assert!(hr >= 0 && !raw.is_null(), "the placed depth buffer: {hr:#x}");
+            let _placed = ID3D12Resource::from_raw(raw);
+            let at = vram::canonical_va(va as usize);
+            assert_eq!(depth_uav::made_in(raw as usize), Some((Some(D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32), Some(at))), "kept under its title address, made in DEPTH_WRITE");
+
+            // #71: { the PC's UAV desc; the GPU address @0x28 }
+            let mut view = [0u64; 8];
+            std::ptr::write_unaligned(view.as_mut_ptr() as *mut D3D12_UNORDERED_ACCESS_VIEW_DESC, uav(DXGI_FORMAT_X24_TYPELESS_G8_UINT, 1));
+            view[5] = va;
+            dev_create_uav_at_x(d, rdesc, view.as_ptr() as *const u8, f.base);
+            let twin = depth_uav::twin_of(raw as usize).expect("the placed buffer has a stencil twin");
+            let s = console_heap::slot(f.base).unwrap();
+            assert_eq!(console_heap::names_of(&s), (twin, twin), "the view by address names the placed buffer's twin");
+            assert_eq!(depth_uav::made_in(raw as usize).unwrap().0, Some(D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32), "the view's own object (made in COMMON) does not change the buffer's state");
+        }
+    }
+
+    /// ClearUnorderedAccessViewUint of console code with the console handles of a stencil UAV
+    /// and the depth buffer as its resource: the PC clear goes to the twin the slot's view names,
+    /// and the twin reads back the value. On WARP, in a child process.
+    #[test]
+    fn gpu_clear_uav_of_a_stencil_uav_clears_the_twin() {
+        if !in_child("gpu_clear_uav_of_a_stencil_uav_clears_the_twin") {
+            return;
+        }
+        use super::super::{console_heap, depth_uav, list_x};
+        unsafe {
+            let Some(f) = Fixture::new() else { return };
+            let (d, raw) = (f.dev.as_raw(), f.depth.as_raw());
+            let slot = f.base;
+            dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_X24_TYPELESS_G8_UINT, 1), slot);
+            let twin = depth_uav::twin_of(raw as usize).expect("a stencil twin");
+            let twin = ID3D12Resource::from_raw_borrowed(&(twin as *mut c_void)).unwrap().clone();
+
+            // the title's call (#53) with the shared heap bound, on a stand-in of the list whose
+            // PC ClearUnorderedAccessViewUint (#49) notes the resource it is given and goes on to
+            // the list's own: what the PC call gets, not only what XCL counted
+            static PC_CLEAR: AtomicUsize = AtomicUsize::new(0);
+            static LIST: AtomicUsize = AtomicUsize::new(0);
+            static GOT: AtomicUsize = AtomicUsize::new(0);
+            type ClearUint = unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const u32, u32, *const c_void);
+            unsafe extern "system" fn noting(_this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, n: u32, rects: *const c_void) {
+                GOT.store(res, Ordering::Relaxed);
+                let pc: ClearUint = std::mem::transmute(PC_CLEAR.load(Ordering::Relaxed));
+                pc(LIST.load(Ordering::Relaxed) as *mut c_void, gpu, cpu, res, values, n, rects)
+            }
+            let l = &f.list;
+            l.SetDescriptorHeaps(&[console_heap::global_heap()]);
+            let lraw = l.as_raw();
+            LIST.store(lraw as usize, Ordering::Relaxed);
+            PC_CLEAR.store(*(*(lraw as *const *const usize)).add(49), Ordering::Relaxed);
+            let mut pc_vt = [0usize; 64];
+            pc_vt[49] = noting as usize;
+            // (`orig_fn` reads the PC table at -1 of the object's table)
+            let ext_vt = [pc_vt.as_ptr() as usize, 0];
+            let stand_in = [ext_vt.as_ptr().add(1)];
+            let (done, not_done) = depth_uav::clears();
+            list_x::clear_uav_uint_x(stand_in.as_ptr() as *mut c_void, slot, slot, raw as usize, [0x5Au32; 4].as_ptr(), 0, std::ptr::null());
+            let (done2, not_done2) = depth_uav::clears();
+            assert_eq!((done2 - done, not_done2 - not_done), (1, 0), "the clear went to the twin");
+            assert_eq!(GOT.load(Ordering::Relaxed), twin.as_raw() as usize, "the PC clear gets the twin as its resource, not the depth buffer");
+            // a depth-plane UAV of the buffer is a null view: its clear is not done, nothing reaches the PC
+            let depth_slot = slot + console_heap::SLOT as u64;
+            dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_R24_UNORM_X8_TYPELESS, 0), depth_slot);
+            GOT.store(0, Ordering::Relaxed);
+            list_x::clear_uav_uint_x(stand_in.as_ptr() as *mut c_void, depth_slot, depth_slot, raw as usize, [0x11u32; 4].as_ptr(), 0, std::ptr::null());
+            let (done3, not_done3) = depth_uav::clears();
+            assert_eq!((done3 - done2, not_done3 - not_done2, GOT.load(Ordering::Relaxed)), (0, 1, 0), "a clear through the null view is not done");
+
+            // the twin to a readback buffer
+            let td = twin.GetDesc();
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0u64;
+            f.dev.GetCopyableFootprints(&td, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+            let mut rb: Option<ID3D12Resource> = None;
+            f.dev
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: total,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut rb,
+                )
+                .expect("readback buffer");
+            let rb = rb.unwrap();
+            let b = [D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(Some(twin.clone())),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    }),
+                },
+            }];
+            l.ResourceBarrier(&b);
+            for b in b {
+                let tr = std::mem::ManuallyDrop::into_inner(b.Anonymous.Transition);
+                let _ = std::mem::ManuallyDrop::into_inner(tr.pResource);
+            }
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&twin), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            l.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            l.Close().expect("close list");
+            f.queue.ExecuteCommandLists(&[Some(l.cast().unwrap())]);
+            let fence: ID3D12Fence = f.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            f.queue.Signal(&fence, 1).expect("signal");
+            crate::gpu::fence::wait(&fence, 1, &f.dev, None, 5000).expect("the clear and the copy complete");
+
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).expect("map readback");
+            let pitch = fp.Footprint.RowPitch as usize;
+            let rows: Vec<Vec<u8>> = (0..16).map(|y| std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + y * pitch), 16).to_vec()).collect();
+            rb.Unmap(0, None);
+            assert!(rows.iter().all(|r| r.iter().all(|&v| v == 0x5A)), "the twin was not cleared: {:x?}", &rows[0]);
+        }
+    }
+}

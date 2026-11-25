@@ -966,7 +966,7 @@ unsafe fn reservable(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
 /// shared 64 KiB VRAM pages and arenas alias instead of duplicating video memory. If distinct
 /// physical or committed pages are mapped directly at `va`, keep `va` unaliased (matching
 /// `title_textures::mirror_source`).
-fn canonical_va(va: usize) -> usize {
+pub(super) fn canonical_va(va: usize) -> usize {
     let Some(src) = crate::hle::kernelx::mirrors::source(va) else { return va };
     if crate::hle::kernelx::physical_page_at(va) {
         return va;
