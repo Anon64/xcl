@@ -39,6 +39,10 @@ const POOL_TILES: u32 = 1024;
 const PARKED_MAX: usize = 4096;
 /// tiles waiting for their mapping call (`State::pending`) before they are sent at once: 256 MB
 const PENDING_MAX: usize = 4096;
+/// a pool tile freed is not reused before this (`State::cooling`): work the title submitted
+/// before its unmap may still read it on the title's queues, and the sparse queue that maps,
+/// clears and fills it for its next address does not wait for those
+const COOL: std::time::Duration = std::time::Duration::from_secs(2);
 /// bytes of the ring-buffered upload staging buffer
 const STAGING: usize = 64 << 20;
 /// alignment of sub-allocations inside the upload staging ring (write-combined cacheline)
@@ -300,6 +304,36 @@ fn zero_runs(pieces: BTreeSet<(usize, usize)>) -> Vec<(usize, usize)> {
     out
 }
 
+/// Whether the oldest tile of `cooling` was freed `COOL` ago or more at `now`
+fn cooled(cooling: &VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant) -> bool {
+    cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL)
+}
+
+/// The pool tile to use next (`State::take_tile`): the oldest of `cooling` if it cooled, else
+/// one of `free`. None: neither, though tiles freed less than `COOL` ago may be cooling.
+fn reuse_tile(free: &mut Vec<(u32, u32)>, cooling: &mut VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant) -> Option<(u32, u32)> {
+    if cooled(cooling, now) {
+        return cooling.pop_front().map(|(t, _)| t);
+    }
+    free.pop()
+}
+
+/// The pool heaps (`pools` of them) all of whose tiles are in `free` or cooled in `cooling` at
+/// `now` (`State::retire_free_pools`): a tile still cooling keeps its heap.
+fn free_heaps(free: &[(u32, u32)], cooling: &VecDeque<((u32, u32), std::time::Instant)>, pools: usize, now: std::time::Instant) -> Vec<usize> {
+    let ready = cooling.iter().take_while(|&&(_, at)| now.duration_since(at) >= COOL).map(|&(t, _)| t);
+    if free.len() + ready.clone().count() < POOL_TILES as usize {
+        return Vec::new();
+    }
+    let mut count = vec![0u32; pools];
+    for (h, _) in free.iter().copied().chain(ready) {
+        if let Some(c) = count.get_mut(h as usize) {
+            *c += 1;
+        }
+    }
+    (0..pools).filter(|&h| count[h] == POOL_TILES).collect()
+}
+
 struct UploadSlot {
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
@@ -389,7 +423,13 @@ struct State {
     windows: Vec<(usize, ID3D12Resource)>,
     /// video-memory pool heaps (None: given back, its index free for the next one)
     pools: Vec<Option<ID3D12Heap>>,
+    /// pool tiles to use: those of a pool that were never used, and cooled ones (`cooling`)
     free: Vec<(u32, u32)>,
+    /// pool tiles freed (`flush_parked`, `release_if_unused`), oldest first, with when: used
+    /// again `COOL` after that at the earliest (`take_tile`). Before, a tile unmapped went to
+    /// `free` and was the next one taken, mapped, cleared and filled for another address on the
+    /// sparse queue while title work submitted before the unmap could still read it.
+    cooling: VecDeque<((u32, u32), std::time::Instant)>,
     /// pools all of whose tiles came free: released once the GPU is past `value` and a moment
     /// went by (titles' queues may still read what was mapped there)
     retired: Vec<(ID3D12Heap, u64, std::time::Instant)>,
@@ -716,7 +756,7 @@ pub fn pool_bytes() -> (usize, usize) {
     let g = lock_state();
     let Some(s) = g.as_ref() else { return (0, 0) };
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
-    (pools, pools.saturating_sub(s.free.len() * TILE))
+    (pools, pools.saturating_sub((s.free.len() + s.cooling.len()) * TILE))
 }
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
@@ -839,6 +879,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         windows,
         pools: Vec::new(),
         free: Vec::new(),
+        cooling: VecDeque::new(),
         retired: Vec::new(),
         mapped: FxHashMap::default(),
         pinned: FxHashMap::default(),
@@ -967,17 +1008,17 @@ impl State {
         self.windows.iter().position(|(b, _)| a >= *b && a < *b + crate::gpu::uma::WINDOW)
     }
 
+    /// A pool tile (true: used before, to be cleared). One freed less than `COOL` ago is not
+    /// taken: a retired pool is taken back or a heap made instead. (Parked tiles are not flushed
+    /// for it: freed now, they would cool all the same.)
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
-        if self.free.is_empty() {
-            self.flush_parked();
-        }
-        if let Some(t) = self.free.pop() {
+        if let Some(t) = reuse_tile(&mut self.free, &mut self.cooling, std::time::Instant::now()) {
             return Some((t, true));
         }
         // a pool retired a moment ago (its last tile came free) is taken back before a new
         // 64 MB heap is made: freeing and allocating a tile in turn made a new pool each time,
         // up to 18 GB of retired heaps in 2 s (#913). Its tiles are reused as freed tiles are
-        // (zeroed), so this is no less safe than reusing a tile of a pool in use.
+        // (zeroed), and they all cooled before it was retired.
         if let Some((heap, _, _)) = self.retired.pop() {
             let h = self.add_pool(heap);
             return Some(((h, 0), true));
@@ -1019,25 +1060,19 @@ impl State {
         h
     }
 
-    /// Pools whose every tile is free again go (64 MB of video memory each – and as much of the
-    /// system's commit: a retail game's homes of physical pages left 0.75 GB of pools for
-    /// 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
+    /// Pools whose every tile is free again (cooled, `COOL`) go (64 MB of video memory each –
+    /// and as much of the system's commit: a retail game's homes of physical pages left 0.75 GB
+    /// of pools for 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
     fn retire_free_pools(&mut self) {
         let now = std::time::Instant::now();
         let done = unsafe { super::real::fence_completed(&self.fence) };
         self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
-        if self.free.len() < POOL_TILES as usize {
-            return;
-        }
-        let mut count = vec![0u32; self.pools.len()];
-        for &(h, _) in &self.free {
-            count[h as usize] += 1;
-        }
-        let gone: Vec<usize> = (0..count.len()).filter(|&h| count[h] == POOL_TILES && self.pools[h].is_some()).collect();
+        let gone: Vec<usize> = free_heaps(&self.free, &self.cooling, self.pools.len(), now).into_iter().filter(|&h| self.pools[h].is_some()).collect();
         if gone.is_empty() {
             return;
         }
         self.free.retain(|&(h, _)| !gone.contains(&(h as usize)));
+        self.cooling.retain(|&((h, _), _)| !gone.contains(&(h as usize)));
         for h in gone {
             if let Some(heap) = self.pools[h].take() {
                 self.retired.push((heap, self.value, now));
@@ -2431,7 +2466,7 @@ impl State {
         }
     }
 
-    /// A pool tile a buffer used at `t` goes back to the free list, unless its window maps it, it
+    /// A pool tile a buffer used at `t` is freed (`cooling`), unless its window maps it, it
     /// is parked there, or another buffer uses it. Kept mapped for the buffer: parked from here on.
     fn release_if_unused(&mut self, t: usize, tile: (u32, u32)) {
         if self.pinned.contains_key(&tile) {
@@ -2443,17 +2478,18 @@ impl State {
             return;
         }
         if self.mapped.get(&t).is_none_or(|e| e.pool != tile) && self.parked.get(&t) != Some(&tile) {
-            self.free.push(tile);
+            self.cooling.push_back((tile, std::time::Instant::now()));
         }
     }
 
     /// The parked tiles unmapped from their windows (one call per window) and their pool tiles
-    /// free (but those of placed buffers). Pools left all free are not retired here: callers do
-    /// that (`retire_free_pools`) unless they take a tile right away.
+    /// freed to `cooling` (but those of placed buffers). Pools left all free are not retired
+    /// here: callers do that (`retire_free_pools`).
     unsafe fn flush_parked(&mut self) -> bool {
         if self.parked.is_empty() {
             return false;
         }
+        let now = std::time::Instant::now();
         let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
         for (t, tile) in std::mem::take(&mut self.parked) {
             // (a placed buffer uses it)
@@ -2464,7 +2500,7 @@ impl State {
             if let Some(wi) = self.window_index(t) {
                 by_window.entry(wi).or_default().push(t);
             }
-            self.free.push(tile);
+            self.cooling.push_back((tile, now));
         }
         if by_window.is_empty() {
             return false;
@@ -2724,8 +2760,10 @@ impl State {
             self.to_zero.insert((w, TILE));
         } else {
             let at_cap = !force && self.mirrored >= self.mirror_cap;
-            // (a moment after a heap could not be made, only tiles at hand)
-            let wait = at_cap || (!force && self.short_of_memory() && self.free.is_empty() && self.parked.is_empty() && self.retired.is_empty());
+            // (a moment after a heap could not be made, only tiles at hand: parked ones and those
+            // still cooling are not)
+            let at_hand = !self.free.is_empty() || cooled(&self.cooling, std::time::Instant::now()) || !self.retired.is_empty();
+            let wait = at_cap || (!force && self.short_of_memory() && !at_hand);
             let got = if wait { None } else { self.take_tile() };
             let Some((tile, reused)) = got else {
                 if !wait {
@@ -3785,6 +3823,7 @@ mod tests {
                 windows: vec![(base, reserved.clone())],
                 pools: Vec::new(),
                 free: Vec::new(),
+                cooling: VecDeque::new(),
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
@@ -4069,6 +4108,7 @@ mod tests {
                 windows: Vec::new(),
                 pools: Vec::new(),
                 free: Vec::new(),
+                cooling: VecDeque::new(),
                 retired: Vec::new(),
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
@@ -4298,6 +4338,7 @@ mod tests {
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
+                cooling: VecDeque::new(),
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
@@ -4416,6 +4457,7 @@ mod tests {
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
+                cooling: VecDeque::new(),
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
@@ -4471,7 +4513,7 @@ mod tests {
             assert!(!s.free.contains(&tile));
             assert_eq!(s.value, v, "no tile mapping changed");
             s.release_if_unused(base, tile);
-            assert!(!s.free.contains(&tile), "a parked tile is not free");
+            assert!(!s.free.contains(&tile) && s.cooling.is_empty(), "a parked tile is not free");
 
             assert!(s.runs.is_empty() && runs_of(&s).is_empty());
             // committed again: the same tile, cleared, no new mapping
@@ -4486,23 +4528,29 @@ mod tests {
             assert_eq!(s.value, v, "no tile mapping changed");
             assert!(mapped_gen() > gen, "readers of `mapped` see it changed");
 
-            // decommitted and flushed (as before a submit): unmapped and free
+            // decommitted and flushed (as before a submit): unmapped and cooling, not free yet
             s.decommit_range(base, TILE);
             assert!(s.flush_parked());
             assert!(s.parked.is_empty());
-            assert!(s.free.contains(&tile));
+            assert!(s.cooling.iter().any(|c| c.0 == tile) && !s.free.contains(&tile));
             assert!(s.value > v, "the unmapping is sent");
             assert!(!s.flush_parked(), "nothing left to flush");
 
-            // no free tile left: the parked one is flushed and taken for the next commit
+            // no free tile left: neither the parked tile (mapped at its address until the next
+            // flush) nor the one cooling is taken for the next commit, but a new pool's. Before,
+            // the parked one was unmapped and taken at once.
             s.commit_range(base, TILE);
-            let tile = s.mapped[&base].pool;
+            let parked = s.mapped[&base].pool;
+            assert_ne!(parked, tile, "the cooling tile is not taken");
             s.decommit_range(base, TILE);
             s.free.clear();
             s.commit_range(base + TILE, TILE);
-            assert!(s.parked.is_empty());
-            assert_eq!(s.mapped[&(base + TILE)].pool, tile);
+            assert_eq!(s.parked.get(&base), Some(&parked), "still parked");
+            let tile = s.mapped[&(base + TILE)].pool;
+            assert_ne!(tile.0, parked.0, "a tile of a new pool");
             assert!(!s.mapped.contains_key(&base));
+            assert!(s.flush_parked());
+            assert_eq!(s.cooling.back().map(|c| c.0), Some(parked), "unmapped at the flush, then cooling");
 
             // a placed buffer uses the tile: the window keeps it when it is decommitted and
             // flushed, memory committed there again is the buffer's, and it is free only once
@@ -4535,9 +4583,9 @@ mod tests {
             assert!(!s.flush_parked());
             s.pinned.remove(&tile);
             s.release_if_unused(at, tile);
-            assert!(s.kept.is_empty() && !s.free.contains(&tile));
+            assert!(s.kept.is_empty() && !s.cooling.iter().any(|c| c.0 == tile));
             assert!(s.flush_parked());
-            assert!(s.free.contains(&tile));
+            assert!(s.cooling.iter().any(|c| c.0 == tile) && !s.free.contains(&tile));
 
             assert_eq!(s.runs, runs_of(&s));
             // committed and decommitted again before a flush: no mapping is sent for it
@@ -5512,6 +5560,77 @@ mod tests {
             v.submit(&[]);
             assert!(v.s.mapped.contains_key(&w) && v.s.refused.is_empty());
             assert!(v.s.mapped[&w].sent.iter().all(|p| p.is_some()), "what the CPU view held went up");
+        }
+    }
+
+    /// A pool tile freed is used again `COOL` after at the earliest, the oldest first and before
+    /// a tile of `free`. Before, it went to `free` and was the next one taken.
+    #[test]
+    fn a_freed_pool_tile_cools_before_it_is_used_again() {
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut free: Vec<(u32, u32)> = Vec::new();
+        let mut cooling: VecDeque<((u32, u32), std::time::Instant)> = VecDeque::new();
+        cooling.push_back(((0, 5), ms(0)));
+        cooling.push_back(((0, 6), ms(10)));
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(1999)), None, "freed 1999 ms ago: still cooling");
+        assert!(!cooled(&cooling, ms(1999)));
+        free.push((1, 9));
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(1999)), Some((1, 9)), "a free tile meanwhile");
+        assert!(cooled(&cooling, ms(2000)));
+        free.push((1, 8));
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2005)), Some((0, 5)), "cooled: before a free tile");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2005)), Some((1, 8)), "the next one freed 10 ms later is not");
+        cooling.push_back(((2, 1), ms(20)));
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), Some((0, 6)), "the oldest first");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), Some((2, 1)));
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), None);
+    }
+
+    /// A pool goes when all its tiles are free or cooled: one with a tile still cooling stays.
+    #[test]
+    fn a_pool_with_a_tile_still_cooling_is_not_retired() {
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        // pool 1 free but its last tile, freed at 0 ms; pool 0 free but its first, freed at 1500 ms
+        let mut free: Vec<(u32, u32)> = (0..POOL_TILES - 1).map(|t| (1, t)).collect();
+        free.extend((1..POOL_TILES).map(|t| (0, t)));
+        let cooling = VecDeque::from([((1, POOL_TILES - 1), ms(0)), ((0, 0), ms(1500))]);
+        assert!(free_heaps(&free, &cooling, 2, ms(1999)).is_empty(), "their last tiles are cooling");
+        assert_eq!(free_heaps(&free, &cooling, 2, ms(2000)), vec![1], "pool 1's cooled");
+        assert_eq!(free_heaps(&free, &cooling, 2, ms(3500)), vec![0, 1]);
+        assert_eq!(free_heaps(&free[1..], &cooling, 2, ms(3500)), vec![0], "a tile of pool 1 in use");
+    }
+
+    /// A GPU-view tile given back and unmapped at a submit is not the video memory of the next
+    /// tile asked for: that gets another, and the tile is used again once it cooled. Before, it
+    /// was the next tile taken, mapped, cleared and filled on the sparse queue while the title's
+    /// work submitted before could still read it.
+    #[test]
+    fn a_tile_given_back_is_not_used_again_before_it_cooled() {
+        unsafe {
+            let Some(mut v) = Views::new(113) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let (w, c) = (v.w, v.c);
+            v.commit(0, 3);
+            v.write(0, 3, 59);
+            v.s.asks.push(w);
+            v.submit(&[]);
+            let pool = v.s.mapped[&w].pool;
+            v.s.forget_mirrors_in(c, c + TILE);
+            assert_eq!(v.s.parked.get(&w), Some(&pool));
+            v.submit(&[]);
+            assert_eq!(v.s.cooling.iter().map(|t| t.0).collect::<Vec<_>>(), vec![pool], "unmapped, cooling");
+            v.s.asks.push(w + TILE);
+            v.submit(&[]);
+            assert_ne!(v.s.mapped[&(w + TILE)].pool, pool, "another tile");
+            // (as 2 s later)
+            for t in v.s.cooling.iter_mut() {
+                t.1 = t.1.checked_sub(COOL).expect("an earlier instant");
+            }
+            v.s.asks.push(w + 2 * TILE);
+            v.submit(&[]);
+            assert_eq!(v.s.mapped[&(w + 2 * TILE)].pool, pool, "cooled: used again");
+            assert!(v.s.cooling.is_empty());
         }
     }
 
