@@ -393,9 +393,10 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // the CPU writes and the GPU reads, as a PC game's upload heaps): in the coherent window, which
     // the GPU reads where it is – one copy (a retail game's 4.4 GB; as plain memory its shaders
     // read zeros, in the sparse windows video memory would have doubled them). The window is as
-    // large as what the title asked for last time (`uma::coherent_hint`).
+    // large as what the title put in it last time with this setting (`uma::coherent_hint`).
     if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 && size <= crate::gpu::uma::MAX_SIZE && std::env::var("XCL_COHERENT_HEAPS").map_or(true, |v| v != "0") {
         let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
         // `XCL_COHERENT_HEAPS=sparse[:N]`: heaps of at least N MB (all with no N) go to the
         // sparse windows instead – video memory, the CPU's writes uploaded before each
         // submission (`d3d12x::sparse`). In the coherent window the GPU reads them over the bus,
@@ -406,10 +407,12 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
                 crate::xlog_info!("kernelx: a GPU heap of {} MB in the sparse windows (XCL_COHERENT_HEAPS)", size >> 20);
                 trace_mem("VirtualAlloc (graphics heap, sparse VRAM)", 0, rounded, t as u64, p, q);
+                // nothing of it in the coherent window, noted all the same: a run whose heaps all
+                // come here stores what it put there too (`uma::note_coherent_need`)
+                crate::gpu::uma::note_coherent_need(ASKED.load(Ordering::Relaxed));
                 return q as *mut c_void;
             }
         }
-        static ASKED: AtomicUsize = AtomicUsize::new(0);
         let asked = ASKED.fetch_add(size, Ordering::Relaxed) + size;
         crate::gpu::uma::note_coherent_need(asked);
         if let Some(u) = uma {
@@ -456,6 +459,27 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
 fn sparse_heaps_min() -> Option<usize> {
     static MIN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *MIN.get_or_init(|| std::env::var("XCL_COHERENT_HEAPS").ok().and_then(|v| parse_sparse_heaps(&v)))
+}
+
+/// Which of the title's GPU heaps go to the coherent window, as `uma_coherent.txt` keeps a size
+/// for each (`uma::coherent_hint_for`).
+pub(crate) fn coherent_heaps_route() -> String {
+    heaps_route(std::env::var("XCL_COHERENT_HEAPS").ok().as_deref())
+}
+
+/// `coherent_heaps_route` of a value of `XCL_COHERENT_HEAPS`, read as `VirtualAlloc` reads it:
+/// `off` (`0`: none), `sparse` (only those the sparse windows have no room for), `sparse:N`
+/// (those under N MB too), else every heap (`uma::ALL_HEAPS`).
+fn heaps_route(v: Option<&str>) -> String {
+    match v {
+        Some("0") => "off".into(),
+        Some(v) => match parse_sparse_heaps(v) {
+            Some(0) => "sparse".into(),
+            Some(min) => format!("sparse:{}", min >> 20),
+            None => crate::gpu::uma::ALL_HEAPS.into(),
+        },
+        None => crate::gpu::uma::ALL_HEAPS.into(),
+    }
 }
 
 /// `sparse` -> 0, `sparse:N` -> N MB in bytes; anything else -> None
@@ -2469,6 +2493,18 @@ mod tests {
         assert_eq!(parse_sparse_heaps("sparse:big"), None);
         assert_eq!(parse_sparse_heaps("sparsex"), None);
         assert_eq!(parse_sparse_heaps(&format!("sparse:{}", usize::MAX)), None, "no overflow");
+    }
+
+    /// The setting `uma_coherent.txt` keeps the coherent window's size for: what goes there
+    /// differs between them, and the same heaps' setting is one name however it is written.
+    #[test]
+    fn coherent_heaps_routes() {
+        assert_eq!(heaps_route(None), crate::gpu::uma::ALL_HEAPS);
+        assert_eq!(heaps_route(Some("1")), crate::gpu::uma::ALL_HEAPS, "not a setting: every heap, as VirtualAlloc reads it");
+        assert_eq!(heaps_route(Some("0")), "off");
+        assert_eq!(heaps_route(Some("sparse")), "sparse");
+        assert_eq!(heaps_route(Some("sparse:0")), "sparse", "the same heaps as `sparse`");
+        assert_eq!(heaps_route(Some(" sparse: 16 ")), "sparse:16");
     }
 
     /// Neighbouring sparse pages a mapping call maps are committed as one run; a gap starts

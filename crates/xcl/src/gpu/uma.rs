@@ -928,10 +928,45 @@ static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 
 /// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
 /// known only once it asks for it, and the window is committed when it is made: its size is
-/// what the title asked for in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
+/// what the title put in it in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
 /// 512 MB, at most a window. `XCL_COHERENT_MB` chooses it.
+///
+/// Which of the title's GPU heaps go there is `XCL_COHERENT_HEAPS`'s
+/// (`kernelx::coherent_heaps_route`), so the file keeps a size for each setting, a line
+/// `<bytes> <setting>` each: a size measured with every heap in the window does not apply to a
+/// run that sends them to the sparse windows. A retail title's 4582 MB of heaps, stored once,
+/// made windows of 4095 + 998 MB in runs that put at most 105 MB in them, each shadowed by as
+/// much video memory with `XCL_UMA_SHADOW=1`.
 fn coherent_file() -> std::path::PathBuf {
     crate::state::data_dir().join("cache").join("uma_coherent.txt")
+}
+
+/// The setting of `XCL_COHERENT_HEAPS` that puts every GPU heap in the coherent window (none),
+/// as `uma_coherent.txt` names it. The file of before held one number, measured with it.
+pub const ALL_HEAPS: &str = "all";
+
+/// The bytes `text` (`uma_coherent.txt`) keeps for `route` (0: none).
+fn stored_need(text: &str, route: &str) -> usize {
+    text.lines()
+        .find_map(|l| {
+            let mut w = l.split_whitespace();
+            let bytes = w.next()?.parse::<usize>().ok()?;
+            (w.next().unwrap_or(ALL_HEAPS) == route).then_some(bytes)
+        })
+        .unwrap_or(0)
+}
+
+/// `text` (`uma_coherent.txt`) with `bytes` for `route`; the other settings' lines stay.
+fn with_need(text: &str, route: &str, bytes: usize) -> String {
+    let mut out = String::new();
+    for l in text.lines() {
+        let mut w = l.split_whitespace();
+        if w.next().is_some_and(|b| b.parse::<usize>().is_ok()) && w.next().unwrap_or(ALL_HEAPS) != route {
+            out += l.trim();
+            out += "\n";
+        }
+    }
+    out + &format!("{bytes} {route}\n")
 }
 
 /// Bytes the coherent window(s) are made with for a runtime layout of `windows` windows.
@@ -940,7 +975,8 @@ pub fn coherent_hint_for(windows: usize) -> usize {
     if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         return (mb << 20).clamp(GRAIN, cap);
     }
-    let title = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+    let route = crate::hle::kernelx::coherent_heaps_route();
+    let title = std::fs::read_to_string(coherent_file()).map_or(0, |s| stored_need(&s, &route));
     // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
     // and textures (WDDM charges commit for each video-memory allocation too) and the window
     // itself – a retail game took ~18 GB; with less free it runs without (its GPU heaps outside
@@ -974,19 +1010,62 @@ fn free_commit() -> usize {
     m.ullAvailPageFile as usize
 }
 
-/// The title has asked for `bytes` of graphics memory XCL places in the coherent window: the
-/// next run makes the window that large (this one has the size it was made with).
+/// bytes of graphics memory the title asked the coherent window for in this run
+static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// `uma_coherent.txt` is read and written under it
+static COHERENT_FILE: Mutex<()> = Mutex::new(());
+/// A run this long has made its GPU heaps (a retail title made all of them in its first 7 s):
+/// what it put in the coherent window by then stands for the next run, also when it is less
+/// (`settle_coherent_need`). A run that ends sooner only ever grows the stored size: one cut
+/// short before its heaps would leave the next run's window too small for them.
+const SETTLED: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The title has asked for `bytes` of graphics memory XCL places in the coherent window so far
+/// in this run (0: its GPU heaps all went to the sparse windows): the next run makes the window
+/// that large (this one has the size it was made with).
 pub fn note_coherent_need(bytes: usize) {
-    static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let before = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
-    if bytes > before && NOTED.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed) < bytes {
-        let f = coherent_file();
+    let prev = NOTED.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+    static SETTLE: std::sync::Once = std::sync::Once::new();
+    SETTLE.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-uma-coherent".into()).spawn(|| {
+            std::thread::sleep(SETTLED);
+            settle_coherent_need();
+        });
+    });
+    if bytes <= prev {
+        return;
+    }
+    let _g = COHERENT_FILE.lock().unwrap();
+    let route = crate::hle::kernelx::coherent_heaps_route();
+    let f = coherent_file();
+    let text = std::fs::read_to_string(&f).unwrap_or_default();
+    if bytes > stored_need(&text, &route) {
         if let Some(d) = f.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(&f, bytes.to_string());
+        let _ = std::fs::write(&f, with_need(&text, &route, bytes));
         let cap = max_coherent_bytes(configured_runtime_windows());
         crate::xlog_info!("UMA: the title's graphics memory for the coherent window: {} MB (up to {} MB from the next run)", bytes >> 20, (bytes + RUNTIME_COMMITTED_CAP).min(cap) >> 20);
+    }
+}
+
+/// `SETTLED` into the run: the size stored for this run's `XCL_COHERENT_HEAPS` becomes what the
+/// run put in the coherent window, when that is less.
+fn settle_coherent_need() {
+    let _g = COHERENT_FILE.lock().unwrap();
+    let run = NOTED.load(std::sync::atomic::Ordering::Relaxed);
+    let route = crate::hle::kernelx::coherent_heaps_route();
+    let f = coherent_file();
+    let text = std::fs::read_to_string(&f).unwrap_or_default();
+    let before = stored_need(&text, &route);
+    if run < before {
+        let _ = std::fs::write(&f, with_need(&text, &route, run));
+        crate::xlog_info!(
+            "UMA: this run put {} MB of the title's graphics memory in the coherent window, {} MB were stored for '{route}' (XCL_COHERENT_HEAPS): the next run makes it {} MB",
+            run >> 20,
+            before >> 20,
+            (run + RUNTIME_COMMITTED_CAP).min(max_coherent_bytes(configured_runtime_windows())) >> 20
+        );
     }
 }
 
@@ -1410,7 +1489,7 @@ mod tests {
         }
         assert_eq!(coherent_window_sizes(20 << 30, 20 << 30, 8).len(), 5);
         assert_eq!(coherent_window_sizes(20 << 30, 20 << 30, MAX_HEAP_WINDOWS).len(), 6);
-        // a coherent need past 7 windows (`uma_coherent.txt` only grows) stops at 7: windows
+        // a coherent need past 7 windows (as `uma_coherent.txt` may keep) stops at 7: windows
         // 10..15 stay the views'
         assert_eq!(coherent_window_sizes(40 << 30, 40 << 30, MAX_HEAP_WINDOWS), vec![MAX_SIZE; 7]);
         assert_eq!(max_coherent_windows(MAX_WINDOWS), 1);
@@ -1424,5 +1503,30 @@ mod tests {
         assert_eq!(u.window_of(a), Some(0));
         assert_eq!(u.window_of(b), Some(1));
         assert!(u.free(a) && u.free(b));
+    }
+
+    /// `uma_coherent.txt` keeps the coherent window's size per `XCL_COHERENT_HEAPS` setting: the
+    /// 4582 MB a run with every GPU heap in the window stored (one number, the file of before)
+    /// does not size the window of a run that sends them to the sparse windows, which stores its
+    /// own size beside it, and lowers it.
+    #[test]
+    fn the_stored_coherent_need_is_the_one_of_the_heaps_setting() {
+        let old = format!("{}\n", 4582usize << 20);
+        assert_eq!(stored_need(&old, ALL_HEAPS), 4582 << 20);
+        assert_eq!(stored_need(&old, "sparse:16"), 0, "measured with the heaps in the window");
+        assert_eq!(stored_need(&old, "sparse"), 0);
+        assert_eq!(stored_need("", ALL_HEAPS), 0);
+        // one size per setting; writing one keeps the others, and may lower it
+        let both = with_need(&old, "sparse:16", 105 << 20);
+        assert_eq!(stored_need(&both, ALL_HEAPS), 4582 << 20, "kept for a run with every heap in the window");
+        assert_eq!(stored_need(&both, "sparse:16"), 105 << 20);
+        let lower = with_need(&both, "sparse:16", 0);
+        assert_eq!((stored_need(&lower, "sparse:16"), stored_need(&lower, ALL_HEAPS)), (0, 4582 << 20));
+        assert_eq!(lower.lines().count(), 2, "{lower:?}");
+        let all = with_need(&lower, ALL_HEAPS, 64 << 20);
+        assert_eq!((stored_need(&all, ALL_HEAPS), stored_need(&all, "sparse:16")), (64 << 20, 0));
+        assert_eq!(all.lines().count(), 2, "the number of before is replaced, not kept beside: {all:?}");
+        // lines that are no size are dropped
+        assert_eq!(with_need("junk\n\n7 off\n", "sparse", 1), "7 off\n1 sparse\n");
     }
 }
