@@ -789,7 +789,8 @@ pub fn note_gpu_write(list: usize, res: usize) {
     if marked {
         STREAM_RECHECK.lock().unwrap().remove(&res);
     }
-    if kept && list != 0 {
+    // (the stamp is for the queue's page mappings: with them off, a submit takes no lock for it)
+    if kept && list != 0 && crate::hle::kernelx::mirrors::page_mappings() {
         let mut g = LIST_WRITES.lock().unwrap();
         let v = g.entry(list).or_default();
         if !v.contains(&res) {
