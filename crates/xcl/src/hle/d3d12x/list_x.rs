@@ -3755,6 +3755,35 @@ fn pc_va_in(u: &crate::gpu::uma::Uma, va: u64, window_va: impl Fn(usize) -> Opti
     }
 }
 
+/// The bytes of a view of `bytes` at the title's address `va` that the PC can bind as one range:
+/// up to the end of the memory window `va` is in. The title's GPU view is one range, but its
+/// windows are separate buffers on the PC (a GPU view spans six of 4 GiB): a view across a
+/// window's end, bound as it is, runs past that window's buffer into addresses nothing maps.
+/// The GPU reads zeros past the clamped size. (Logged once.)
+fn view_bytes(va: u64, bytes: u32) -> u32 {
+    match crate::gpu::uma::get().and_then(|u| bytes_in_window(u, va, bytes)) {
+        Some(n) => {
+            static N: AtomicBool = AtomicBool::new(false);
+            if !N.swap(true, Ordering::Relaxed) {
+                crate::xlog_warn!("D3D12.X: a vertex or index buffer at {va:#x} ({bytes} bytes) runs past the end of its memory window: bound up to it ({n} bytes)");
+            }
+            n
+        }
+        None => bytes,
+    }
+}
+
+/// `view_bytes` in `u`: the clamped size when `[va, va + bytes)` starts in the title's memory
+/// of a window and runs past that window's end (None: it does not).
+fn bytes_in_window(u: &crate::gpu::uma::Uma, va: u64, bytes: u32) -> Option<u32> {
+    let p = va as usize;
+    let k = u.window_of(p)?;
+    let (base, size) = u.window(k);
+    let room = (base + size).checked_sub(p)?;
+    // (the title's memory is looked up only for a view across the end: a lock)
+    (bytes as usize > room && u.is_title_address(p)).then_some(room as u32)
+}
+
 /// `pc_va` for an index or vertex buffer of `bytes` bytes bound on `list`. A retail title also
 /// binds buffers in its ordinary memory (a private allocation outside the unified-memory
 /// windows – on the console the GPU reads all of the title's memory). The PC's GPU has no
@@ -4017,6 +4046,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
         .map(|k| {
             let mut v = views.add(k).read_unaligned();
             let title = v.BufferLocation;
+            v.SizeInBytes = view_bytes(title, v.SizeInBytes);
             v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "vertex buffer", true);
             if super::present::trace_frame() {
                 static N: AtomicU64 = AtomicU64::new(0);
@@ -4064,6 +4094,7 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
     let mut v = view.read_unaligned();
     s.bindings.index_title = Some((v.BufferLocation, v.SizeInBytes, v.Format.0));
     drop(g);
+    v.SizeInBytes = view_bytes(v.BufferLocation, v.SizeInBytes);
     v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "index buffer", true);
     if let Some(s) = recording(this as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
         s.index_buffer = Some(v);
@@ -4088,7 +4119,9 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     };
     let bound = recording(this as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
     sync_title_buffers(this, None, 0, 0, 2);
-    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu_va(this, va, count.saturating_mul(stride) as usize, "DrawIndexedX indices", false), SizeInBytes: count.saturating_mul(stride), Format: format };
+    // (indices past the clamped size read as 0)
+    let bytes = view_bytes(va, count.saturating_mul(stride));
+    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu_va(this, va, bytes as usize, "DrawIndexedX indices", false), SizeInBytes: bytes, Format: format };
     set_index_buffer(this, Some(&view));
     super::bind::emit_prepared_indexed_draw(&list, count, 1, 0, 0, 0);
     set_index_buffer(this, bound.as_ref());
@@ -7018,6 +7051,22 @@ mod tests {
         assert_eq!(pc_va_in(&u, other, window_va), other);
         assert_eq!(pc_va_in(&u, 0x1234_0000, window_va), 0x1234_0000);
         assert_eq!(u.view_release(g), Some(1 << 20));
+    }
+
+    /// A vertex or index buffer of a GPU view across a view window's end is bound only up to that
+    /// end: the windows are separate buffers on the PC. One inside a window stays as it is.
+    #[test]
+    fn a_view_across_a_window_end_is_bound_up_to_it() {
+        use crate::gpu::uma::{GRAIN, WINDOW};
+        let u = sixteen_windows();
+        let g = u.view_reserve(WINDOW + GRAIN).expect("a GPU view over two windows");
+        let end = (g + WINDOW) as u64;
+        assert_eq!(bytes_in_window(&u, end - 0x100, 0x200), Some(0x100), "across the end");
+        assert_eq!(bytes_in_window(&u, end - 0x200, 0x200), None, "up to the end");
+        assert_eq!(bytes_in_window(&u, g as u64 + 0x40, 0x1000), None, "inside");
+        assert_eq!(bytes_in_window(&u, end + 0x10, 0x100), None, "in the next window");
+        assert_eq!(bytes_in_window(&u, 0x1234_0000, 0x1000_0000), None, "not in a window");
+        assert_eq!(u.view_release(g), Some(WINDOW + GRAIN));
     }
 
     /// A wait on an address in a GPU view reads the value at its CPU view, where the title writes

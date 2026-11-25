@@ -269,6 +269,23 @@ unsafe fn make(dev: &ID3D12Device) -> Result<Guard, String> {
     })
 }
 
+/// bytes of an argument record the program reads (`check`)
+const COUNT_BYTES: usize = 5 * 4;
+
+/// The GPU address of the arguments at UMA address `t` through their memory window, when all
+/// `COUNT_BYTES` of them are in one window. The program reads them through a root UAV, which
+/// has no bounds: a record across a view window's end would be read past that window's buffer
+/// (the view windows are separate 4 GiB resources). None: the caller reads the title's buffer.
+fn counts_va(t: usize) -> Option<u64> {
+    counts_va_in(t, |p, n| real::uma_window_buffer_gpu(p, n).is_some(), real::uma_va_of)
+}
+
+/// `counts_va` with the window lookups given: whether `n` bytes at an address are in one
+/// window, and an address's GPU address.
+fn counts_va_in(t: usize, in_one_window: impl Fn(usize, usize) -> bool, va_of: impl Fn(usize) -> Option<u64>) -> Option<u64> {
+    in_one_window(t, COUNT_BYTES).then(|| va_of(t)).flatten()
+}
+
 /// An ExecuteIndirect whose counts XCL's program reads: what it runs instead of the title's.
 pub(super) struct Checked {
     guard: Arc<Guard>,
@@ -304,9 +321,9 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     // (in a GPU view: its window, which has the arguments once their tiles are asked for; the
     // program reads them on the GPU only)
     if let Some(t) = title {
-        super::bind::want_view(super::view_want::Path::MemoryOp, t as u64, 5 * 4);
+        super::bind::want_view(super::view_want::Path::MemoryOp, t as u64, COUNT_BYTES as u64);
     }
-    let va = title.and_then(real::uma_va_of).filter(|v| v % 4 == 0).unwrap_or(shown);
+    let va = title.and_then(counts_va).filter(|v| v % 4 == 0).unwrap_or(shown);
     let shown = if compare() { shown } else { va };
     let g = guard_of(l)?;
     let slot = g.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
@@ -478,6 +495,19 @@ mod tests {
         queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
         queue.Signal(&done, 1).unwrap();
         fence::wait(&done, 1, dev, None, 10_000).unwrap();
+    }
+
+    /// The program reads the arguments through their memory window only when the whole record is
+    /// in that window: one across a window's end is read through the title's buffer instead.
+    #[test]
+    fn arguments_across_a_window_end_are_not_read_through_the_window() {
+        // windows of 0x1000 bytes from 0x1_0000, each at its own GPU address (separate buffers)
+        let in_one_window = |p: usize, n: usize| p >= 0x1_0000 && (p - 0x1_0000) % 0x1000 + n <= 0x1000;
+        let va_of = |p: usize| (p >= 0x1_0000).then(|| 0x7000_0000 + ((p - 0x1_0000) / 0x1000) as u64 * 0x10_0000 + ((p - 0x1_0000) % 0x1000) as u64);
+        assert_eq!(counts_va_in(0x1_0100, in_one_window, va_of), Some(0x7000_0100));
+        assert_eq!(counts_va_in(0x1_1000 - COUNT_BYTES, in_one_window, va_of), Some(0x7000_1000 - COUNT_BYTES as u64), "the last record in a window");
+        assert_eq!(counts_va_in(0x1_1000 - 8, in_one_window, va_of), None, "a record across the window's end");
+        assert_eq!(counts_va_in(0x100, in_one_window, va_of), None, "not in a window");
     }
 
     #[test]
