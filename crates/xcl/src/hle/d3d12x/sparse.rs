@@ -1955,6 +1955,33 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     s.readback_ranges(&[(va, len)]);
 }
 
+/// Submits waiting for the state's lock. A thread that takes it again and again – a title mapping
+/// its memory a page at a time – can keep them out for seconds: the lock goes to the first to ask
+/// once it is free, and the thread that just gave it up is back before a waiting one has woken (a
+/// retail title's loading screen stood still for 8 s while another of its threads mapped 1.2 GB).
+static SUBMITS_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// what a commit waits for them at most
+const GIVE_WAY_US: u128 = 2000;
+
+/// `m` for a submit: the others let it in first (`lock_in_turn`).
+fn lock_first<'a, T>(m: &'a Mutex<T>, waiting: &std::sync::atomic::AtomicUsize) -> std::sync::MutexGuard<'a, T> {
+    waiting.fetch_add(1, Ordering::AcqRel);
+    let g = m.lock();
+    waiting.fetch_sub(1, Ordering::AcqRel);
+    g.unwrap()
+}
+
+/// `m` once no submit waits for it (or `GIVE_WAY_US` have gone by).
+fn lock_in_turn<'a, T>(m: &'a Mutex<T>, waiting: &std::sync::atomic::AtomicUsize) -> std::sync::MutexGuard<'a, T> {
+    if waiting.load(Ordering::Acquire) > 0 {
+        let t0 = std::time::Instant::now();
+        while waiting.load(Ordering::Acquire) > 0 && t0.elapsed().as_micros() < GIVE_WAY_US {
+            std::thread::yield_now();
+        }
+    }
+    m.lock().unwrap()
+}
+
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
 /// lie outside the range are not committed (holes); the range's pages are.
 pub unsafe fn committed(a: usize, n: usize) {
@@ -1962,7 +1989,7 @@ pub unsafe fn committed(a: usize, n: usize) {
         return;
     }
     super::title_textures::mark_hot(a, n);
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_in_turn(&STATE, &SUBMITS_WAITING);
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_add(&mut EARLY.lock().unwrap(), start, end);
@@ -1978,7 +2005,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_in_turn(&STATE, &SUBMITS_WAITING);
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
@@ -2255,7 +2282,7 @@ unsafe fn run_copies(jobs: &mut Vec<(usize, usize, usize)>, staging: *mut u8) {
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_first(&STATE, &SUBMITS_WAITING);
     let Some(s) = g.as_mut() else { return };
     s.drain_readbacks(Drain::Finished);
     // the title's work sees what was committed mapped …
@@ -2430,7 +2457,7 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::*;
         let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
         let mut dev: Option<ID3D12Device> = None;
-        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+        if std::env::var_os("XCL_TEST_WARP").is_some() || D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
             let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
             D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
         }
@@ -2675,6 +2702,41 @@ mod tests {
         drop(held);
         asked.join().unwrap();
         assert!(answered, "queue() waited for the sparse state's lock");
+    }
+
+    /// A submit gets the lock soon although another thread takes it again and again for 0.2 ms each.
+    #[test]
+    fn a_submit_is_let_in_before_the_commits() {
+        use std::sync::atomic::AtomicUsize;
+        let (m, waiting, stop) = (Mutex::new(0u64), AtomicUsize::new(0), AtomicBool::new(false));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    let mut g = lock_in_turn(&m, &waiting);
+                    *g += 1;
+                    let t = std::time::Instant::now();
+                    while t.elapsed().as_micros() < 200 {
+                        std::hint::spin_loop();
+                    }
+                }
+            });
+            while *m.lock().unwrap() == 0 {
+                std::thread::yield_now();
+            }
+            let mut turns: Vec<u64> = Vec::new();
+            for _ in 0..20 {
+                let before = *lock_first(&m, &waiting);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                let after = *lock_first(&m, &waiting);
+                // (the turns the other thread had while this one slept and waited)
+                turns.push(after - before);
+            }
+            stop.store(true, Ordering::Release);
+            turns.sort_unstable();
+            // 2 ms of sleep are 10 turns; without the rule a waiting thread stood behind hundreds
+            assert!(turns[10] < 60, "the other thread's turns before a submit had the lock: {turns:?}");
+        });
+        assert_eq!(waiting.load(Ordering::Acquire), 0);
     }
 
     /// A mapping put off does not wait for the title's next submit: a CPU signal sends it, and
