@@ -36,6 +36,7 @@ const WRITE_WATCH_FLAG_RESET: u32 = 1;
 #[link(name = "kernel32")]
 extern "system" {
     fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
+    fn ResetWriteWatch(base: *const c_void, size: usize) -> u32;
 }
 
 /// (device, address its bytes are read from, layout, states) of an upload
@@ -1049,6 +1050,45 @@ unsafe fn walk() {
     }
 }
 
+/// Ranges of the title's memory XCL wrote itself (DirectStorage data) since the last look: a
+/// title's loads write gigabytes that way, and the write watch would find the pages one look after
+/// the other (each block of them stayed hot for `hot_for`, and every look walked it).
+static KNOWN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// `XCL_DS_KNOWN_WRITES=0`: what DirectStorage writes is found by the write watch, as before.
+fn known_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DS_KNOWN_WRITES").map_or(true, |v| v.trim() != "0"))
+}
+
+/// XCL wrote `[at, at + len)` of the title's memory itself (DirectStorage data). Called once the
+/// bytes are there and before the title can learn of it. The write watch is cleared for the pages
+/// inside the range (written whole by this, and by nobody else while the request ran); the pages
+/// at its ends stay in it, for a neighbour's writes.
+pub fn note_known_write(at: usize, len: usize) {
+    if len == 0 || !known_writes() || crate::gpu::uma::get().is_none() {
+        return;
+    }
+    let (lo, hi) = ((at + 0xFFF) & !0xFFF, (at + len) & !0xFFF);
+    if hi > lo {
+        // (not write-watched memory: nothing to clear)
+        unsafe { ResetWriteWatch(lo as *const c_void, hi - lo) };
+    }
+    KNOWN.lock().unwrap().push((at, len));
+}
+
+/// The pages of the known writes, added to `dirty`.
+fn take_known(dirty: &mut Vec<usize>) {
+    let ranges = std::mem::take(&mut *KNOWN.lock().unwrap());
+    for (at, len) in ranges {
+        let mut p = at & !0xFFF;
+        while p < at + len {
+            dirty.push(p);
+            p += 0x1000;
+        }
+    }
+}
+
 /// Diagnostic: where the written pages of the looks are, in 64 MiB pieces. The 12 with the most
 /// pages are logged every 4096 looks, each with its UMA window and that window's kind.
 fn note_dirty_regions(u: &crate::gpu::uma::Uma) {
@@ -1117,8 +1157,12 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) {
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
+        // (a submit without a look of its own takes these too: they are dirty by XCL's account)
+        take_known(&mut dirty);
         if !look {
-            return 0;
+            dirty.sort_unstable();
+            dirty.dedup();
+            return dirty.len();
         }
         LOOK_BEGAN.store(now_us(), Ordering::Release);
         WATCH_BUF.with(|wcell| {
@@ -1135,6 +1179,7 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) {
             }
         });
         dirty.sort_unstable();
+        dirty.dedup();
         dirty.len()
     });
     if look {

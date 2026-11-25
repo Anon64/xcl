@@ -1049,6 +1049,7 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
         let chunk = (PHYS_PAGE - page_off).min(src.len() - done);
         pagelog::note("DirectStorage write by page number", addr + page_off, 0, chunk);
         std::ptr::copy_nonoverlapping(src.as_ptr().add(done), (addr + page_off) as *mut u8, chunk);
+        crate::hle::d3d12x::title_textures::note_known_write(addr + page_off, chunk);
         done += chunk;
         page_off = 0;
     }

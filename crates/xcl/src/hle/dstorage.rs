@@ -973,6 +973,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     } else if n > 0 {
         crate::hle::kernelx::pagelog::note("DirectStorage write", r.destination as usize, 0, n);
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        crate::hle::d3d12x::title_textures::note_known_write(r.destination as usize, n);
     }
     Ok(())
 }
