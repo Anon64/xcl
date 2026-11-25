@@ -74,15 +74,25 @@ pub struct Layout {
     pub size: u32,
     pub inline: u32,
     pub inline_gfx: u32,
+    /// the shaders index the view heap / the sampler heap themselves (the root signature's
+    /// CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED / SAMPLER_HEAP_DIRECTLY_INDEXED): they take the 32-bit
+    /// address of each from a user SGPR after the arguments, the view heap's first
+    pub heaps: [bool; 2],
+    pub inline_ms: u32,
 }
+
+const CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED: u32 = 0x400;
+const SAMPLER_HEAP_DIRECTLY_INDEXED: u32 = 0x800;
 
 /// User SGPRs the console's compiler gives root arguments: compute s4…s15 (s0…s3 are the
 /// driver's), graphics stages (VS, PS) s8…s31 (s0…s7: the driver's, s[4:5] of a VS the
 /// fetch shader) – both measured on its output (`tests/console_shaders.rs`).
 const INLINE_SGPRS: u32 = 12;
 const INLINE_SGPRS_GFX: u32 = 24;
+const INLINE_SGPRS_MS: u32 = 16;
 const FIRST_SGPR: usize = 4;
 const FIRST_SGPR_GFX: usize = 8;
+const FIRST_SGPR_MS: usize = 16;
 /// Most bytes of root arguments a layout has. The PC's limit is 64 DWORDs (256 bytes: a
 /// constant or a table 1, a root descriptor 2, D3D12 "Root Signature Limits"); the console's
 /// is not known, so 16 times that. A malformed blob (a count of 0x3FFF_FFFF constants) gets no
@@ -100,11 +110,12 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
     };
     let r = |o: usize| rts0.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let (n, poff) = (r(4)? as usize, r(8)? as usize);
-    let mut l = Layout::default();
+    let flags = r(20).unwrap_or(0);
+    let mut l = Layout { heaps: [CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED, SAMPLER_HEAP_DIRECTLY_INDEXED].map(|f| flags & f != 0), ..Default::default() };
     // the parameters go into user SGPRs in order while each fits whole; from the first one
     // that does not, the rest go to the table (packed from its start) – as the console's
     // compiler expects them (HANDOFF: root argument binding)
-    let (mut spilled, mut spilled_gfx) = (false, false);
+    let (mut spilled, mut spilled_gfx, mut spilled_ms) = (false, false, false);
     for k in 0..n {
         let (ty, pay) = (r(poff + 12 * k)?, r(poff + 12 * k + 8)? as usize);
         let p = match ty {
@@ -126,6 +137,10 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
         spilled_gfx |= l.inline_gfx + bytes > 4 * INLINE_SGPRS_GFX;
         if !spilled_gfx {
             l.inline_gfx += bytes;
+        }
+        spilled_ms |= l.inline_ms + bytes > 4 * INLINE_SGPRS_MS;
+        if !spilled_ms {
+            l.inline_ms += bytes;
         }
         l.size = size;
         l.params.push(p);
@@ -168,6 +183,32 @@ pub fn user_data_for(l: &Layout, user_sgprs: Option<u32>, args: &[u8], table_at:
 /// `user_data` of a draw: the vertex and pixel shader's user SGPRs (inline from s8).
 pub fn user_data_gfx(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR_GFX, l.inline_gfx, args, table_at)
+}
+
+/// `sgprs` (`user_data_for` / `user_data_gfx`) and the addresses of the view heap and the sampler
+/// heap set that the shaders index (`Layout::heaps`). A compute shader without registers left
+/// for them (`user_sgprs`: its count) gets none.
+pub fn with_heaps(l: &Layout, user_sgprs: Option<u32>, mut sgprs: Vec<u32>, heaps: [u32; 2]) -> Vec<u32> {
+    for (_, base) in l.heaps.iter().zip(heaps).filter(|(&used, _)| used) {
+        if user_sgprs.is_some_and(|n| sgprs.len() as u32 >= n) {
+            break;
+        }
+        sgprs.push(base);
+    }
+    sgprs
+}
+
+pub fn user_data_ms(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
+    let mut s = vec![0u32; FIRST_SGPR_MS];
+    s[8] = table_at as u32;
+    s[9] = (table_at >> 32) as u32;
+    let inline = &args[..(l.inline_ms as usize).min(args.len())];
+    s.extend(inline.chunks(4).map(|c| {
+        let mut w = [0u8; 4];
+        w[..c.len()].copy_from_slice(c);
+        u32::from_le_bytes(w)
+    }));
+    s
 }
 
 fn sgprs(first: usize, inline: u32, args: &[u8], table_at: u64) -> Vec<u32> {
@@ -333,6 +374,7 @@ pub fn allocator_reset(allocator: *mut c_void) {
     if let Some(b) = blocks {
         unsafe { free_uma(&b) };
     }
+    super::bind::release_allocator_res(allocator as usize);
 }
 
 fn with_list<R>(obj: usize, f: impl FnOnce(&mut ListState) -> R) -> Option<R> {
@@ -978,6 +1020,36 @@ mod tests {
         r.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
 
+    /// Shaders that index the heaps set themselves get the heaps' addresses after their
+    /// arguments, the view heap's first; a compute shader without registers for them does not.
+    #[test]
+    fn heap_addresses_follow_the_arguments() {
+        let layout = |flags: u32, p: &[(u32, u32)]| {
+            let mut blob = rts0(p);
+            blob[20..24].copy_from_slice(&flags.to_le_bytes());
+            layout_from_blob(&blob).unwrap()
+        };
+        let heaps = [0x6000_0000, 0x6381_0000];
+        // a table and two constants
+        let args: Vec<u8> = [0x80u32, 5, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let gfx = |flags: u32| {
+            let l = layout(flags, &[(0, 0), (1, 2)]);
+            with_heaps(&l, None, user_data_gfx(&l, &args, 0x200), heaps)[8..].to_vec()
+        };
+        assert_eq!(gfx(1), [0x80, 5, 0]);
+        assert_eq!(gfx(0x801), [0x80, 5, 0, 0x6381_0000]);
+        assert_eq!(gfx(0x401), [0x80, 5, 0, 0x6000_0000]);
+        assert_eq!(gfx(0xC01), [0x80, 5, 0, 0x6000_0000, 0x6381_0000]);
+        let cs = |flags: u32, user: u32| {
+            let l = layout(flags, &[(0, 0), (1, 2)]);
+            with_heaps(&l, Some(user), user_data_for(&l, Some(user), &args, 0x200), heaps)[4..].to_vec()
+        };
+        assert_eq!(cs(0xC00, 9), [0x80, 5, 0, 0x6000_0000, 0x6381_0000]);
+        assert_eq!(cs(0xC00, 8), [0x80, 5, 0, 0x6000_0000]);
+        assert_eq!(cs(0xC00, 7), [0x80, 5, 0], "no register left");
+        assert_eq!(cs(0, 9), [0x80, 5, 0]);
+    }
+
     /// A blob whose constant count makes the arguments overflow u32 (0x4000_0000) or take
     /// gigabytes (0x3FFF_FFFF: 0xFFFF_FFFC bytes, allocated at every Set*RootSignature) has no
     /// layout; the largest one allowed still has one.
@@ -1020,5 +1092,20 @@ mod tests {
         let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
         let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(user_data_gfx(&l, &args, 0x200), vec![0x200, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0x5000, 4, 0x80]);
+    }
+
+    #[test]
+    fn mesh_arguments_go_in_user_sgprs_from_s16() {
+        let inline = |p: &[(u32, u32)]| layout_from_blob(&rts0(p)).unwrap().inline_ms;
+        assert_eq!(inline(&[(1, 2), (2, 0), (0, 0)]), 20);
+        assert_eq!(inline(&[(1, 14), (2, 0)]), 64);
+        assert_eq!(inline(&[(1, 15), (2, 0)]), 60);
+        assert_eq!(inline(&[(1, 17), (2, 0)]), 0);
+        let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
+        let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let got = user_data_ms(&l, &args, 0x7_0000_0200);
+        assert_eq!(got[8], 0x200);
+        assert_eq!(got[9], 7);
+        assert_eq!(&got[16..], &[1, 2, 0x5000, 4, 0x80]);
     }
 }
