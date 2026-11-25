@@ -445,8 +445,8 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
-static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+/// cached `watch_ranges` keyed by `watch_key`
+static WATCH_CACHE: Mutex<Option<((u64, u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -987,11 +987,13 @@ thread_local! {
     static WATCH_BUF: std::cell::RefCell<Vec<*mut c_void>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Reusable dirty page list for `refresh_once`.
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Reusable list of the GPU-view pages the dirty pages are written to (`views_of_written`).
+    static TWINS_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// What the watched ranges are made of, as generations.
-fn watch_key() -> (u64, u64, u64) {
-    (super::sparse::mapped_gen(), COARSE_GEN.load(Ordering::Acquire), crate::hle::kernelx::graphics_reservations_gen())
+fn watch_key() -> (u64, u64, u64, u64) {
+    (super::sparse::mapped_gen(), COARSE_GEN.load(Ordering::Acquire), crate::hle::kernelx::graphics_reservations_gen(), crate::hle::kernelx::mirrors::shown_gen())
 }
 
 /// The ranges the last look used, and whether they are still all there is.
@@ -1018,6 +1020,8 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // every submit while it loads)
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().coarse.keys().map(|&b| (b << SRC_COARSE_SHIFT, (b + 1) << SRC_COARSE_SHIFT)).collect();
     wanted.extend(super::sparse::mapped_ranges());
+    // (the blocks where the pages the queue's page mappings show are kept: the pool, the CPU view)
+    wanted.extend(crate::hle::kernelx::mirrors::shown_blocks());
     let computed = watch_ranges(&regions, wanted);
     let mut g = WATCH_CACHE.lock().unwrap();
     // (ranges that came out the same stay the same object: `hot_runs` keeps its blocks by it)
@@ -1718,6 +1722,25 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
             super::vram::before_execute(q);
         });
     }
+    // a write where a page the queue's page mappings show is kept is a write to the GPU-view pages
+    // that show it: the textures read through their pages find it by their own range (sparse had
+    // the real addresses above)
+    let dirty_len = if crate::hle::kernelx::mirrors::any_mapped() {
+        DIRTY_BUF.with(|dcell| {
+            let mut dirty = dcell.borrow_mut();
+            TWINS_BUF.with(|tcell| {
+                let mut twins = tcell.borrow_mut();
+                twins.clear();
+                crate::hle::kernelx::mirrors::views_of_written(&dirty, &mut twins);
+                dirty.extend_from_slice(&twins);
+            });
+            dirty.sort_unstable();
+            dirty.dedup();
+            dirty.len()
+        })
+    } else {
+        dirty_len
+    };
     let recheck_frame = {
         let (p, b) = super::present::counters();
         p.max(b)
@@ -3125,6 +3148,44 @@ pub(super) mod tests {
             map_pages(g, &[[0, 1, 1]], home, 2);
             refresh(queue.as_raw());
             assert_eq!(read_r8(dev, &queue, &paged), vec![0x62; 64 * 64]);
+            // writes where the page is kept: in the pool; just before the page moves into the CPU
+            // view, with no look in between; where it is kept after that; by its page number
+            // (`mark_hot`: the looks take those blocks now, not once the walk finds them)
+            std::ptr::write_bytes((home + PAGE) as *mut u8, 0x73, PAGE);
+            mark_hot(home, 2 * PAGE);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x73; 64 * 64], "a write to the pool page");
+            std::ptr::write_bytes((home + PAGE) as *mut u8, 0x84, PAGE);
+            let kept = src + 6 * PAGE;
+            let mut one = [pool.0[1]];
+            assert_eq!(kernelx::MapTitlePhysicalPages(kept as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, kept);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x84; 64 * 64], "a write made just before the page moved");
+            std::ptr::write_bytes(kept as *mut u8, 0x95, PAGE);
+            mark_hot(kept, PAGE);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x95; 64 * 64], "a write where the page is kept now");
+            assert!(kernelx::write_physical_pages(&[pool.0[1]], 0, &[0xA6; PAGE]));
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0xA6; 64 * 64], "a write by page number");
+            // the GPU's write of a submitted list stays over a CPU write, and gives way to a later
+            // mapping; a CPU write after that goes up
+            let list = 0x7E57_0000_8000usize;
+            note_gpu_write(list, paged.as_raw() as usize);
+            submitted(&[list as *mut c_void]);
+            std::ptr::write_bytes(kept as *mut u8, 0xB7, PAGE);
+            mark_hot(kept, PAGE);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0xA6; 64 * 64], "the GPU's");
+            map_pages(g, &[[0, 0, 1]], home, 2);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x62; 64 * 64], "a later mapping takes it back");
+            std::ptr::write_bytes(home as *mut u8, 0xC8, PAGE);
+            mark_hot(home, PAGE);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0xC8; 64 * 64], "and a CPU write after it goes up");
+            list_reset(list);
+            assert_eq!(kernelx::MapTitlePhysicalPages(kept as *mut c_void, 1, 0, 4, std::ptr::null_mut()) as usize, kept);
             dev.GetDeviceRemovedReason().unwrap();
         }
     }
@@ -3323,6 +3384,50 @@ pub(super) mod tests {
             assert!(!state().0);
             assert_eq!(again(), page_again());
             forget(res);
+            drop_paged_views(cpu, gpu, pages);
+        }
+    }
+
+    /// A texture read through its pages finds its written pages through the GPU-view pages a
+    /// write reaches: a write where a mapped page is kept, and one in the CPU view under a page
+    /// the queue's page mappings never named; those that differ from what went up are sent.
+    #[test]
+    fn an_untouched_page_of_a_paged_texture_is_found_written() {
+        use crate::hle::kernelx::mirrors::{views_of_written, PAGE};
+        use texture_upload::{Change, Written};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let (cpu, gpu, pages, home) = paged_views(191 * PAGE, 1);
+            assert_eq!(VirtualAlloc((cpu + PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, cpu + PAGE);
+            std::ptr::write_bytes(home as *mut u8, 0x21, PAGE);
+            std::ptr::write_bytes((cpu + PAGE) as *mut u8, 0x43, PAGE);
+            // a texture over view pages 0 (the pool page mapped there) and 1 (never named)
+            map_pages(gpu, &[[0, 0, 1]], home, 1);
+            let m = page_map(gpu, 2 * PAGE, false).expect("a table");
+            let known: texture_upload::Known = Default::default();
+            texture_upload::all_sent(&known, gpu, 2 * PAGE);
+            let compare = |dirty: &[usize]| texture_upload::changed(&[Written { src: gpu, size: 2 * PAGE, dirty, known: &known, pages: Some(&m) }], true).0.remove(0);
+            let all: Vec<usize> = (0..2 * PAGE / 0x1000).map(|k| gpu + k * 0x1000).collect();
+            assert_eq!(compare(&all), Change::Parts(vec![(0, 2 * PAGE)]), "nothing was known of it");
+            // a write where the mapped page is kept, and one in the CPU view under the other page
+            let (a, b) = (home + 0x2000, cpu + PAGE + 0x3000);
+            let mut written = vec![a, b];
+            written.sort_unstable();
+            let look = |written: &[usize]| {
+                let mut twins = Vec::new();
+                views_of_written(written, &mut twins);
+                twins.sort_unstable();
+                twins.dedup();
+                assert!(twins.contains(&(gpu + 0x2000)) && twins.contains(&(gpu + PAGE + 0x3000)), "{twins:x?}");
+                compare(&twins)
+            };
+            assert_eq!(look(&written), Change::None, "they hold what went up");
+            *(a as *mut u8) ^= 1;
+            *(b as *mut u8) ^= 1;
+            assert_eq!(look(&written), Change::Parts(vec![(0x2000, 0x3000), (PAGE + 0x3000, PAGE + 0x4000)]));
+            assert_eq!(look(&written), Change::None);
             drop_paged_views(cpu, gpu, pages);
         }
     }
