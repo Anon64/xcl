@@ -373,7 +373,12 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0, None, 0);
+    submit_with(standin, compute, job, 0);
+}
+
+/// `submit`, with a compute pipeline's console program for the log (`record`; 0: not known).
+pub(super) fn submit_with(standin: usize, compute: bool, job: Job, record: u64) {
+    submit_as(standin, compute, job, true, 0, None, record);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -1051,6 +1056,22 @@ mod used_tests {
         assert!(first_late(0x5EED_C024));
         assert!(!first_late(0x5EED_C024), "another pipeline of the same program");
         assert!(first_late(0x5EED_C025));
+    }
+
+    /// A compute pipeline sent to the workers when made (`XCL_LAZY_PSO=0`) carries its console
+    /// program as a lazy one does: a late one is logged by it (`resolve_within`).
+    #[test]
+    fn a_pipeline_sent_to_the_workers_when_made_carries_its_record() {
+        let standin = 0x7E57_C026usize;
+        let (go, finish) = mpsc::channel::<()>();
+        submit_with(standin, true, Box::new(move || {
+            let _ = finish.recv();
+            0x6A6A
+        }), 0x5EED_C026);
+        assert_eq!(entry(standin).map(|p| p.record), Some(0x5EED_C026));
+        go.send(()).unwrap();
+        assert_eq!(resolve_wait_for(standin, None), 0x6A6A);
+        released(standin);
     }
 
     /// A pipeline for the backlog (`warm`: with its translation on its own), never built.

@@ -5748,7 +5748,7 @@ unsafe fn go_background(
     if super::pso_async::lazy() {
         super::pso_async::submit_lazy_with(*ppv as usize, compute, job, key, warm, record);
     } else {
-        super::pso_async::submit(*ppv as usize, compute, job);
+        super::pso_async::submit_with(*ppv as usize, compute, job, record);
     }
     Some(hr)
 }
