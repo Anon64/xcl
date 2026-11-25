@@ -4332,8 +4332,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 /// run still goes through the driver's compiler. On an NVIDIA GPU that is 5 – 27 s for each of
 /// a retail title's larger compute programs when its world loads: the title dispatches without
 /// them meanwhile and is ended before all are built, so the next run starts the same compiles
-/// again. A blob whose build took `KEEP` or longer is written under the hash of its DXIL and
-/// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
+/// again. A blob whose build took `KEEP` (a compute pipeline's: `COMPUTE_KEEP`) or longer is
+/// written under the hash of its DXIL and its flags (`<DXIL cache>\driver\`) and read when a
+/// later run has none in memory; the
 /// driver refuses the blob of another driver, adapter or root signature (the file is dropped
 /// and the program compiled as before). A translated graphics pipeline's blob goes under
 /// `graphics_file_hash`, the passes of a two-pass one under `TwoPassBlob`'s names.
@@ -4344,6 +4345,10 @@ pub(crate) mod driver_cache {
 
     /// builds shorter than this are not worth a file
     const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
+    /// … of a compute pipeline: one not kept is compiled again in every run, at its first bind,
+    /// often on one of the title's threads (a retail title's thread spent 228 ms on a 4 KB
+    /// program that no file was kept for)
+    const COMPUTE_KEEP: std::time::Duration = std::time::Duration::from_millis(20);
     static HITS: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     static STORED: AtomicU64 = AtomicU64::new(0);
@@ -4392,8 +4397,19 @@ pub(crate) mod driver_cache {
     /// Builds shorter than this keep no file (`KEEP`; `XCL_PSO_DISK_CACHE_MIN_MS` to choose).
     pub(super) fn keep_threshold() -> std::time::Duration {
         static MIN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-        *MIN.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE_MIN_MS").ok()
-            .and_then(|v| v.trim().parse().ok()).map_or(KEEP, std::time::Duration::from_millis))
+        *MIN.get_or_init(|| keep_threshold_of(std::env::var("XCL_PSO_DISK_CACHE_MIN_MS").ok().as_deref(), KEEP))
+    }
+
+    /// Compute builds shorter than this keep no file (`COMPUTE_KEEP`; `XCL_PSO_DISK_CACHE_MIN_MS`
+    /// to choose, as for the others).
+    fn compute_keep_threshold() -> std::time::Duration {
+        static MIN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        *MIN.get_or_init(|| keep_threshold_of(std::env::var("XCL_PSO_DISK_CACHE_MIN_MS").ok().as_deref(), COMPUTE_KEEP))
+    }
+
+    /// A threshold in milliseconds from the environment (unset or not a number: `default`).
+    fn keep_threshold_of(v: Option<&str>, default: std::time::Duration) -> std::time::Duration {
+        v.and_then(|v| v.trim().parse().ok()).map_or(default, std::time::Duration::from_millis)
     }
 
     pub fn load(p: &Path) -> Option<Vec<u8>> {
@@ -4457,9 +4473,10 @@ pub(crate) mod driver_cache {
         ok
     }
 
-    /// Keep `blob`, of a build that took `took`, for the next run.
+    /// Keep `blob`, of a compute pipeline's build that took `took`, for the next run
+    /// (`compute_keep_threshold`).
     pub fn keep(p: &Path, blob: &[u8], took: std::time::Duration) {
-        keep_at(p, blob, took, KEEP);
+        keep_at(p, blob, took, compute_keep_threshold());
     }
 
     pub(super) fn keep_at(p: &Path, blob: &[u8], took: std::time::Duration, min: std::time::Duration) {
@@ -4521,6 +4538,23 @@ pub(crate) mod driver_cache {
             note(false, Some(&p));
             assert_eq!(load(&p), None);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A compute build of 20 ms or more keeps its file (it was 250 ms, as for the others, and
+        /// `XCL_PSO_DISK_CACHE_MIN_MS` did not reach it); the switch chooses for both.
+        #[test]
+        fn a_compute_build_of_a_tenth_of_a_second_keeps_its_file() {
+            let ms = std::time::Duration::from_millis;
+            assert_eq!(keep_threshold_of(None, COMPUTE_KEEP), ms(20));
+            assert_eq!(keep_threshold_of(None, KEEP), ms(250), "the others' as before");
+            assert_eq!(keep_threshold_of(Some(" 100 "), COMPUTE_KEEP), ms(100));
+            assert_eq!(keep_threshold_of(Some("0"), KEEP), ms(0));
+            assert_eq!(keep_threshold_of(Some("soon"), COMPUTE_KEEP), ms(20));
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-compute-{}", std::process::id()));
+            let _directory = Directory(dir.clone());
+            let p = dir.join("driver").join(name(b"small program", 0));
+            keep(&p, &[4, 5, 6], ms(100));
+            assert_eq!(load(&p).as_deref(), Some(&[4u8, 5, 6][..]), "a 100 ms compute build is kept");
         }
 
         #[test]
