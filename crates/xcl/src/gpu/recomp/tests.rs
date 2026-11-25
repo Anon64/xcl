@@ -7582,7 +7582,7 @@ fn only_compute_programs_with_a_loop_read_the_dispatch_loop_budget() {
 /// lane, the same in every thread (both halves of a split wave64). A dispatch that does not
 /// say (0) leaves it the lane's 65 536. Entered three times the loop runs them three times:
 /// loops inside one another are not cut to one loop's share. The HLSL path: the direct
-/// translator has its own fixed budget.
+/// translator's is `dxil::core_tests::gpu_direct_compute_loop_passes_follow_the_dispatch`.
 #[test]
 fn gpu_compute_loop_passes_follow_the_dispatch() {
     if !gpu_ready() {
