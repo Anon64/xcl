@@ -774,12 +774,19 @@ thread_local! {
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// What the watched ranges are made of, as generations.
+fn watch_key() -> (u64, u64, u64) {
+    (super::sparse::mapped_gen(), COARSE_GEN.load(Ordering::Acquire), crate::hle::kernelx::graphics_reservations_gen())
+}
+
+/// The ranges the last look used, and whether they are still all there is.
+fn last_watch_ranges() -> Option<(Arc<Vec<(usize, usize)>>, bool)> {
+    let g = WATCH_CACHE.lock().unwrap();
+    g.as_ref().map(|(k, ranges)| (Arc::clone(ranges), *k == watch_key()))
+}
+
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
-    let key = (
-        super::sparse::mapped_gen(),
-        COARSE_GEN.load(Ordering::Acquire),
-        crate::hle::kernelx::graphics_reservations_gen(),
-    );
+    let key = watch_key();
     {
         let g = WATCH_CACHE.lock().unwrap();
         if let Some((k, ref ranges)) = *g {
@@ -796,8 +803,14 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // every submit while it loads)
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().coarse.keys().map(|&b| (b << SRC_COARSE_SHIFT, (b + 1) << SRC_COARSE_SHIFT)).collect();
     wanted.extend(super::sparse::mapped_ranges());
-    let computed = Arc::new(watch_ranges(&regions, wanted));
-    *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
+    let computed = watch_ranges(&regions, wanted);
+    let mut g = WATCH_CACHE.lock().unwrap();
+    // (ranges that came out the same stay the same object: `hot_runs` keeps its blocks by it)
+    let computed = match g.take() {
+        Some((_, old)) if *old == computed => old,
+        _ => Arc::new(computed),
+    };
+    *g = Some((key, Arc::clone(&computed)));
     computed
 }
 
@@ -859,6 +872,18 @@ fn closed_before_last_look(lists: &[*mut c_void]) -> bool {
     lists.iter().all(|&l| m.get(&(l as usize)).is_some_and(|&t| t < began))
 }
 
+/// When the youngest of `lists` was closed (None: one was not seen closing).
+fn youngest_closed(lists: &[*mut c_void]) -> Option<u64> {
+    let g = CLOSED.lock().unwrap();
+    let m = g.as_ref()?;
+    lists.iter().map(|&l| m.get(&(l as usize)).copied()).try_fold(0, |a, t| Some(t?.max(a)))
+}
+
+thread_local! {
+    /// diagnostic: how long ago the youngest list of this thread's submit was closed (µs)
+    static CLOSED_AGO: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// `refresh` before the title's ExecuteCommandLists of `lists` (its own pointers).
 pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
     if BUSY.with(|b| b.get()) {
@@ -881,6 +906,9 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
     let t1 = std::time::Instant::now();
     // (XCL's copy of the frame to its window reads no memory of the title)
     let look = !(old && look_skip()) && !super::present::presenting();
+    if look && super::look_stats::on() {
+        CLOSED_AGO.with(|c| c.set(youngest_closed(lists).map(|t| now_us().saturating_sub(t))));
+    }
     own_work(|| refresh_once(queue, look));
     super::submit_cost::refresh(t1.elapsed());
 }
@@ -952,72 +980,166 @@ static LOOKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// looks, runs they took, bytes they covered, blocks the walk made hot
 static HOT_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
+/// The hot blocks of `ranges` as runs, each inside one range (a write-watch call covers one
+/// allocation), and how many blocks are hot.
+fn hot_runs(ranges: &Arc<Vec<(usize, usize)>>, now: std::time::Instant) -> (Vec<(usize, usize)>, usize) {
+    let mut g = HOT.lock().unwrap();
+    let h = g.get_or_insert_with(HotBlocks::default);
+    // a block new to the ranges starts hot: memory just mapped is often written and used at once
+    if !h.ranges.as_ref().is_some_and(|r| Arc::ptr_eq(r, ranges)) {
+        let mut known = std::collections::HashSet::with_capacity(h.known.len());
+        for &(base, size) in ranges.iter() {
+            let mut b = base & !(HOT_BLOCK - 1);
+            while b < base + size {
+                if !h.known.contains(&b) {
+                    h.hot.insert(b, now);
+                }
+                known.insert(b);
+                b += HOT_BLOCK;
+            }
+        }
+        h.known = known;
+        h.ranges = Some(Arc::clone(ranges));
+    }
+    let keep = hot_for();
+    h.hot.retain(|_, t| now.saturating_duration_since(*t) < keep);
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (&b, _) in h.hot.iter() {
+        let mut j = ranges.partition_point(|&(base, size)| base + size <= b);
+        while let Some(&(base, size)) = ranges.get(j) {
+            if base >= b + HOT_BLOCK {
+                break;
+            }
+            let (lo, hi) = (b.max(base), (b + HOT_BLOCK).min(base + size));
+            if lo < hi {
+                match runs.last_mut() {
+                    // one call for hot blocks up to HOT_GAP apart in the same range: a call costs
+                    // about as much as walking 6 MiB of committed pages
+                    Some(last) if last.0 >= base && lo - (last.0 + last.1) <= hot_gap() => last.1 = hi - last.0,
+                    _ => runs.push((lo, hi - lo)),
+                }
+            }
+            j += 1;
+        }
+    }
+    (runs, h.hot.len())
+}
+
+/// The blocks of `pages`, which a look found written, are hot from `now` on.
+fn keep_hot(pages: &[usize], now: std::time::Instant) {
+    if pages.is_empty() {
+        return;
+    }
+    if let Some(h) = HOT.lock().unwrap().as_mut() {
+        let mut last = usize::MAX;
+        for &p in pages {
+            let b = p & !(HOT_BLOCK - 1);
+            if b != last {
+                h.hot.insert(b, now);
+                last = b;
+            }
+        }
+    }
+}
+
+/// `XCL_LOOK_AHEAD=ms` (off unless given): a thread takes the written pages of the hot blocks every
+/// so many milliseconds while the title submits. They are dirty by XCL's account from then on
+/// (`AHEAD`): the next submit takes them with what its own look finds, and one whose lists were
+/// closed before such a round began needs no look (`XCL_LOOK_SKIP`). A look's time goes up with the
+/// pages it takes – each is a page-table entry changed and flushed on every core, ~0.5 µs with the
+/// title's threads running – and a retail title's world had ~8,000 a look: 5 ms on the thread that
+/// submits.
+fn look_ahead() -> Option<std::time::Duration> {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("XCL_LOOK_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    (ms > 0 && hot_looks()).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// pages found ahead of the next submit
+static AHEAD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// one look, or a piece of the thread's, at a time: what the one before was told is in `AHEAD` or in
+/// its submit's hands when the next one asks
+static ONE_LOOK: Mutex<()> = Mutex::new(());
+/// when the last submit came (`now_us`; the thread rests while there are none)
+static LAST_SUBMIT: AtomicU64 = AtomicU64::new(0);
+
+/// The written pages of `[at, at + len)` taken into `ahead`: how many.
+unsafe fn take_piece(at: usize, len: usize, buf: &mut [*mut c_void], ahead: &Mutex<Vec<usize>>) -> usize {
+    let (mut found, mut page) = (Vec::new(), 0x1000u32);
+    {
+        let _one = ONE_LOOK.lock().unwrap_or_else(|e| e.into_inner());
+        LOOKING.store(true, Ordering::Release);
+        take_written(at, len, buf, &mut found, &mut page);
+        LOOKING.store(false, Ordering::Release);
+        ahead.lock().unwrap().extend_from_slice(&found);
+    }
+    keep_hot(&found, std::time::Instant::now());
+    found.len()
+}
+
+/// The written pages of all hot blocks, in pieces (a submit's look waits for one at most).
+unsafe fn take_round(buf: &mut [*mut c_void]) -> usize {
+    const PIECE: usize = 64 << 20;
+    // (before the ranges and the blocks are asked for: what is new after that is not in the round)
+    let began = now_us();
+    let Some((ranges, all)) = last_watch_ranges() else { return 0 };
+    let mut n = 0;
+    for (base, size) in hot_runs(&ranges, std::time::Instant::now()).0 {
+        for at in (base..base + size).step_by(PIECE) {
+            n += take_piece(at, PIECE.min(base + size - at), buf, &AHEAD);
+        }
+    }
+    // (memory new since the last look: that one's ranges are made again by the next submit's, and
+    // it does not stand for this round)
+    if all {
+        LOOK_BEGAN.fetch_max(began, Ordering::AcqRel);
+    }
+    n
+}
+
+fn start_look_ahead() {
+    let Some(pause) = look_ahead() else { return };
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        crate::xlog_info!("D3D12.X: XCL_LOOK_AHEAD: a thread takes the written pages every {} ms between the submits", pause.as_millis());
+        let _ = std::thread::Builder::new().name("xcl-look-ahead".into()).spawn(move || {
+            let mut buf: Vec<*mut c_void> = vec![std::ptr::null_mut(); 16384];
+            let (mut rounds, mut pages, mut us, mut longest) = (0u64, 0u64, 0u64, 0u64);
+            loop {
+                std::thread::sleep(pause);
+                if now_us().saturating_sub(LAST_SUBMIT.load(Ordering::Relaxed)) > 200_000 {
+                    continue;
+                }
+                let t = std::time::Instant::now();
+                let n = unsafe { take_round(&mut buf) };
+                let took = t.elapsed().as_micros() as u64;
+                (rounds, pages, us, longest) = (rounds + 1, pages + n as u64, us + took, longest.max(took));
+                if rounds % 4096 == 0 {
+                    crate::xlog_info!(
+                        "D3D12.X: {rounds} rounds ahead of the submits so far; the last 4096: {} pages and {:.2} ms each on average, the longest {:.1} ms",
+                        pages / 4096,
+                        us as f64 / 4096e3,
+                        longest as f64 / 1e3
+                    );
+                    (pages, us, longest) = (0, 0, 0);
+                }
+            }
+        });
+    });
+}
+
 /// The written pages of the hot blocks inside `ranges` (see `hot_looks`).
 unsafe fn take_hot(ranges: &Arc<Vec<(usize, usize)>>, buf: &mut [*mut c_void], dirty: &mut Vec<usize>, page: &mut u32) {
     start_walk(ranges);
     let now = std::time::Instant::now();
-    let (runs, hot_now): (Vec<(usize, usize)>, usize) = {
-        let mut g = HOT.lock().unwrap();
-        let h = g.get_or_insert_with(HotBlocks::default);
-        // a block new to the ranges starts hot: memory just mapped is often written and used at once
-        if !h.ranges.as_ref().is_some_and(|r| Arc::ptr_eq(r, ranges)) {
-            let mut known = std::collections::HashSet::with_capacity(h.known.len());
-            for &(base, size) in ranges.iter() {
-                let mut b = base & !(HOT_BLOCK - 1);
-                while b < base + size {
-                    if !h.known.contains(&b) {
-                        h.hot.insert(b, now);
-                    }
-                    known.insert(b);
-                    b += HOT_BLOCK;
-                }
-            }
-            h.known = known;
-            h.ranges = Some(Arc::clone(ranges));
-        }
-        let keep = hot_for();
-        h.hot.retain(|_, t| now.duration_since(*t) < keep);
-        // the hot blocks as runs, each inside one range (a write-watch call covers one allocation)
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for (&b, _) in h.hot.iter() {
-            let mut j = ranges.partition_point(|&(base, size)| base + size <= b);
-            while let Some(&(base, size)) = ranges.get(j) {
-                if base >= b + HOT_BLOCK {
-                    break;
-                }
-                let (lo, hi) = (b.max(base), (b + HOT_BLOCK).min(base + size));
-                if lo < hi {
-                    match runs.last_mut() {
-                        // one call for hot blocks up to HOT_GAP apart in the same range: a call costs
-                        // about as much as walking 6 MiB of committed pages
-                        Some(last) if last.0 >= base && lo - (last.0 + last.1) <= hot_gap() => last.1 = hi - last.0,
-                        _ => runs.push((lo, hi - lo)),
-                    }
-                }
-                j += 1;
-            }
-        }
-        (runs, h.hot.len())
-    };
+    let (runs, hot_now) = hot_runs(ranges, now);
     let first = dirty.len();
     LOOKING.store(true, Ordering::Release);
     for &(base, size) in &runs {
         take_written(base, size, buf, dirty, page);
     }
     LOOKING.store(false, Ordering::Release);
-    if dirty.len() > first {
-        let mut g = HOT.lock().unwrap();
-        if let Some(h) = g.as_mut() {
-            let mut last = usize::MAX;
-            for &p in &dirty[first..] {
-                let b = p & !(HOT_BLOCK - 1);
-                if b != last {
-                    h.hot.insert(b, now);
-                    last = b;
-                }
-            }
-        }
-    }
+    keep_hot(&dirty[first..], now);
     let n = HOT_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
     let r = HOT_STATS[1].fetch_add(runs.len() as u64, Ordering::Relaxed) + runs.len() as u64;
     let covered: usize = runs.iter().map(|r| r.1).sum();
@@ -1254,26 +1376,38 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
     super::submit_cost::recheck(t_recheck.elapsed());
     let mut page = 0x1000u32;
     let t_ranges = std::time::Instant::now();
+    LAST_SUBMIT.store(now_us(), Ordering::Relaxed);
+    // (before the ranges are asked for: memory that is new after that is not in this look)
+    let began = now_us();
     let ranges = cached_watch_ranges(u);
     super::submit_cost::ranges(t_ranges.elapsed());
     let watch_t0 = std::time::Instant::now();
+    let mut ahead = 0usize;
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
+        // (with a look of its own: what the thread's piece in progress finds is there first)
+        let _one = look.then(|| ONE_LOOK.lock().unwrap_or_else(|e| e.into_inner()));
         // (a submit without a look of its own takes these too: they are dirty by XCL's account)
         take_known(&mut dirty);
+        {
+            let mut found = AHEAD.lock().unwrap();
+            ahead = found.len();
+            dirty.append(&mut found);
+        }
         if !look {
             dirty.sort_unstable();
             dirty.dedup();
             return dirty.len();
         }
-        LOOK_BEGAN.store(now_us(), Ordering::Release);
+        LOOK_BEGAN.fetch_max(began, Ordering::AcqRel);
         WATCH_BUF.with(|wcell| {
             let mut buf = wcell.borrow_mut();
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
             if hot_looks() {
+                start_look_ahead();
                 take_hot(&ranges, &mut buf, &mut dirty, &mut page);
             } else {
                 for &(base, size) in ranges.iter() {
@@ -1288,6 +1422,7 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
     if look {
         super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
         note_dirty_regions(u);
+        DIRTY_BUF.with(|d| super::look_stats::look(&d.borrow(), ahead, watch_t0.elapsed(), CLOSED_AGO.with(|c| c.take())));
     }
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
@@ -2438,6 +2573,40 @@ pub(super) mod tests {
             *(plain as *mut u8) = 1;
             assert!(written_pages(plain, 0x1000).is_empty(), "memory that is not watched");
             VirtualFree(plain as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Pages found ahead of a submit are kept until one takes them, are not reported again, and a
+    /// page written after that is found again.
+    #[test]
+    fn pages_found_ahead_are_kept_for_the_next_submit() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 256;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N << 12, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 64];
+            let ahead = Mutex::new(Vec::new());
+            let write = |k: usize| ((base + (k << 12)) as *mut u8).write_volatile(1);
+            for k in (0..N).step_by(2) {
+                write(k);
+            }
+            assert_eq!(take_piece(base, N << 12, &mut buf, &ahead), N / 2, "past a full buffer too");
+            assert_eq!(*ahead.lock().unwrap(), (0..N).step_by(2).map(|k| base + (k << 12)).collect::<Vec<_>>());
+            let (mut dirty, mut page) = (Vec::new(), 0u32);
+            take_written(base, N << 12, &mut buf, &mut dirty, &mut page);
+            assert!(dirty.is_empty(), "a look does not find them again");
+            write(8);
+            write(9);
+            assert_eq!(take_piece(base, N << 12, &mut buf, &ahead), 2);
+            assert_eq!(ahead.lock().unwrap()[N / 2..], [base + 0x8000, base + 0x9000], "written again: found again, behind the others");
+            // (only of its own piece)
+            write(0);
+            write(200);
+            assert_eq!(take_piece(base + (100 << 12), 100 << 12, &mut buf, &ahead), 0);
+            assert_eq!(take_piece(base + (100 << 12), 101 << 12, &mut buf, &ahead), 1);
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
     }
 

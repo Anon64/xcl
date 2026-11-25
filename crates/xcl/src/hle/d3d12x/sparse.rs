@@ -16,10 +16,10 @@
 //! Buffers the title places there get reserved resources over the same tiles, so PC-side
 //! copies, views and barriers see the same memory.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use windows::core::Interface;
@@ -37,6 +37,8 @@ const POOL_TILES: u32 = 1024;
 /// tiles decommitted while no title work was submitted that stay mapped (`State::parked`) before
 /// they are unmapped together: 256 MB of video memory
 const PARKED_MAX: usize = 4096;
+/// tiles waiting for their mapping call (`State::pending`) before they are sent at once: 256 MB
+const PENDING_MAX: usize = 4096;
 /// bytes of the ring-buffered upload staging buffer
 const STAGING: usize = 64 << 20;
 /// alignment of sub-allocations inside the upload staging ring (write-combined cacheline)
@@ -143,7 +145,7 @@ fn decommit_tiles(
     mapped: &mut FxHashMap<usize, TileEntry>,
     pinned: &FxHashMap<(u32, u32), u32>,
     free: &mut Vec<(u32, u32)>,
-    to_zero: &mut Vec<(usize, usize)>,
+    to_zero: &mut BTreeSet<(usize, usize)>,
     a: usize,
     n: usize,
 ) -> Vec<usize> {
@@ -174,7 +176,7 @@ fn decommit_tiles(
             } else if newly_holed != 0 {
                 for idx in 0..PAGES_PER_TILE {
                     if newly_holed & (1u16 << idx) != 0 {
-                        to_zero.push((t + idx * PAGE, PAGE));
+                        to_zero.insert((t + idx * PAGE, PAGE));
                     }
                 }
             }
@@ -191,10 +193,26 @@ fn decommit_tiles(
             }
         }
     }
-    if !unmapped.is_empty() {
-        to_zero.retain(|&(za, _)| mapped.contains_key(&(za & !(TILE - 1))));
+    // (their pieces only: going over all of them for each page decommitted while a title loads,
+    // with no submit to clear them, grew with the square of the pages)
+    for &t in &unmapped {
+        while let Some(&piece) = to_zero.range((t, 0)..(t + TILE, 0)).next() {
+            to_zero.remove(&piece);
+        }
     }
     unmapped
+}
+
+/// The pieces to clear (`State::to_zero`) as runs: neighbours and pieces inside another together.
+fn zero_runs(pieces: BTreeSet<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for (a, n) in pieces {
+        match out.last_mut() {
+            Some(l) if a <= l.0 + l.1 => l.1 = l.1.max(a + n - l.0),
+            _ => out.push((a, n)),
+        }
+    }
+    out
 }
 
 struct UploadSlot {
@@ -305,10 +323,16 @@ struct State {
     /// the window (what shaders write) and the buffer (what an ExecuteIndirect or a copy of the
     /// title reads); with a new tile in the window the buffer kept the old one, with old bytes
     kept: FxHashMap<usize, (u32, u32)>,
+    /// tile addresses given a pool tile in `mapped` whose `UpdateTileMappings` has not been sent
+    /// yet: mapped together (`flush_pending`, one call per window) before the next title submit,
+    /// before XCL's own GPU work on the windows, or past `PENDING_MAX`. (A retail title starting
+    /// on a Series S profile maps 4.3 GB of physical pages in small pieces: one mapping call
+    /// each, ~0.4 ms, held its loading thread ~25 s and its stall watchdog ended it.)
+    pending: Vec<usize>,
     /// placed buffers → the tiles they use (address, pool tile)
     buffers: FxHashMap<usize, Vec<(usize, (u32, u32))>>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
-    to_zero: Vec<(usize, usize)>,
+    to_zero: BTreeSet<(usize, usize)>,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
     staging: Option<(ID3D12Resource, *mut u8)>,
     /// monotonic ring-buffer write/submitted/retired byte cursors
@@ -329,8 +353,9 @@ struct State {
     rb_last_fence: u64,
     /// the fence value each title queue last waited for
     waited: FxHashMap<usize, u64>,
-    /// `mapped` as sorted (start, end) runs (None: to be made again)
-    runs: Option<Vec<(usize, usize)>>,
+    /// `mapped` as runs of neighbouring tiles (start -> end), kept with it: sorted out of all of
+    /// them again (a retail title has 150,000) for each look behind a commit
+    runs: BTreeMap<usize, usize>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
 }
@@ -521,7 +546,8 @@ fn page_span(a: usize, n: usize) -> (usize, usize) {
     (a & !(PAGE - 1), a.saturating_add(n).saturating_add(PAGE - 1) & !(PAGE - 1))
 }
 
-/// Add the pages `[a, b)` to `early`, merged with the ranges they overlap or touch.
+/// Add the pages `[a, b)` to `early` (ranges as start -> end), merged with the ranges they overlap
+/// or touch.
 fn early_add(early: &mut BTreeMap<usize, usize>, mut a: usize, mut b: usize) {
     if a >= b {
         return;
@@ -635,8 +661,9 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         pinned: FxHashMap::default(),
         parked: FxHashMap::default(),
         kept: FxHashMap::default(),
+        pending: Vec::new(),
         buffers: FxHashMap::default(),
-        to_zero: Vec::new(),
+        to_zero: BTreeSet::new(),
         staging: None,
         ring_write: 0,
         ring_submitted: 0,
@@ -650,7 +677,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         rb_list,
         rb_last_fence: 0,
         waited: FxHashMap::default(),
-        runs: None,
+        runs: BTreeMap::new(),
         scratch_runs: Vec::new(),
     })
 }
@@ -682,7 +709,7 @@ pub unsafe fn shadow_window(dev: &ID3D12Device, base: usize, size: usize, buf: &
     for (i, t) in (base..base + size).step_by(TILE).enumerate() {
         s.mapped.insert(t, TileEntry::with_holes((SHADOW_POOL, i as u32), 0));
     }
-    s.runs = None;
+    early_add(&mut s.runs, base, base + size.next_multiple_of(TILE));
     MAPPED_GEN.fetch_add(1, Ordering::Release);
     true
 }
@@ -909,7 +936,7 @@ impl State {
         }
         let first = a & !(TILE - 1);
         let end = a.saturating_add(n);
-        let mut new: Vec<(usize, (u32, u32))> = Vec::new();
+        let mut new = false;
         let mut unparked = false;
         let mut t = first;
         while t < end {
@@ -917,17 +944,18 @@ impl State {
                 // still mapped there: no new mapping, what it held is cleared
                 if let Some(tile) = self.parked.remove(&t).or_else(|| self.kept.remove(&t)) {
                     self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
-                    self.runs = None;
-                    self.to_zero.push((t, TILE));
+                    early_add(&mut self.runs, t, t + TILE);
+                    self.to_zero.insert((t, TILE));
                     unparked = true;
                 } else {
                     let Some((tile, reused)) = self.take_tile() else { break };
                     self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
-                    self.runs = None;
+                    early_add(&mut self.runs, t, t + TILE);
                     if reused {
-                        self.to_zero.push((t, TILE));
+                        self.to_zero.insert((t, TILE));
                     }
-                    new.push((t, tile));
+                    self.pending.push(t);
+                    new = true;
                 }
             }
             match t.checked_add(TILE) {
@@ -935,19 +963,38 @@ impl State {
                 None => break,
             }
         }
-        if new.is_empty() {
-            if unparked {
-                MAPPED_GEN.fetch_add(1, Ordering::Release);
-            }
+        if new || unparked {
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
+        }
+        if self.pending.len() >= PENDING_MAX {
+            self.flush_pending();
+        } else if !self.pending.is_empty() {
+            pending_soon();
+        }
+    }
+
+    /// The pending tiles (`pending`) mapped onto their pool tiles, one call per window, then the
+    /// fence signalled (title queues wait for it in `before_execute`). An address decommitted
+    /// since has no `mapped` entry and is skipped; one committed again maps its current tile. One
+    /// decommitted and parked (or kept for a placed buffer) stays pending: its mapping was never
+    /// sent, and a commit that takes it back from there sends none.
+    unsafe fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
             return;
         }
-        MAPPED_GEN.fetch_add(1, Ordering::Release);
-        // per window
+        let mut addrs = std::mem::take(&mut self.pending);
+        addrs.sort_unstable();
+        addrs.dedup();
         let mut by_window: FxHashMap<usize, Vec<(usize, (u32, u32))>> = FxHashMap::default();
-        for x in new {
-            if let Some(wi) = self.window_index(x.0) {
-                by_window.entry(wi).or_default().push(x);
+        for t in addrs {
+            if let (Some(e), Some(wi)) = (self.mapped.get(&t), self.window_index(t)) {
+                by_window.entry(wi).or_default().push((t, e.pool));
+            } else if self.parked.contains_key(&t) || self.kept.contains_key(&t) {
+                self.pending.push(t);
             }
+        }
+        if by_window.is_empty() {
+            return;
         }
         for (wi, tiles) in by_window {
             let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
@@ -1021,6 +1068,8 @@ impl State {
     /// Close and submit upload slot `idx` asynchronously (NO CPU wait — callers order GPU work
     /// via `queue.Wait(&self.fence, self.value)`).
     unsafe fn submit_slot(&mut self, idx: usize) {
+        // the copies on `queue` see every tile mapped (`pending` goes first on the same queue)
+        self.flush_pending();
         let closed = self.slots[idx].list.Close().is_ok();
         if closed {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
@@ -1393,6 +1442,7 @@ impl State {
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
+        self.flush_pending();
         // copies back of earlier submissions first: their data is older than this one's
         self.drain_readbacks(Drain::TitleDone);
         let Some((rb, p)) = self.readback_buf() else { return };
@@ -1730,7 +1780,7 @@ pub(super) unsafe fn pc_execute(queue: &ID3D12CommandQueue, list: &ID3D12Graphic
 
 /// copies back submitted and not landed yet, and whether any ran on the readback queue
 static RB_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static RB_ASYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RB_ASYNC: AtomicBool = AtomicBool::new(false);
 
 /// Whether copies back land asynchronously (any ran on the readback queue so far)
 pub fn readbacks_async() -> bool {
@@ -1873,7 +1923,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if s.window_index(va).is_none() {
         return;
     }
-    let zeroed = std::mem::take(&mut s.to_zero);
+    let zeroed = zero_runs(std::mem::take(&mut s.to_zero));
     if !zeroed.is_empty() {
         for &(a, n) in &zeroed {
             s.clear_sent_range(a, n);
@@ -1938,6 +1988,60 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     s.decommit_range(a, n);
 }
 
+/// Tiles wait for their mapping call (`State::pending`; read without the lock).
+static PENDING: AtomicBool = AtomicBool::new(false);
+static PENDING_WAKE: (Mutex<()>, std::sync::Condvar) = (Mutex::new(()), std::sync::Condvar::new());
+
+/// A tile's mapping was put off: sent by the thread started here in 2 ms, unless something sends
+/// it before. Work already on the GPU can reach the memory without another submit (it waits for a
+/// value the CPU writes).
+fn pending_soon() {
+    if PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-tile-maps".into()).spawn(|| loop {
+            {
+                let mut g = PENDING_WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
+                while !PENDING.load(Ordering::Acquire) {
+                    g = PENDING_WAKE.1.wait(g).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            if PENDING.load(Ordering::Acquire) {
+                send_pending();
+            }
+        });
+    });
+    drop(PENDING_WAKE.0.lock().unwrap_or_else(|e| e.into_inner()));
+    PENDING_WAKE.1.notify_one();
+}
+
+/// The mappings put off go to the GPU now: the CPU is about to signal a fence, and work submitted
+/// before the title committed the memory may run because of it.
+pub fn send_pending() {
+    if !PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    // (a signal under the state's lock must not wait for it; the thread sends them then)
+    let t0 = std::time::Instant::now();
+    loop {
+        match STATE.try_lock() {
+            Ok(mut g) => {
+                PENDING.store(false, Ordering::Release);
+                if let Some(s) = g.as_mut() {
+                    unsafe { s.flush_pending() };
+                }
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return PENDING.store(false, Ordering::Release),
+            Err(std::sync::TryLockError::WouldBlock) if t0.elapsed().as_millis() >= 2 => return,
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+        }
+    }
+}
+
 impl State {
     /// `committed` with the state locked
     unsafe fn commit_range(&mut self, a: usize, n: usize) {
@@ -1980,8 +2084,8 @@ impl State {
         if tiles.is_empty() {
             return;
         }
-        self.runs = None;
         for &t in &tiles {
+            early_remove(&mut self.runs, t, t + TILE);
             if let Ok(i) = pools.binary_search_by_key(&t, |p| p.0) {
                 self.parked.insert(t, pools[i].1);
             }
@@ -2042,21 +2146,9 @@ impl State {
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
-    let mut g = lock_state();
-    let Some(s) = g.as_mut() else { return Vec::new() };
-    if s.runs.is_none() {
-        let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
-        tiles.sort_unstable();
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for t in tiles {
-            match runs.last_mut() {
-                Some(last) if last.1 == t => last.1 = t + TILE,
-                _ => runs.push((t, t + TILE)),
-            }
-        }
-        s.runs = Some(runs);
-    }
-    s.runs.clone().unwrap_or_default()
+    let g = lock_state();
+    let Some(s) = g.as_ref() else { return Vec::new() };
+    s.runs.iter().map(|(&a, &b)| (a, b)).collect()
 }
 
 /// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
@@ -2167,13 +2259,16 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.drain_readbacks(Drain::Finished);
+    // the title's work sees what was committed mapped …
+    PENDING.store(false, Ordering::Release);
+    s.flush_pending();
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
         s.retire_free_pools();
     }
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
-    let zero_runs = std::mem::take(&mut s.to_zero);
+    let zero_runs = zero_runs(std::mem::take(&mut s.to_zero));
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
     }
@@ -2209,6 +2304,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     scan_pages(&pages, &mut dirty_runs);
     let t_scanned = std::time::Instant::now();
+    super::look_stats::scan(pages.len(), &dirty_runs);
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
@@ -2344,6 +2440,20 @@ fn forget_in(s: &mut State, res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The runs of the tiles mapped, made from all of them.
+    fn runs_of(s: &State) -> BTreeMap<usize, usize> {
+        let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
+        tiles.sort_unstable();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for t in tiles {
+            match runs.last_mut() {
+                Some(last) if last.1 == t => last.1 = t + TILE,
+                _ => runs.push((t, t + TILE)),
+            }
+        }
+        runs.into_iter().collect()
+    }
 
     /// A device of the test's own (a software one without a GPU).
     unsafe fn test_device() -> ID3D12Device {
@@ -2505,8 +2615,9 @@ mod tests {
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
+                pending: Vec::new(),
                 buffers: FxHashMap::default(),
-                to_zero: Vec::new(),
+                to_zero: BTreeSet::new(),
                 staging: None,
                 ring_write: 0,
                 ring_submitted: 0,
@@ -2520,11 +2631,13 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
-                runs: None,
+                runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
             };
             s.commit_range(base, TILE);
             assert!(s.mapped.contains_key(&base));
+            // (as before the title's submit)
+            s.flush_pending();
             std::ptr::write_bytes(base as *mut u8, 0, 256);
 
             // the title's queue: blocked on a fence nothing has signalled yet, then a copy of
@@ -2593,6 +2706,39 @@ mod tests {
         drop(held);
         asked.join().unwrap();
         assert!(answered, "queue() waited for the sparse state's lock");
+    }
+
+    /// A mapping put off does not wait for the title's next submit: a CPU signal sends it, and
+    /// without one it goes a few milliseconds after the commit (work the title submitted before
+    /// may reach the memory once a value the CPU writes lets it run).
+    #[test]
+    fn a_mapping_put_off_is_sent_without_a_submit() {
+        if super::super::backend() != super::super::Backend::Real {
+            return;
+        }
+        unsafe {
+            let _ = super::super::real::device_raw();
+            let Some((at, len)) = alloc(64 * TILE, TILE) else { return };
+            let put_off = || STATE.lock().unwrap().as_ref().is_some_and(|s| s.pending.iter().any(|t| (at..at + len).contains(t)));
+            let mapped = || STATE.lock().unwrap().as_ref().is_some_and(|s| (at..at + len).step_by(TILE).all(|t| s.mapped.contains_key(&t)));
+            send_pending();
+            assert!(mapped() && !put_off(), "a CPU signal sends what is put off");
+            decommitted(at, len);
+            VirtualFree(at as *mut c_void, len, MEM_DECOMMIT);
+            // (as a submit does: the tiles unmapped, so the next commit needs mappings again)
+            if let Some(s) = STATE.lock().unwrap().as_mut() {
+                s.flush_parked();
+            }
+            assert!(!VirtualAlloc(at as *const c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null());
+            committed(at, len);
+            let t0 = std::time::Instant::now();
+            while put_off() {
+                assert!(t0.elapsed().as_secs() < 5, "nothing sent the mappings");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(mapped());
+            assert!(free(at));
+        }
     }
 
     /// A block freed on one thread while another allocates: its address goes back to the
@@ -2698,10 +2844,11 @@ mod tests {
                 retired: Vec::new(),
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
+                pending: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 buffers: FxHashMap::default(),
-                to_zero: Vec::new(),
+                to_zero: BTreeSet::new(),
                 staging: None,
                 ring_write: 0,
                 ring_submitted: 0,
@@ -2715,7 +2862,7 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
-                runs: None,
+                runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
             };
 
@@ -2914,8 +3061,9 @@ mod tests {
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
+                pending: Vec::new(),
                 buffers: FxHashMap::default(),
-                to_zero: Vec::new(),
+                to_zero: BTreeSet::new(),
                 staging: None,
                 ring_write: 0,
                 ring_submitted: 0,
@@ -2929,7 +3077,7 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
-                runs: None,
+                runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
             };
 
@@ -3017,8 +3165,9 @@ mod tests {
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
+                pending: Vec::new(),
                 buffers: FxHashMap::default(),
-                to_zero: Vec::new(),
+                to_zero: BTreeSet::new(),
                 staging: None,
                 ring_write: 0,
                 ring_submitted: 0,
@@ -3032,12 +3181,16 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
-                runs: None,
+                runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
             };
 
             s.commit_range(base, TILE);
             let tile = s.mapped[&base].pool;
+            assert_eq!(s.pending, vec![base], "a new tile's mapping waits for the next flush");
+            assert_eq!(s.value, 0, "nothing sent yet");
+            s.flush_pending();
+            assert!(s.pending.is_empty());
             let v = s.value;
             assert!(v > 0, "a new tile is mapped");
 
@@ -3050,14 +3203,16 @@ mod tests {
             s.release_if_unused(base, tile);
             assert!(!s.free.contains(&tile), "a parked tile is not free");
 
+            assert!(s.runs.is_empty() && runs_of(&s).is_empty());
             // committed again: the same tile, cleared, no new mapping
             s.to_zero.clear();
             let gen = mapped_gen();
             s.commit_range(base, TILE);
+            assert_eq!(s.runs, BTreeMap::from([(base, base + TILE)]));
             assert_eq!(s.mapped[&base].pool, tile);
             assert_eq!(s.mapped[&base].holes, 0);
             assert!(s.parked.is_empty());
-            assert_eq!(s.to_zero, vec![(base, TILE)]);
+            assert_eq!(s.to_zero, BTreeSet::from([(base, TILE)]));
             assert_eq!(s.value, v, "no tile mapping changed");
             assert!(mapped_gen() > gen, "readers of `mapped` see it changed");
 
@@ -3084,15 +3239,27 @@ mod tests {
             // the buffer is gone and it was decommitted
             *s.pinned.entry(tile).or_default() += 1;
             let at = base + TILE;
+            assert!(s.pending.contains(&at), "its mapping is not sent yet");
             s.decommit_range(at, TILE);
             assert!(!s.flush_parked(), "nothing to unmap");
             assert_eq!(s.kept.get(&at), Some(&tile));
             assert!(!s.free.contains(&tile));
+            // kept before its mapping was sent: that stays pending, and the commit that takes the
+            // tile back sends it
+            let v = s.value;
+            s.flush_pending();
+            assert_eq!((s.value, &s.pending), (v, &vec![at]), "no mapping of a kept tile");
+            s.commit_range(at, TILE);
+            s.flush_pending();
+            assert!(s.value > v && s.pending.is_empty(), "mapped with the commit");
+            s.decommit_range(at, TILE);
+            assert!(!s.flush_parked(), "nothing to unmap");
+            assert_eq!(s.kept.get(&at), Some(&tile));
             let v = s.value;
             s.to_zero.clear();
             s.commit_range(at, TILE);
             assert_eq!(s.mapped[&at].pool, tile, "the buffer's tile");
-            assert_eq!(s.to_zero, vec![(at, TILE)]);
+            assert_eq!(s.to_zero, BTreeSet::from([(at, TILE)]));
             assert_eq!(s.value, v, "no tile mapping changed");
             s.decommit_range(at, TILE);
             assert!(!s.flush_parked());
@@ -3101,6 +3268,32 @@ mod tests {
             assert!(s.kept.is_empty() && !s.free.contains(&tile));
             assert!(s.flush_parked());
             assert!(s.free.contains(&tile));
+
+            assert_eq!(s.runs, runs_of(&s));
+            // committed and decommitted again before a flush: no mapping is sent for it
+            s.flush_pending();
+            s.flush_parked();
+            let v = s.value;
+            s.commit_range(base, TILE);
+            assert_eq!(s.pending, vec![base]);
+            s.decommit_range(base, TILE);
+            s.flush_pending(); // as for an upload or readback before the title's next submit
+            assert_eq!(s.value, v, "a tile gone before the flush is not mapped");
+            assert_eq!(s.pending, vec![base], "parked, its mapping never sent: still pending");
+            // taken back from `parked`: the flush now sends its mapping
+            s.commit_range(base, TILE);
+            s.flush_pending();
+            assert!(s.pending.is_empty());
+            assert!(s.value > v, "a tile parked before its mapping was sent is mapped");
+
+            // neighbours are one run, a tile taken out of it leaves the other
+            s.commit_range(base, 2 * TILE);
+            assert_eq!(s.runs, BTreeMap::from([(base, base + 2 * TILE)]));
+            s.decommit_range(base, TILE);
+            assert_eq!(s.runs, BTreeMap::from([(base + TILE, base + 2 * TILE)]));
+            s.decommit_range(base + TILE, PAGE);
+            assert_eq!(s.runs, runs_of(&s), "a tile with pages left stays");
+            s.flush_pending();
 
             s.wait_for(s.value);
             drop(s);
@@ -3116,7 +3309,7 @@ mod tests {
         let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
         let mut pinned: FxHashMap<(u32, u32), u32> = FxHashMap::default();
         let mut free: Vec<(u32, u32)> = Vec::new();
-        let mut to_zero: Vec<(usize, usize)> = Vec::new();
+        let mut to_zero: BTreeSet<(usize, usize)> = BTreeSet::new();
 
         // 1. Two 32 KiB decommits across a full 64 KiB tile.
         let t0 = 0x10_0000usize;
@@ -3165,11 +3358,16 @@ mod tests {
         mapped.insert(t3, TileEntry::with_holes((0, 13), 0xFFFF & !(1u16 << 2)));
         mapped.insert(t4, TileEntry::with_holes((0, 14), 0));
         assert!(decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t4, PAGE).is_empty());
-        assert_eq!(to_zero, vec![(t4, PAGE)]);
+        assert_eq!(to_zero, BTreeSet::from([(t4, PAGE)]));
         let u = decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t3 + 2 * PAGE, PAGE);
         assert_eq!(u, vec![t3]);
         assert_eq!(free, vec![(0, 13)]);
-        assert_eq!(to_zero, vec![(t4, PAGE)], "unrelated mapped tile's to_zero must remain");
+        assert_eq!(to_zero, BTreeSet::from([(t4, PAGE)]), "unrelated mapped tile's to_zero must remain");
+
+        // 5. The pieces as runs: neighbours together, pieces inside a whole tile with it.
+        let t5 = 0x60_0000usize;
+        to_zero.extend([(t5, TILE), (t5 + 3 * PAGE, PAGE), (t5 + TILE, TILE), (t5 + 2 * TILE + PAGE, PAGE)]);
+        assert_eq!(zero_runs(to_zero), vec![(t4, PAGE), (t5, 2 * TILE), (t5 + 2 * TILE + PAGE, PAGE)]);
     }
 
     /// The pages in `early`, checking that its ranges are page-aligned, not empty, disjoint and
