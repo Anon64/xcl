@@ -548,6 +548,11 @@ fn graphics_wave32(device: *mut c_void) -> bool {
 /// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
 pub fn init() -> Result<String, String> {
+    // one at a time: two threads that both found no device made one each and opened the memory
+    // windows for it, and GPU work on the one device with window addresses of the other hung the
+    // GPU (unit tests; a title comes in through `backend`, which asks once)
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     if !device_raw().is_null() {
         return Ok(ADAPTER.lock().map(|a| a.clone()).unwrap_or_default());
     }
