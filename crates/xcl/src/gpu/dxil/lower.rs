@@ -61,6 +61,10 @@ pub struct MeshCtx {
     pub rec: Value,
     pub vtx: Value,
     pub prm: Value,
+    /// this thread has a vertex slot / a primitive slot in the record (its index is below the
+    /// record's `max_vertices` / `max_primitives`): a thread past either exports nothing
+    pub vok: Value,
+    pub pok: Value,
     pub outputs: Vec<crate::gpu::dxbc::SigElement>,
 }
 

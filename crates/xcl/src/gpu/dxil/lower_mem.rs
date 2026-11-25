@@ -2428,9 +2428,9 @@ impl Lw {
             }
         };
         let enabled = |c: usize| if compr { en >> (c / 2 * 2) & 3 != 0 } else { en >> c & 1 == 1 };
-        let (vtx, prm) = {
+        let (vtx, prm, vok, pok) = {
             let m = self.mesh.as_ref().expect("mesh");
-            (m.vtx, m.prm)
+            (m.vtx, m.prm, m.vok, m.pok)
         };
         // (dword index in res, value)
         let mut st: Vec<(Value, Value)> = Vec::new();
@@ -2467,6 +2467,8 @@ impl Lw {
         }
         let res = self.res.expect("res");
         let act = self.act();
+        // (only into this thread's own slot of the record: `MeshCtx::vok` / `pok`)
+        let act = self.land(act, if tgt == 20 { pok } else { vok });
         self.guarded(act, &mut |lw| {
             for &(at, v) in &st {
                 let off = lw.shlc(at, 2);

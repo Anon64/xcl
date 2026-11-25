@@ -2329,7 +2329,7 @@ impl Em {
             (Mode::Mesh(_), 12) => {
                 for c in 0..4 {
                     if enabled(c) {
-                        st.push(format!("res.Store((xcl_vtx + {c}u) * 4u, {});", Self::exp_comp(srcs, compr, c)));
+                        st.push(format!("if (xcl_vok) res.Store((xcl_vtx + {c}u) * 4u, {});", Self::exp_comp(srcs, compr, c)));
                     }
                 }
             }
@@ -2346,12 +2346,12 @@ impl Em {
                 for j in at {
                     for c in 0..4 {
                         if enabled(c) {
-                            st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {});", 4 * (j + 1) + c, Self::exp_comp(srcs, compr, c)));
+                            st.push(format!("if (xcl_vok) res.Store((xcl_vtx + {}u) * 4u, {});", 4 * (j + 1) + c, Self::exp_comp(srcs, compr, c)));
                         }
                     }
                 }
             }
-            (Mode::Mesh(_), 20) => st.push(format!("res.Store(xcl_prm * 4u, {});", srcs[0])),
+            (Mode::Mesh(_), 20) => st.push(format!("if (xcl_pok) res.Store(xcl_prm * 4u, {});", srcs[0])),
             (Mode::Mesh(_), 9) => {}
             _ => return Err("export target"),
         }
@@ -4903,6 +4903,14 @@ impl Em {
                 let _ = writeln!(h, "    uint xcl_rec = gid.x * {}u;", ms.record_dwords());
                 let _ = writeln!(h, "    uint xcl_vtx = xcl_rec + {MESH_HEADER}u + xcl_slot * {}u;", ms.vert_dwords());
                 let _ = writeln!(h, "    uint xcl_prm = xcl_rec + {}u + xcl_slot;", MESH_HEADER + ms.max_vertices as usize * ms.vert_dwords());
+                // A record has room for `max_vertices` vertices and `max_primitives` primitives; a
+                // thread past either exports nothing (the console's hardware drops an export past
+                // what the program asked room for). `res` is a root UAV: nothing bounds a store
+                // there, and one past the last record of the buffer is a store to an unmapped
+                // address (a retail title's first frames with mesh programs lost the device to a
+                // shader's access to unmapped memory on five shader units at once).
+                let _ = writeln!(h, "    bool xcl_vok = xcl_slot < {}u;", ms.max_vertices);
+                let _ = writeln!(h, "    bool xcl_pok = xcl_slot < {}u;", ms.max_primitives);
                 load_sgprs(&mut h);
                 if sg.contains(&3) {
                     h.push_str("    s3 = (s3 & 0xF0FFFFFFu) | (xcl_wave << 24);\n");

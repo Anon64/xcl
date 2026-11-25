@@ -662,6 +662,13 @@ pub fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::R
     let vtx = lw.add(vtx, sv);
     let prm = lw.addc(rec, (MESH_HEADER + ms.max_vertices as usize * ms.vert_dwords()) as u32);
     let prm = lw.add(prm, slot);
+    // A record has room for `max_vertices` vertices and `max_primitives` primitives; a thread
+    // past either exports nothing (the console's hardware drops an export past what the program
+    // asked room for). `res` is a root UAV: nothing bounds a store there, and one past the last
+    // record of the buffer is a store to an unmapped address (a retail title's first frames
+    // with mesh programs lost the device to a shader's access to unmapped memory).
+    let vok = lw.cmpc(Pred::ULt, slot, ms.max_vertices);
+    let pok = lw.cmpc(Pred::ULt, slot, ms.max_primitives);
     let zero = lw.c(0);
     let mut sgpr = HashMap::new();
     let o3 = lw.c(12);
@@ -680,7 +687,7 @@ pub fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::R
     let mut vgpr = HashMap::new();
     vgpr.insert(5, v5);
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
-    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, outputs: ms.outputs.clone() });
+    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, vok, pok, outputs: ms.outputs.clone() });
 }
 
 /// EXEC at entry: the console wave's threads (static per wave in the split form: no

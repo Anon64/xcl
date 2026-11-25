@@ -3423,6 +3423,77 @@ fn gpu_mesh_mode_two_passes() {
     assert!(px16 == px, "split pass-through draws the same pixels");
 }
 
+/// A mesh program's thread past its record's vertices or primitives exports nothing. A record
+/// has `max_vertices` vertex slots and `max_primitives` primitive slots, a group can have more
+/// threads, and the console's hardware drops what goes past the room the program asked for.
+/// In compute a store past the record lands in the next record, and past the last record of
+/// the buffer it is a store to an unmapped address (the record buffer is a root UAV: nothing
+/// bounds it). Here every one of 128 threads exports a position and a primitive with room for
+/// 64 and 32: the record's own slots are written and nothing lands behind it (the buffer has
+/// room for a second record, so the test faults no device without the bound either).
+#[test]
+fn gpu_mesh_mode_exports_stay_inside_the_record() {
+    use super::{dxc, mesh_passthrough, MsInterface, MESH_HEADER};
+    const MARK: u32 = 1 << 10 | 2 << 20;
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 128, max_vertices: 64, max_primitives: 32 };
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)), // 1 primitive, 3 vertices
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 10), ("SRC0", 242)], None), // 1.0
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(MARK)),
+    ];
+    // (every thread of both waves exports: nothing masks EXEC)
+    list.push(exp(12, 0xF, [10, 10, 10, 10], 1));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    // the HLSL form says it in text (no GPU needed)
+    let hlsl = translate(&code, &Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() }).unwrap();
+    assert!(hlsl.complete(), "{:?}", hlsl.unsupported_why);
+    assert!(hlsl.hlsl.contains("bool xcl_vok = xcl_slot < 64u;") && hlsl.hlsl.contains("bool xcl_pok = xcl_slot < 32u;"), "{}", hlsl.hlsl);
+    // (every store into a vertex or primitive slot has its bound; the header's has none to need)
+    let count = |what: &str| hlsl.hlsl.matches(what).count();
+    assert_eq!((count("res.Store((xcl_vtx"), count("res.Store(xcl_prm")), (4, 1), "{}", hlsl.hlsl);
+    assert_eq!((count("if (xcl_vok) res.Store((xcl_vtx"), count("if (xcl_pok) res.Store(xcl_prm")), (4, 1), "an export without its bound:\n{}", hlsl.hlsl);
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() });
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = direct_or(&code, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
+    let pass = mesh_passthrough(&ms);
+    let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    let ps = dxc::compile("struct V { float4 pos : SV_Position; };\nfloat4 main(V v) : SV_Target0 { return 1; }\n", "main", "ps_6_6", &[]).unwrap();
+    let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
+    // one group, and a buffer of two records: what a thread past the record's slots wrote
+    // would be in the second
+    let (_, rec) = runner::mesh_draw(&cs, &msb, &ps, 1, 2 * rd, &vec![0u32; 128], &vec![0u32; 256], 32, [-1.0; 4]).unwrap();
+    assert_eq!(rec.len(), 2 * rd);
+    assert_eq!((rec[0], rec[1]), (3, 1), "GS_ALLOC_REQ counts");
+    for v in [0usize, 31, 63] {
+        assert_eq!(f32::from_bits(rec[MESH_HEADER + v * vd]), 1.0, "vertex {v} of the record");
+    }
+    for p in [0usize, 31] {
+        assert_eq!(rec[MESH_HEADER + 64 * vd + p], MARK, "primitive {p} of the record");
+    }
+    assert_eq!(rec[rd..].iter().position(|&w| w != 0), None, "a thread past the record's slots wrote behind it");
+}
+
 #[test]
 fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
     use super::{mesh_passthrough, MsInterface};
