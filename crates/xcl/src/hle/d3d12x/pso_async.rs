@@ -74,6 +74,9 @@ thread_local! {
     static JOB_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
     /// the build this thread runs gave the driver a huge program (`note_huge`)
     static JOB_HUGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// a backlog worker's build: whether it came from `Backlog::compute`; None once another
+    /// worker took this one's place (`build_parks`)
+    static PRELOAD_STEP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Run `p`'s build `job` on this thread (a worker's, or a bind's that took it): its time and
@@ -110,6 +113,19 @@ pub(super) fn build_is_wanted() -> bool {
 /// compile gives its turn to any other (`real::big_compile_turn`).
 pub(super) fn build_is_ahead() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| !p.used.load(Ordering::Relaxed) && p.demand.lock().unwrap().preload_thread != 0))
+}
+
+/// The build ahead on this thread waits for its pipeline's first use before its driver compile
+/// (`real::huge_compile_turn`: no giant one is made ahead), which may never come. On a backlog
+/// worker another worker starts in its place and the lane of new compute pipelines goes to the
+/// next one (`Backlog::built`), so the backlog does not stand still behind it; this thread ends
+/// after the build.
+pub(super) fn build_parks() {
+    let Some(new_compute) = PRELOAD_STEP.with(|s| s.take()) else { return };
+    let Some(q) = preload() else { return };
+    q.list.lock().unwrap().built(new_compute);
+    q.cv.notify_one();
+    spawn_preload_worker(q);
 }
 
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and
@@ -800,55 +816,68 @@ fn preload() -> Option<&'static Preload> {
         .as_ref()?;
     STARTED.call_once(|| {
         let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
-        for k in 0..n {
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
-                unsafe {
-                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
-                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-                }
-                static DONE: AtomicUsize = AtomicUsize::new(0);
-                loop {
-                    let (p, step) = {
-                        let mut g = q.list.lock().unwrap();
-                        loop {
-                            let next = g.next(ahead_room(), AHEAD_BUILDS.load(Ordering::Relaxed) < ahead_cap());
-                            BACKLOG.store(g.len(), Ordering::Relaxed);
-                            if let Some(next) = next {
-                                break next;
-                            }
-                            // (pipelines waiting for free commit are looked at again in a second)
-                            g = q.cv.wait_timeout(g, std::time::Duration::from_secs(1)).unwrap().0;
-                        }
-                    };
-                    let (ahead, new_compute) = match step {
-                        Step::Warm(warm) => {
-                            warm();
-                            WARMED.fetch_add(1, Ordering::Relaxed);
-                            if p.unclaimed() {
-                                q.list.lock().unwrap().cold.push_back(p);
-                            }
-                            continue;
-                        }
-                        Step::Build { ahead, new_compute } => (ahead, new_compute),
-                    };
-                    // (None: a bind took it and builds it itself)
-                    let job = p.job.lock().unwrap().take();
-                    if let Some(job) = job {
-                        if ahead {
-                            AHEAD_BUILDS.fetch_add(1, Ordering::Relaxed);
-                        }
-                        build(&p, job, true);
-                        let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n.is_power_of_two() {
-                            crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
-                        }
-                    }
-                    q.list.lock().unwrap().built(new_compute);
-                }
-            });
+        for _ in 0..n {
+            spawn_preload_worker(q);
         }
     });
     Some(q)
+}
+
+/// One more worker of the backlog (`preload`).
+fn spawn_preload_worker(q: &'static Preload) {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let k = NEXT.fetch_add(1, Ordering::Relaxed);
+    let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
+        unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        }
+        static DONE: AtomicUsize = AtomicUsize::new(0);
+        loop {
+            let (p, step) = {
+                let mut g = q.list.lock().unwrap();
+                loop {
+                    let next = g.next(ahead_room(), AHEAD_BUILDS.load(Ordering::Relaxed) < ahead_cap());
+                    BACKLOG.store(g.len(), Ordering::Relaxed);
+                    if let Some(next) = next {
+                        break next;
+                    }
+                    // (pipelines waiting for free commit are looked at again in a second)
+                    g = q.cv.wait_timeout(g, std::time::Duration::from_secs(1)).unwrap().0;
+                }
+            };
+            let (ahead, new_compute) = match step {
+                Step::Warm(warm) => {
+                    warm();
+                    WARMED.fetch_add(1, Ordering::Relaxed);
+                    if p.unclaimed() {
+                        q.list.lock().unwrap().cold.push_back(p);
+                    }
+                    continue;
+                }
+                Step::Build { ahead, new_compute } => (ahead, new_compute),
+            };
+            // (None: a bind took it and builds it itself)
+            let job = p.job.lock().unwrap().take();
+            if let Some(job) = job {
+                if ahead {
+                    AHEAD_BUILDS.fetch_add(1, Ordering::Relaxed);
+                }
+                PRELOAD_STEP.with(|s| s.set(Some(new_compute)));
+                build(&p, job, true);
+                let parked = PRELOAD_STEP.with(|s| s.take()).is_none();
+                let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
+                }
+                // (its lane went back and another worker took its place: `build_parks`)
+                if parked {
+                    return;
+                }
+            }
+            q.list.lock().unwrap().built(new_compute);
+        }
+    });
 }
 
 #[cfg(test)]
