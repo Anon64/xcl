@@ -1134,6 +1134,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
+                (127, b::dispatch_mesh as usize),
                 // the newer layout's (called before anything tells the layouts apart)
                 (131, l::flush_cache_range_x as usize),
                 (132, l::flush_cache_range_x as usize),
@@ -6404,8 +6405,21 @@ static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
 /// (`DispatchMesh` sits at newer #129 after #126 RSSetShadingRate, #127 RSSetShadingRateImage,
-/// and #128 Scarlett-only shading-rate/color struct).
-const NEWER_LIST_SLOTS: [(usize, usize); 23] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (69, 67), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (129, 126), (139, 10)];
+/// and #128 Scarlett-only shading-rate/color struct: the older layout's #124 … #127, two slots
+/// on as the other methods are).
+const NEWER_LIST_SLOTS: [(usize, usize); 23] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (69, 67), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (129, 127), (139, 10)];
+
+pub(super) unsafe fn list_device(list: *mut c_void) -> Option<ID3D12Device> {
+    type F = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(list, 7));
+    let iid = pc_iid(Kind::Device);
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    if f(list, &iid, &mut raw) >= 0 && !raw.is_null() {
+        Some(ID3D12Device::from_raw(raw))
+    } else {
+        None
+    }
+}
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -7333,10 +7347,14 @@ mod queue_tests {
         QUEUE_OLDER.store(false, Ordering::Release);
     }
 
+    /// The newer layout's DispatchMesh (#129) is the older layout's #127, where the two-pass
+    /// DispatchMesh is hooked; #128 is another method.
     #[test]
     fn newer_layout_maps_dispatch_mesh_to_slot_129_not_128() {
-        assert!(NEWER_LIST_SLOTS.contains(&(129, 126)), "DispatchMesh must map to newer slot #129");
+        assert!(NEWER_LIST_SLOTS.contains(&(129, 127)), "DispatchMesh must map to newer slot #129");
         assert!(!NEWER_LIST_SLOTS.iter().any(|&(newer, _)| newer == 128), "newer slot #128 must not map to DispatchMesh");
+        let handler = console_slots(Kind::CommandList).into_iter().find(|e| e.0 == 127).map(|e| e.1);
+        assert_eq!(handler, Some(super::super::bind::dispatch_mesh as usize), "the older slot runs DispatchMesh");
     }
 }
 
