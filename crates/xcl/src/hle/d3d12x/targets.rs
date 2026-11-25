@@ -1,10 +1,11 @@
-//! `XCL_DUMP_TARGETS=<work>[,<frames>]`: what a busy frame draws into. In the first `frames`
-//! frames (default 1) with at least `work` draws and dispatches, every render target the frame
-//! drew into (and the depth buffer bound most) is logged with how its draws went – ran, drew
+//! `XCL_DUMP_TARGETS=<work>[,<frames>[,<targets>]]`: what a busy frame draws into. In the first
+//! `frames` frames (default 1) with at least `work` draws and dispatches, every render target the
+//! frame drew into (and the depth buffer bound most) is logged with how its draws went – ran, drew
 //! nothing (a stand-in while the pipeline is built), went to the PC untranslated, skipped – and
-//! the eight drawn into most are written next to the presented frame (`target<k>_<n>.bmp`) with
-//! how many of their texels are not zero and how many differ from the first one. A black picture
-//! over a scene that was drawn tells a lost composite from a scene that never was.
+//! the `targets` drawn into most (default eight, 64 at most) are written next to the presented
+//! frame (`target<k>_<n>.bmp`) with how many of their texels are not zero and how many differ from
+//! the first one. A black picture over a scene that was drawn tells a lost composite from a scene
+//! that never was; the passes after the scene's (a few draws each) are among the last ranks.
 //! `XCL_DUMP_AFTER_S=<s>`: no frame is dumped until `s` seconds after the first present.
 //!
 //! A draw counts for the frame whose PresentX follows its recording (bundles, and lists executed
@@ -24,8 +25,9 @@ use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-/// targets dumped of one frame
+/// targets dumped of one frame when the switch names no number, and the most it may name
 const DUMPED: usize = 8;
+const DUMPED_MOST: usize = 64;
 
 /// How a draw went: ran on its translated pipeline, drew nothing (a stand-in for a pipeline still
 /// being built), went to the PC untranslated, or was skipped.
@@ -42,14 +44,16 @@ struct Config {
     frames: u64,
     /// no dump before this long after the first present
     after: Duration,
+    /// targets written of a frame
+    targets: usize,
 }
 
 fn config() -> Option<Config> {
     static C: OnceLock<Option<Config>> = OnceLock::new();
     *C.get_or_init(|| {
         let v = std::env::var("XCL_DUMP_TARGETS").ok()?;
-        let Some((work, frames)) = parse(&v) else {
-            crate::xlog_warn!("D3D12.X: XCL_DUMP_TARGETS={v:?} is not <draws and dispatches>[,<frames>]: no targets dumped");
+        let Some((work, frames, targets)) = parse(&v) else {
+            crate::xlog_warn!("D3D12.X: XCL_DUMP_TARGETS={v:?} is not <draws and dispatches>[,<frames>[,<targets>]]: no targets dumped");
             return None;
         };
         let after = match std::env::var("XCL_DUMP_AFTER_S") {
@@ -59,18 +63,23 @@ fn config() -> Option<Config> {
             }),
             Err(_) => Duration::ZERO,
         };
-        Some(Config { work, frames, after })
+        Some(Config { work, frames, after, targets })
     })
 }
 
-fn parse(v: &str) -> Option<(u64, u64)> {
+/// (work, frames, targets written of a frame: 1 ..= `DUMPED_MOST`)
+fn parse(v: &str) -> Option<(u64, u64, usize)> {
     let mut it = v.split(',').map(|s| s.trim().parse::<u64>());
     let work = it.next()?.ok()?;
     let frames = match it.next() {
         Some(n) => n.ok()?,
         None => 1,
     };
-    (work > 0 && frames > 0).then_some((work, frames))
+    let targets = match it.next() {
+        Some(n) => n.ok()? as usize,
+        None => DUMPED,
+    };
+    (work > 0 && frames > 0 && targets > 0 && it.next().is_none()).then_some((work, frames, targets.min(DUMPED_MOST)))
 }
 
 /// `XCL_DUMP_AFTER_S`: seconds, fractions too (None: not a number of seconds)
@@ -174,6 +183,7 @@ pub fn submitted() {
 /// Logs what frame `n` drew into; the targets to copy for its dump: (tag, resource, desc).
 pub unsafe fn to_dump(n: u64, f: &Frame) -> Vec<(String, ID3D12Resource, D3D12_RESOURCE_DESC)> {
     let ranked = f.ranked();
+    let dumped = config().map_or(DUMPED, |c| c.targets);
     crate::xlog_info!("D3D12.X: target dump of frame {n}: {} draws and dispatches, {} render targets drawn into", f.work, ranked.len());
     let mut out = Vec::new();
     let depth = f.depth().map(|(r, c)| (usize::MAX, r, c));
@@ -184,7 +194,7 @@ pub unsafe fn to_dump(n: u64, f: &Frame) -> Vec<(String, ID3D12Resource, D3D12_R
         let copyable = d.is_some_and(|d| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count <= 1);
         let tag = match (k, copyable) {
             (usize::MAX, _) => " (not dumped: its state is not known)".into(),
-            (k, true) if k < DUMPED => format!(" → target{k}"),
+            (k, true) if k < dumped => format!(" → target{k}"),
             (_, false) if d.is_some() => " (not dumped)".into(),
             _ => String::new(),
         };
@@ -197,7 +207,7 @@ pub unsafe fn to_dump(n: u64, f: &Frame) -> Vec<(String, ID3D12Resource, D3D12_R
             c[PC],
             c[SKIPPED]
         );
-        if let (true, Some(res), Some(d)) = (k < DUMPED && copyable, res, d) {
+        if let (true, Some(res), Some(d)) = (k < dumped && copyable, res, d) {
             out.push((format!("target{k}"), res, d));
         }
     }
@@ -266,13 +276,19 @@ mod tests {
 
     #[test]
     fn the_switch_takes_a_work_threshold_and_a_frame_count() {
-        assert_eq!(parse("200"), Some((200, 1)));
-        assert_eq!(parse("200,3"), Some((200, 3)));
-        assert_eq!(parse(" 50 , 2 "), Some((50, 2)));
+        assert_eq!(parse("200"), Some((200, 1, DUMPED)));
+        assert_eq!(parse("200,3"), Some((200, 3, DUMPED)));
+        assert_eq!(parse(" 50 , 2 "), Some((50, 2, DUMPED)));
         assert_eq!(parse("0"), None);
         assert_eq!(parse("200,0"), None);
         assert_eq!(parse("x"), None);
         assert_eq!(parse("200,x"), None);
+        // a third number: the targets written of a frame, 64 at most
+        assert_eq!(parse("200,3,24"), Some((200, 3, 24)));
+        assert_eq!(parse("200,3,1000"), Some((200, 3, DUMPED_MOST)));
+        assert_eq!(parse("200,3,0"), None);
+        assert_eq!(parse("200,3,x"), None);
+        assert_eq!(parse("200,3,24,1"), None);
     }
 
     #[test]
@@ -282,7 +298,7 @@ mod tests {
         assert_eq!(parse_after("soon"), None);
         assert_eq!(parse_after("-1"), None);
         assert_eq!(parse_after("inf"), None);
-        let c = Config { work: 100, frames: 2, after: Duration::from_secs(30) };
+        let c = Config { work: 100, frames: 2, after: Duration::from_secs(30), targets: DUMPED };
         assert!(!due(&c, 500, 0, Duration::from_secs(29)), "too early");
         assert!(due(&c, 500, 0, Duration::from_secs(30)));
         assert!(!due(&c, 99, 0, Duration::from_secs(40)), "too little work");
