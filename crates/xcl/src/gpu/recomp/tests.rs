@@ -3423,6 +3423,36 @@ fn gpu_mesh_mode_two_passes() {
     assert!(px16 == px, "split pass-through draws the same pixels");
 }
 
+#[test]
+fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
+    use super::{mesh_passthrough, MsInterface};
+    let sig = |name: &str, sv: u32, reg: u32, idx: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: idx,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = MsInterface {
+        outputs: vec![sig("SV_Position", 1, 0, 0), sig("TEXCOORD", 0, 1, 0)],
+        threads: 128,
+        max_vertices: 128,
+        max_primitives: 128,
+    };
+    let unsplit = mesh_passthrough(&ms);
+    assert!(unsplit.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{unsplit}");
+    assert!(!unsplit.contains("0x3FFu"), "{unsplit}");
+
+    let ins: Vec<_> = (0..16).map(|k| sig("TEXCOORD", 0, k + 1, k)).collect();
+    assert!(super::emit::passthrough_split(&ms, super::emit::passthrough_elements(&ms, Some(&ins))) > 1);
+    let split = super::emit::mesh_passthrough_for(&ms, Some(&ins));
+    assert!(split.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{split}");
+    assert!(!split.contains("0x3FFu"), "{split}");
+}
+
 /// The mesh output budget with wide vertices: DXC accounts whole chunks of 32 vertices even
 /// when fewer are declared, so 78 vertices with 22 float4 rows are accounted as 96 (33792 B >
 /// 32768) and the record must go out in split groups. A retail title's NGG transform programs

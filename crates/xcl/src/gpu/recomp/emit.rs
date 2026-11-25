@@ -5287,7 +5287,9 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         h.push_str("        verts[i] = o;\n    }\n");
         let _ = writeln!(h, "    for (uint j = gi; j < np; j += {t}u) {{");
         let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + j) * 4u);");
-        h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
+        // RDNA2 EXP PRIM packs 9-bit vertex indices at [8:0], [18:10], [28:20] with
+        // per-edge flags at [9], [19], [29] and null_prim at [31].
+        h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
         h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
         h.push_str("        tris[j] = select(bad, uint3(0u, 0u, 0u), x);\n    }\n}\n");
         return h;
@@ -5306,7 +5308,7 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     h.push_str("    SetMeshOutputCounts(3u * n, n);\n");
     let _ = writeln!(h, "    for (uint j = gi; j < n; j += {t}u) {{");
     let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + first + j) * 4u);");
-    h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
+    h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
     h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
     h.push_str("        [unroll] for (uint c = 0u; c < 3u; c++) {\n");
     let _ = writeln!(h, "        uint b = (rec + {MESH_HEADER}u + select(bad, 0u, x[c]) * {vd}u) * 4u;");
