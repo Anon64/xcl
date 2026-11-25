@@ -87,7 +87,16 @@ struct Table {
     /// Largest byte span currently in `shadowed` (bounds range queries)
     max_shadowed_size: usize,
     next_seq: u64,
+    /// the active textures by the 1 MiB pieces of their source (`Entry::src`) they cover: which of
+    /// them lie under a written page. A title has tens of thousands of textures; a submit asks
+    /// about the few its dirty pages touch
+    src_pieces: BTreeMap<usize, Vec<usize>>,
+    /// textures whose first upload is still to come (`Entry::pending`; may name ones that went)
+    pending_res: std::collections::BTreeSet<usize>,
 }
+
+/// the piece (1 MiB) of an address, for `Table::src_pieces`
+const SRC_PIECE_SHIFT: usize = 20;
 
 impl Table {
     const fn new() -> Self {
@@ -98,7 +107,42 @@ impl Table {
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
             next_seq: 0,
+            src_pieces: BTreeMap::new(),
+            pending_res: std::collections::BTreeSet::new(),
         }
+    }
+
+    fn link_src(&mut self, res: usize, src: usize, size: usize) {
+        for p in (src >> SRC_PIECE_SHIFT)..=((src + size.max(1) - 1) >> SRC_PIECE_SHIFT) {
+            self.src_pieces.entry(p).or_default().push(res);
+        }
+    }
+
+    fn unlink_src(&mut self, res: usize, src: usize, size: usize) {
+        for p in (src >> SRC_PIECE_SHIFT)..=((src + size.max(1) - 1) >> SRC_PIECE_SHIFT) {
+            if let Some(v) = self.src_pieces.get_mut(&p) {
+                v.retain(|&r| r != res);
+                if v.is_empty() {
+                    self.src_pieces.remove(&p);
+                }
+            }
+        }
+    }
+
+    /// The textures (active) whose source the dirty pages `dirty` (sorted) may touch.
+    fn touched_by(&self, dirty: &[usize]) -> std::collections::BTreeSet<usize> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut last = usize::MAX;
+        for &p in dirty {
+            let piece = p >> SRC_PIECE_SHIFT;
+            if piece != last {
+                last = piece;
+                if let Some(v) = self.src_pieces.get(&piece) {
+                    out.extend(v.iter().copied());
+                }
+            }
+        }
+        out
     }
 
     fn has_active_overlap(&self, va: usize, end: usize) -> bool {
@@ -146,6 +190,7 @@ impl Table {
         for (ova, ores, _) in self.active_overlaps(va, end) {
             self.by_va.remove(&(ova, ores));
             if let Some(old) = self.by_res.remove(&ores) {
+                self.unlink_src(ores, old.src, old.tex.size() as usize);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -181,6 +226,7 @@ impl Table {
         let mut pending_delta = 0isize;
         let mut to_unmap = Vec::new();
         if let Some(old) = self.by_res.remove(&res) {
+            self.unlink_src(res, old.src, old.tex.size() as usize);
             self.by_va.remove(&(old.va, res));
             if old.pending {
                 pending_delta -= 1;
@@ -195,6 +241,7 @@ impl Table {
             }
             self.by_va.remove(&(ova, ores));
             if let Some(mut old) = self.by_res.remove(&ores) {
+                self.unlink_src(ores, old.src, old.tex.size() as usize);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -223,8 +270,11 @@ impl Table {
         entry.seq = self.next_seq;
         if entry.pending {
             pending_delta += 1;
+            self.pending_res.insert(res);
         }
         self.by_va.insert((va, res), end);
+        let (src, size) = (entry.src, entry.tex.size() as usize);
+        self.link_src(res, src, size);
         self.by_res.insert(res, entry);
         (pending_delta, to_unmap)
     }
@@ -240,6 +290,7 @@ impl Table {
             return (true, 0, Vec::new());
         }
         let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new()) };
+        self.unlink_src(res, old.src, old.tex.size() as usize);
         self.by_va.remove(&(old.va, res));
         let mut pending_delta = if old.pending { -1 } else { 0 };
         let va = old.va;
@@ -268,6 +319,11 @@ impl Table {
                     pending_delta += 1;
                 }
                 self.by_va.insert((sva, sres), send);
+                let (src, size) = (e.src, e.tex.size() as usize);
+                self.link_src(sres, src, size);
+                if e.pending {
+                    self.pending_res.insert(sres);
+                }
                 self.by_res.insert(sres, e);
             }
         }
@@ -416,15 +472,60 @@ fn mirror_source(va: usize) -> usize {
 fn recheck_gpu_view_sources() {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     let gen = crate::hle::kernelx::gpu_view_map_gen();
-    if SEEN.swap(gen, Ordering::AcqRel) == gen {
+    let seen = SEEN.swap(gen, Ordering::AcqRel);
+    if seen == gen {
         return;
     }
     let mut changed = false;
     // (the shadowed textures too: one comes back when the texture over it goes)
     let mut g = TEXTURES.lock().unwrap();
     let t = &mut *g;
-    for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
-        changed |= recheck_source(e);
+    // the textures whose source may have changed: those overlapping the ranges whose mappings
+    // changed since the last look (all of them when the log of changes has lost some)
+    let names: Option<std::collections::BTreeSet<usize>> = crate::hle::kernelx::gpu_view_map_changes(seen).map(|ranges| {
+        let mut s = std::collections::BTreeSet::new();
+        for (lo, hi) in ranges {
+            s.extend(t.active_overlaps(lo, hi).into_iter().map(|(_, r, _)| r));
+            s.extend(t.shadowed_overlaps(lo, hi).into_iter().map(|(_, r, _)| r));
+        }
+        s
+    });
+    let mut moved: Vec<(usize, usize, usize, usize, bool)> = Vec::new();
+    let Table { by_res, shadowed, .. } = t;
+    let mut look = |res: usize, e: &mut Entry, active: bool| {
+        let (old, size) = (e.src, e.tex.size() as usize);
+        if recheck_source(e) {
+            changed = true;
+            if active {
+                moved.push((res, old, e.src, size, e.pending));
+            }
+        }
+    };
+    match &names {
+        Some(s) => {
+            for &r in s {
+                if let Some(e) = by_res.get_mut(&r) {
+                    look(r, e, true);
+                } else if let Some(e) = shadowed.get_mut(&r) {
+                    look(r, e, false);
+                }
+            }
+        }
+        None => {
+            for (&r, e) in by_res.iter_mut() {
+                look(r, e, true);
+            }
+            for (&r, e) in shadowed.iter_mut() {
+                look(r, e, false);
+            }
+        }
+    }
+    for (res, old, new, size, pending) in moved {
+        t.unlink_src(res, old, size);
+        t.link_src(res, new, size);
+        if pending {
+            t.pending_res.insert(res);
+        }
     }
     drop(g);
     if changed {
@@ -754,12 +855,18 @@ fn hot_looks() -> bool {
 }
 
 const HOT_BLOCK: usize = 2 << 20;
-const HOT_GAP: usize = 4 << 20;
+/// the gap up to which hot blocks go into one write-watch call (`XCL_WATCH_GAP_MB`, 64 unless
+/// given): a call waits for the process's memory lock, which is busy while the title loads, and
+/// costs more than walking some megabytes of pages
+fn hot_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| std::env::var("XCL_WATCH_GAP_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(64) << 20)
+}
 /// a block nothing was written to for this long is left to the walk again (`XCL_WATCH_HOT_MS`,
-/// 5000 unless given)
+/// 1500 unless given)
 fn hot_for() -> std::time::Duration {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    std::time::Duration::from_millis(*MS.get_or_init(|| std::env::var("XCL_WATCH_HOT_MS").ok().and_then(|v| v.trim().parse().ok()).filter(|&v| v >= 20).unwrap_or(5000)))
+    std::time::Duration::from_millis(*MS.get_or_init(|| std::env::var("XCL_WATCH_HOT_MS").ok().and_then(|v| v.trim().parse().ok()).filter(|&v| v >= 20).unwrap_or(1500)))
 }
 
 #[derive(Default)]
@@ -820,7 +927,7 @@ unsafe fn take_hot(ranges: &Arc<Vec<(usize, usize)>>, buf: &mut [*mut c_void], d
                     match runs.last_mut() {
                         // one call for hot blocks up to HOT_GAP apart in the same range: a call costs
                         // about as much as walking 6 MiB of committed pages
-                        Some(last) if last.0 >= base && lo - (last.0 + last.1) <= HOT_GAP => last.1 = hi - last.0,
+                        Some(last) if last.0 >= base && lo - (last.0 + last.1) <= hot_gap() => last.1 = hi - last.0,
                         _ => runs.push((lo, hi - lo)),
                     }
                 }
@@ -885,7 +992,7 @@ fn start_walk(ranges: &Arc<Vec<(usize, usize)>>) {
 /// The walk: all watched memory in steps of 64 MiB, without taking the written pages (they stay
 /// reported until a look takes them); a block with a written page is hot from then on.
 unsafe fn walk() {
-    const STEP: usize = 16 << 20;
+    const STEP: usize = 32 << 20;
     let mut buf: Vec<*mut c_void> = vec![std::ptr::null_mut(); 8192];
     let mut found: Vec<usize> = Vec::new();
     loop {
@@ -936,8 +1043,9 @@ unsafe fn walk() {
                 at = stop;
             }
         }
-        // a pass takes ~0.6 ms a GiB of the kernel's time; the pause keeps the thread to about half a core
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // a pass takes the process's memory lock some hundred times (a call each); the pause keeps
+        // the thread from holding up the title's own calls
+        std::thread::sleep(std::time::Duration::from_millis(15));
     }
 }
 
@@ -1078,19 +1186,19 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) {
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
-        t.by_res
-            .iter_mut()
-            .filter(|(_, e)| {
-                if e.pending {
-                    return true;
+        let mut names = t.touched_by(&dirty);
+        names.extend(std::mem::take(&mut t.pending_res));
+        names
+            .into_iter()
+            .filter_map(|res| {
+                let e = t.by_res.get_mut(&res)?;
+                let wanted = e.pending || (!e.gpu_written && {
+                    let i = dirty.partition_point(|&p| p + page as usize <= e.src);
+                    dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                });
+                if !wanted {
+                    return None;
                 }
-                if e.gpu_written {
-                    return false;
-                }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-            })
-            .filter_map(|(&res, e)| {
                 if e.pending {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
