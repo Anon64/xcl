@@ -697,6 +697,78 @@ pub mod mirrors {
         gone
     }
 
+    /// The GPU-view pages in `[lo, hi)` whose content changed after cursor `seen` (0 at first),
+    /// each once, with the call that last changed it, in the order of their last change – at
+    /// most `most` – and the cursor to pass next. Nothing is drained: each reader keeps a cursor
+    /// of its own. One atomic load when nothing changed.
+    pub fn changes_since(seen: u64, lo: usize, hi: usize, most: usize) -> (u64, Vec<(usize, u64)>) {
+        let mut out = Vec::new();
+        if CHANGE_SEQ.load(Ordering::Acquire) == seen {
+            return (seen, out);
+        }
+        let p = read_pages();
+        let mut cursor = seen;
+        for (&seq, &g) in p.log.range(seen.saturating_add(1)..) {
+            if g >= lo && g < hi {
+                if out.len() >= most {
+                    return (cursor, out);
+                }
+                out.push((g, p.shown.get(&g).map_or(0, |e| e.call)));
+            }
+            cursor = seq;
+        }
+        (p.seq.max(cursor), out)
+    }
+
+    /// The GPU-view pages a CPU write reaches, added to `out` for `dirty` (sorted 4 KiB pages
+    /// written): each written page of a place where a mapped page is kept, at every GPU-view
+    /// page that shows it; and a written page of a CPU view at its GPU-view page when the
+    /// page-mapping method never named that one (it shows the CPU view at the same offset). A
+    /// GPU-view page that is mapped or unmapped gets nothing from the CPU view under it.
+    pub fn views_of_written(dirty: &[usize], out: &mut Vec<usize>) {
+        if MAPPED.load(Ordering::Acquire) == 0 || dirty.is_empty() {
+            return;
+        }
+        // (GPU view, size, CPU view)
+        let pairs: Vec<(usize, usize, usize)> = STATE.lock().unwrap().gpu.iter().map(|(&g, &(n, c))| (g, n, c)).collect();
+        let p = read_pages();
+        let mut i = 0;
+        while i < dirty.len() {
+            let page = dirty[i] & !(PAGE - 1);
+            let n = dirty[i..].iter().take_while(|&&d| d & !(PAGE - 1) == page).count();
+            let written = &dirty[i..i + n];
+            for &(_, g) in p.by_at.range((page, 0)..=(page, usize::MAX)) {
+                out.extend(written.iter().map(|&d| g + (d - page)));
+            }
+            for &(gv, size, c) in &pairs {
+                if page >= c && page < c + size && !p.shown.contains_key(&(gv + (page - c))) {
+                    out.extend(written.iter().map(|&d| gv + (d - c)));
+                }
+            }
+            i += n;
+        }
+    }
+
+    /// The 16 MiB blocks that hold the place of a shown page, as (start, end), in order.
+    pub fn shown_blocks() -> Vec<(usize, usize)> {
+        if MAPPED.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let mut v: Vec<(usize, usize)> = read_pages().blocks.keys().map(|&b| (b << 24, (b + 1) << 24)).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Changes each time a 16 MiB block comes to hold the place of a shown page, or ceases to.
+    pub fn shown_gen() -> u64 {
+        SHOWN_GEN.load(Ordering::Acquire)
+    }
+
+    /// The GPU-view pages that followed their physical page to another place so far.
+    pub fn moved_pages() -> u64 {
+        MOVED.load(Ordering::Relaxed)
+    }
+
     /// What the record says of GPU-view page `g` (a test's own pages).
     #[cfg(test)]
     pub(super) fn shown_at(g: usize) -> Option<Shown> {
@@ -4264,6 +4336,136 @@ mod tests {
             assert_eq!(VirtualFree(cv as *mut c_void, 0, mem::MEM_RELEASE), 1);
             assert!((0..8).all(|k| shown_at(g + k * PAGE).is_none()));
             for q in [pool, r] {
+                assert_eq!(VirtualFree(q as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            }
+        }
+    }
+
+    /// The changed pages of a GPU view are told in the order of their last change, each once,
+    /// with the call that changed it last; a move is no change; `most` hands them out one by one
+    /// and the range keeps other pages out; the pages of a released view are not told.
+    #[test]
+    fn changed_gpu_view_pages_are_told_once_in_order() {
+        use mirrors::{apply_batches, changes_since, shown_at, shows, Shows, PAGE};
+        const SIZE: usize = 139 * PAGE;
+        let g = 0x7290_0000_0000usize;
+        let (lo, hi, all) = (g, g + SIZE, usize::MAX);
+        let null = std::ptr::null_mut();
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 3usize;
+            let mut pages = [0usize; 3];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
+            let cv = cpu_view(SIZE, g);
+            let pool = reserve_watched(3 * PAGE, 0x2000, mem::PAGE_READWRITE) as usize;
+            let r = reserve_watched(PAGE, 0x2000, mem::PAGE_READWRITE) as usize;
+            assert!(pool != 0 && r != 0);
+            assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 3, 0, 4, pages.as_mut_ptr()) as usize, pool);
+            let apply = |ranges: &[[u32; 3]], at: usize| assert!(apply_batches(1, [batch(at, ranges)].as_ptr() as usize, pool, 3).is_some());
+            let call = |k: usize| shown_at(g + k * PAGE).unwrap().call;
+            let (start, got) = changes_since(0, lo, hi, all);
+            assert!(got.is_empty(), "a view of the test's own");
+
+            // one call of three pages
+            apply(&[[0, 0, 3]], g + PAGE);
+            let c1 = call(1);
+            let (s1, got) = changes_since(start, lo, hi, all);
+            assert_eq!(got, vec![(g + PAGE, c1), (g + 2 * PAGE, c1), (g + 3 * PAGE, c1)]);
+            assert!(changes_since(s1, lo, hi, all).1.is_empty(), "told once");
+            // remapped: that page comes again, last, with its new call
+            apply(&[[0, 2, 1]], g + PAGE);
+            assert!(call(1) > c1);
+            let (s2, got) = changes_since(s1, lo, hi, all);
+            assert_eq!(got, vec![(g + PAGE, call(1))]);
+            // a move is no change: the page of view page 2 mapped elsewhere
+            let mut one = [pages[1]];
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, r);
+            assert_eq!(shows(g + 2 * PAGE), Shows::Page { at: r, tile: true });
+            let (s3, got) = changes_since(s2, lo, hi, all);
+            assert!(got.is_empty(), "a move");
+            // view page 2 unmapped, then 3, then 2 mapped again: 3 and 2, once each
+            apply(&[[2, 0, 1]], g + 2 * PAGE);
+            apply(&[[2, 0, 1]], g + 3 * PAGE);
+            apply(&[[0, 1, 1]], g + 2 * PAGE);
+            assert_eq!(shows(g + 2 * PAGE), Shows::Page { at: r, tile: true });
+            let want = vec![(g + 3 * PAGE, call(3)), (g + 2 * PAGE, call(2))];
+            assert!(call(2) > call(3));
+            assert_eq!(changes_since(s3, lo, hi, all).1, want);
+            // one at a time
+            let (t1, got) = changes_since(s3, lo, hi, 1);
+            assert_eq!(got, want[..1]);
+            let (t2, got) = changes_since(t1, lo, hi, 1);
+            assert_eq!(got, want[1..]);
+            assert!(changes_since(t2, lo, hi, 1).1.is_empty());
+            // the range: view page 3 alone
+            assert_eq!(changes_since(s3, g + 3 * PAGE, g + 4 * PAGE, all).1, want[..1]);
+
+            // released with the view: none of them is told
+            assert_eq!(VirtualFree(cv as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert!(changes_since(start, lo, hi, all).1.is_empty());
+            assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 3, 0, 4, std::ptr::null_mut()) as usize, pool);
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, std::ptr::null_mut()) as usize, r);
+            assert_eq!(FreeTitlePhysicalPages(null, 3, pages.as_mut_ptr()), 1);
+            for q in [pool, r] {
+                assert_eq!(VirtualFree(q as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            }
+        }
+    }
+
+    /// A write where a mapped page is kept reaches every GPU-view page that shows it, and none
+    /// once the page left that address; a write to the CPU view reaches the GPU-view page at the
+    /// same offset only while the page-mapping method never named that page. The 16 MiB blocks
+    /// of the places follow.
+    #[test]
+    fn a_write_where_a_page_is_kept_is_a_write_to_the_views_showing_it() {
+        use mirrors::{apply_batches, shown_blocks, shown_gen, views_of_written, PAGE};
+        const SIZE: usize = 149 * PAGE;
+        const BLOCK: usize = 1 << 24;
+        let g = 0x72A0_0000_0000usize;
+        let null = std::ptr::null_mut();
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 1usize;
+            let mut pages = [0usize; 1];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
+            let cv = cpu_view(SIZE, g);
+            // the pool in a 16 MiB block of the test's own
+            let space = reserve_watched(2 * BLOCK, 0x2000, mem::PAGE_READWRITE) as usize;
+            let r = reserve_watched(PAGE, 0x2000, mem::PAGE_READWRITE) as usize;
+            assert!(space != 0 && r != 0);
+            let pool = (space + BLOCK - 1) & !(BLOCK - 1);
+            assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, pool);
+            *(pool as *mut u32) = 1;
+            let gen = shown_gen();
+            // the page at view pages 1 and 4
+            let ranges = [[0, 0, 1]];
+            let bs = [batch(g + PAGE, &ranges), batch(g + 4 * PAGE, &ranges)];
+            assert!(apply_batches(2, bs.as_ptr() as usize, pool, 1).is_some());
+            assert!(shown_blocks().contains(&(pool, pool + BLOCK)) && shown_gen() > gen);
+            let twins = |dirty: &[usize]| {
+                let mut v = Vec::new();
+                views_of_written(dirty, &mut v);
+                v.sort_unstable();
+                v
+            };
+            assert_eq!(twins(&[pool + 0x1000, pool + 0x3000]), vec![g + PAGE + 0x1000, g + PAGE + 0x3000, g + 4 * PAGE + 0x1000, g + 4 * PAGE + 0x3000]);
+            // moved: the address it left reaches none of them, its new place both
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, r);
+            assert!(twins(&[pool + 0x1000]).is_empty());
+            assert_eq!(twins(&[r + 0x2000]), vec![g + PAGE + 0x2000, g + 4 * PAGE + 0x2000]);
+            let rb = r & !(BLOCK - 1);
+            assert!(!shown_blocks().contains(&(pool, pool + BLOCK)) && shown_blocks().contains(&(rb, rb + BLOCK)));
+            // the CPU view under a page never named reaches it; under a mapped or unmapped one, not
+            assert_eq!(twins(&[cv + 6 * PAGE + 0x2000, cv + 6 * PAGE + 0x5000]), vec![g + 6 * PAGE + 0x2000, g + 6 * PAGE + 0x5000]);
+            assert!(twins(&[cv + PAGE + 0x2000]).is_empty(), "mapped");
+            assert!(apply_batches(1, [batch(g + 6 * PAGE, &[[2, 0, 1]])].as_ptr() as usize, pool, 1).is_some());
+            assert!(twins(&[cv + 6 * PAGE + 0x2000]).is_empty(), "unmapped");
+
+            assert_eq!(VirtualFree(cv as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert!(twins(&[r + 0x2000]).is_empty(), "released with the view");
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, std::ptr::null_mut()) as usize, r);
+            assert_eq!(FreeTitlePhysicalPages(null, 1, pages.as_mut_ptr()), 1);
+            for q in [space, r] {
                 assert_eq!(VirtualFree(q as *mut c_void, 0, mem::MEM_RELEASE), 1);
             }
         }
