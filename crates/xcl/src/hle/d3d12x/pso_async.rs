@@ -1483,6 +1483,108 @@ mod used_tests {
         released(standin);
     }
 
+    /// The names of the backlog's workers alive now (`spawn_preload_worker`).
+    fn preload_workers() -> Vec<String> {
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetThreadDescription, OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
+        let mut names = Vec::new();
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            assert_ne!(snap, INVALID_HANDLE_VALUE, "no thread snapshot");
+            let mut te: THREADENTRY32 = std::mem::zeroed();
+            te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut ok = Thread32First(snap, &mut te) != 0;
+            while ok {
+                let h = if te.th32OwnerProcessID == GetCurrentProcessId() { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, te.th32ThreadID) } else { std::ptr::null_mut() };
+                if !h.is_null() {
+                    let mut p: *mut u16 = std::ptr::null_mut();
+                    if GetThreadDescription(h, &mut p) >= 0 && !p.is_null() {
+                        let n = (0..).take_while(|&i| *p.add(i) != 0).count();
+                        let name = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+                        LocalFree(p.cast());
+                        if name.starts_with("xcl-pso-pre-") {
+                            names.push(name);
+                        }
+                    }
+                    CloseHandle(h);
+                }
+                ok = Thread32Next(snap, &mut te) != 0;
+            }
+            CloseHandle(snap);
+        }
+        names
+    }
+
+    /// A giant build ahead on a backlog worker waits for its pipeline's first use
+    /// (`real::huge_compile_turn`) and does not stop the lane of new compute pipelines meanwhile:
+    /// the next one is built while it waits, by the worker that took the waiting one's place
+    /// (`build_parks`). Once a bind waits for it, it gets the giant slot and is built; its thread
+    /// then ends without giving the lane back a second time (it holds another worker's build), and
+    /// as many workers are left as before. Without that a pipeline the title never uses held the
+    /// lane for good.
+    #[test]
+    fn a_parked_giant_build_ahead_leaves_the_lane_of_new_compute_pipelines_to_the_next() {
+        use std::time::{Duration, Instant};
+        let until = |done: &dyn Fn() -> bool, limit: Duration| {
+            let start = Instant::now();
+            while !done() && start.elapsed() < limit {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            done()
+        };
+        if preload().is_none() || !ahead_room() {
+            crate::gpu::recomp::runner::skip_test("no build ahead (XCL_PSO_PRELOAD=0, XCL_PSO_AHEAD=0 or short of commit)");
+            return;
+        }
+        // (as `preload` starts them; a thread names itself once it runs)
+        let workers = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        assert!(until(&|| preload_workers().len() == workers, Duration::from_secs(10)), "the backlog's workers: {:?}", preload_workers());
+        let (giant, next, holder, last) = (0x7E57_C030usize, 0x7E57_C031usize, 0x7E57_C032usize, 0x7E57_C033usize);
+        // the giant build: its worker's name, then its turn at the giant slot
+        let (on_tx, on) = mpsc::channel();
+        let (through_tx, through) = mpsc::channel();
+        submit_lazy(giant, true, Box::new(move || {
+            let _ = on_tx.send(std::thread::current().name().map(str::to_owned));
+            let slot = super::super::real::huge_compile_turn(super::super::real::GIANT_DRIVER_COMPILE);
+            let _ = through_tx.send(());
+            drop(slot);
+            0x6B6B
+        }), 0x5EED_C030);
+        let parked = on.recv_timeout(Duration::from_secs(10)).expect("a backlog worker builds it ahead").unwrap_or_default();
+        assert!(parked.starts_with("xcl-pso-pre-"), "built on {parked:?}");
+        submit_lazy(next, true, Box::new(|| 0x6C6C), 0x5EED_C031);
+        assert!(until(&|| !is_pending(next), Duration::from_secs(10)), "the next new compute pipeline is not built while the giant one waits");
+        assert!(is_pending(giant), "nobody used the giant one: it is not built");
+        assert!(through.try_recv().is_err(), "a giant build ahead took its turn");
+        assert!(until(&|| preload_workers().len() == workers + 1, Duration::from_secs(10)), "another worker took the waiting one's place: {:?}", preload_workers());
+        // a new compute build the lane holds when the giant build ends
+        let (held_tx, held) = mpsc::channel();
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(holder, true, Box::new(move || {
+            let _ = held_tx.send(());
+            let _ = finish.recv_timeout(Duration::from_secs(20));
+            0x6D6D
+        }), 0x5EED_C032);
+        held.recv_timeout(Duration::from_secs(10)).expect("the lane's next build starts");
+        assert_eq!(resolve_wait_for(giant, None), 0x6B6B, "wanted, the giant build is made");
+        assert!(through.try_recv().is_ok(), "it went through the giant slot");
+        assert!(until(&|| !preload_workers().contains(&parked), Duration::from_secs(10)), "the waiting worker's thread did not end");
+        assert_eq!(preload_workers().len(), workers, "as many workers as before: {:?}", preload_workers());
+        // the lane is still the holder's: the giant build's end did not give it back again
+        submit_lazy(last, true, Box::new(|| 0x6E6E), 0x5EED_C033);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(is_pending(last), "a second new compute build went while one was out");
+        go.send(()).unwrap();
+        assert!(until(&|| !is_pending(last), Duration::from_secs(10)), "the lane went back after the holder's build");
+        assert_eq!(resolve(next), 0x6C6C);
+        assert_eq!(resolve(holder), 0x6D6D);
+        assert_eq!(resolve(last), 0x6E6E);
+        for standin in [giant, next, holder, last] {
+            released(standin);
+        }
+    }
+
     /// A lazy graphics pipeline of shaders no run used yet is translated, then built, with no
     /// bind – when commit is free.
     #[test]
