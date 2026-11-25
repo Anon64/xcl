@@ -169,15 +169,25 @@ fn note_two_pass(k: usize) {
     let Ok(free) = FREE_RES.try_lock() else { return };
     let (kept, kept_bytes) = (free.free.len(), free.bytes);
     drop(free);
+    // (what waits for allocator resets, and for time: bytes that stay there hold the cap; tried
+    // only, as `FREE_RES`)
+    let Ok(held) = ALLOC_RES.try_lock() else { return };
+    let held_bytes: u64 = held.as_ref().map_or(0, |m| m.values().flatten().map(|b| b.bytes).sum());
+    drop(held);
+    let Ok(unknown) = UNKNOWN_RES.try_lock() else { return };
+    let unknown_bytes = unknown.bytes;
+    drop(unknown);
     if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
     let [made, reused, gone, alive, refused] = std::array::from_fn(|i| TWO_PASS[i].load(Ordering::Relaxed));
     crate::xlog_info!(
-        "D3D12.X: two-pass buffers: {made} made, {reused} taken again, {gone} let go; {} alive ({} MiB), {kept} of them kept for reuse ({} MiB); {refused} not made past {} MiB (XCL_TWO_PASS_MB)",
+        "D3D12.X: two-pass buffers: {made} made, {reused} taken again, {gone} let go; {} alive ({} MiB), {kept} of them kept for reuse ({} MiB), {} MiB waiting for allocator resets, {} MiB for no known allocator; {refused} not made past {} MiB (XCL_TWO_PASS_MB)",
         made.saturating_sub(gone),
         alive >> 20,
         kept_bytes >> 20,
+        held_bytes >> 20,
+        unknown_bytes >> 20,
         two_pass_cap() >> 20
     );
 }
