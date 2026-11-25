@@ -471,6 +471,10 @@ unsafe fn default_uav_buffer(dev: &ID3D12Device, bytes: u64, what: &str) -> Resu
         &mut res,
     )
     .map_err(|e| format!("{what} ({bytes:#x} B): {e}"))?;
+    // (a name for what a device removal reports about an address, `real::log_device_removed`)
+    if let Some(r) = &res {
+        let _ = r.SetName(&windows::core::HSTRING::from(format!("xcl {what}")));
+    }
     res.ok_or_else(|| format!("null {what}"))
 }
 

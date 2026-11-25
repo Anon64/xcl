@@ -664,6 +664,15 @@ pub fn init() -> Result<String, String> {
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
+        // with `XCL_DRED` a thread looks for the removal too: a title whose threads all wait
+        // (for pipelines being built, for a fence) submits and presents nothing, and the
+        // report of the faulting address would never be written
+        if std::env::var_os("XCL_DRED").is_some() {
+            let _ = std::thread::Builder::new().name("xcl-dred".into()).spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                stop_if_device_removed();
+            });
+        }
         *ADAPTER.lock().unwrap() = name.clone();
         Ok(name)
     }

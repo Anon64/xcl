@@ -867,6 +867,8 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             return Vec::new();
         }
         let Some(r) = r else { return Vec::new() };
+        // (a name for what a device removal reports about an address, `real::log_device_removed`)
+        let _ = r.SetName(&windows::core::HSTRING::from(format!("xcl memory window {k}{}", if u.is_view_window(k) { " (GPU views)" } else { "" })));
         out.push((k, r.clone().into_raw() as usize, r.GetGPUVirtualAddress()));
         windows.push((base, r));
     }
@@ -933,6 +935,7 @@ impl State {
             return None;
         }
         let heap = heap?;
+        let _ = heap.SetName(windows::core::w!("xcl sparse tile pool"));
         let h = self.add_pool(heap);
         Some(((h, 0), false))
     }
@@ -3190,6 +3193,10 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     let hr = super::real::dev_create_reserved_resource(this, &d as *const _ as usize, state as usize, 0, riid, ppv);
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         return None;
+    }
+    // (a name for what a device removal reports about an address, `real::log_device_removed`)
+    if let Some(r) = ID3D12Resource::from_raw_borrowed(&*ppv) {
+        let _ = r.SetName(&windows::core::HSTRING::from(format!("title buffer over tiles at {va:#x} ({bytes:#x} bytes)")));
     }
     // its tiles: the window's video memory at the same addresses; probe actual OS commitment
     // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes (of the CPU
