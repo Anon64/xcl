@@ -39,11 +39,11 @@ struct State {
     arena: crate::gpu::uma::Arena,
     /// a heap of views is bound (`list_x::ensure_view_heap`)
     heap_bound: bool,
-    res_buf: Option<(ID3D12Resource, u64, usize)>,
-    res_retired: Vec<(ID3D12Resource, u64, usize)>,
-    /// rewritten indirect arguments (`scratch_args`): the block, its bytes in use, and the
-    /// bytes of blocks this recording took
-    scratch: Option<(ID3D12Resource, u64, usize)>,
+    res_buf: Option<TwoPassBuf>,
+    res_retired: Vec<TwoPassBuf>,
+    /// rewritten indirect arguments (`scratch_args`): the block (and its bytes), its bytes in
+    /// use, and the bytes of blocks this recording took
+    scratch: Option<(ID3D12Resource, u64)>,
     scratch_used: u64,
     scratch_taken: u64,
 }
@@ -59,15 +59,75 @@ const FREE_RES_CAP: u64 = 1 << 30;
 /// only video memory waits on this.
 const FREE_RES_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
-static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<(ID3D12Resource, u64, usize)>>>> = Mutex::new(None);
-static FREE_RES: Mutex<FreePool<(ID3D12Resource, u64, usize)>> = Mutex::new(FreePool::new(FREE_RES_CAP));
+static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<TwoPassBuf>>>> = Mutex::new(None);
+static FREE_RES: Mutex<FreePool<TwoPassBuf>> = Mutex::new(FreePool::new(FREE_RES_CAP));
 
-fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, usize)>) {
+/// A two-pass buffer (records or argument scratch), its bytes and its device: counted from when
+/// it is made until it is let go (`TWO_PASS`).
+struct TwoPassBuf {
+    res: ID3D12Resource,
+    bytes: u64,
+    dev: usize,
+}
+
+impl TwoPassBuf {
+    unsafe fn make(dev: &ID3D12Device, bytes: u64, what: &str) -> Result<Self, String> {
+        let res = default_uav_buffer(dev, bytes, what)?;
+        TWO_PASS[TP_ALIVE].fetch_add(bytes, Ordering::Relaxed);
+        note_two_pass(TP_MADE);
+        Ok(TwoPassBuf { res, bytes, dev: dev.as_raw() as usize })
+    }
+}
+
+impl Drop for TwoPassBuf {
+    fn drop(&mut self) {
+        TWO_PASS[TP_ALIVE].fetch_sub(self.bytes, Ordering::Relaxed);
+        note_two_pass(TP_GONE);
+    }
+}
+
+/// Two-pass buffers made, taken again from `FREE_RES`, let go, and the bytes of those alive.
+static TWO_PASS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+const TP_MADE: usize = 0;
+const TP_REUSED: usize = 1;
+const TP_GONE: usize = 2;
+const TP_ALIVE: usize = 3;
+
+/// One more of `TWO_PASS[k]`. Logged at most every 2 s while they change (always: each buffer
+/// made or let go is the driver's memory manager at work, in video memory that may be short).
+fn note_two_pass(k: usize) {
+    use std::sync::atomic::AtomicI64;
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST: AtomicI64 = AtomicI64::new(i64::MIN);
+    TWO_PASS[k].fetch_add(1, Ordering::Relaxed);
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as i64;
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last.saturating_add(2000) {
+        return;
+    }
+    // (a buffer is let go while `FREE_RES` is locked on this thread too: no line then, the next
+    // change logs)
+    let Ok(free) = FREE_RES.try_lock() else { return };
+    let (kept, kept_bytes) = (free.free.len(), free.bytes);
+    drop(free);
+    if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let [made, reused, gone, alive] = std::array::from_fn(|i| TWO_PASS[i].load(Ordering::Relaxed));
+    crate::xlog_info!(
+        "D3D12.X: two-pass buffers: {made} made, {reused} taken again, {gone} let go; {} alive ({} MiB), {kept} of them kept for reuse ({} MiB)",
+        made.saturating_sub(gone),
+        alive >> 20,
+        kept_bytes >> 20
+    );
+}
+
+fn hold_res_until_reset(allocator: usize, mut bufs: Vec<TwoPassBuf>) {
     if bufs.is_empty() {
         return;
     }
     if allocator == 0 {
-        let over = UNKNOWN_RES.lock().unwrap().hold(std::time::Instant::now(), bufs.into_iter().map(|b| (b.1, b)).collect());
+        let over = UNKNOWN_RES.lock().unwrap().hold(std::time::Instant::now(), bufs.into_iter().map(|b| (b.bytes, b)).collect());
         if over > 0 {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -88,20 +148,23 @@ pub(super) fn release_allocator_res(allocator: usize) {
         let now = std::time::Instant::now();
         let mut gone = free.take_idle(now, FREE_RES_IDLE);
         for b in bufs.into_iter().flatten().chain(aged) {
-            gone.extend(free.put(now, b.1, b.2, b));
+            gone.extend(free.put(now, b.bytes, b.dev, b));
         }
         gone
     };
 }
 
 /// A buffer of `FREE_RES` on the device `dev` of `min..=max` bytes, for a recording to take.
-fn take_free(dev: usize, min: u64, max: u64) -> Option<(ID3D12Resource, u64, usize)> {
+fn take_free(dev: usize, min: u64, max: u64) -> Option<TwoPassBuf> {
     let (gone, picked) = {
         let mut free = FREE_RES.lock().unwrap();
         (free.take_idle(std::time::Instant::now(), FREE_RES_IDLE), free.take(dev, min, max))
     };
     // (let go outside the lock)
     drop(gone);
+    if picked.is_some() {
+        note_two_pass(TP_REUSED);
+    }
     picked
 }
 
@@ -152,7 +215,7 @@ impl<T> Aging<T> {
 }
 
 /// the two-pass buffers of recordings with no known allocator (`hold_res_until_reset`)
-static UNKNOWN_RES: Mutex<Aging<(ID3D12Resource, u64, usize)>> = Mutex::new(Aging::new(UNKNOWN_RES_CAP));
+static UNKNOWN_RES: Mutex<Aging<TwoPassBuf>> = Mutex::new(Aging::new(UNKNOWN_RES_CAP));
 
 /// Buffers the GPU is done with, kept for the recordings that need one next (`FREE_RES`): each
 /// with when it was handed back, its bytes and its device, oldest first. What it keeps is what
@@ -653,7 +716,7 @@ fn indirect_record_need(record_bytes: u64, split: u32) -> u64 {
 /// The record buffer of this list for `need_bytes` (at most `RECORD_MAX`): buffer, address, bytes.
 unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
     let need = record_buffer_bytes(need_bytes);
-    if let Some((buf, cap, _dev)) = with(this, |s| s.res_buf.as_ref().filter(|(_, cap, _)| *cap >= need).cloned()) {
+    if let Some((buf, cap)) = with(this, |s| s.res_buf.as_ref().filter(|b| b.bytes >= need).map(|b| (b.res.clone(), b.bytes))) {
         let va = buf.GetGPUVirtualAddress();
         return Ok((buf, va, cap));
     }
@@ -662,9 +725,9 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
     let picked = take_free(dev_key, need, u64::MAX);
     let entry = match picked {
         Some(e) => e,
-        None => (default_uav_buffer(&dev, need, "two-pass res buffer")?, need, dev_key),
+        None => TwoPassBuf::make(&dev, need, "two-pass res buffer")?,
     };
-    let (buf, cap) = (entry.0.clone(), entry.1);
+    let (buf, cap) = (entry.res.clone(), entry.bytes);
     let va = buf.GetGPUVirtualAddress();
     with(this, |s| {
         if let Some(old) = s.res_buf.replace(entry) {
@@ -807,7 +870,7 @@ unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSigna
 unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, u64), String> {
     let bytes = bytes.next_multiple_of(256);
     if let Some(r) = with(this, |s| {
-        let (b, cap, _) = s.scratch.as_ref()?;
+        let (b, cap) = s.scratch.as_ref()?;
         (s.scratch_used + bytes <= *cap).then(|| {
             s.scratch_used += bytes;
             (b.clone(), s.scratch_used - bytes)
@@ -824,13 +887,13 @@ unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Res
     let picked = take_free(dev_key, size, remaining);
     let block = match picked {
         Some(e) => e,
-        None => (default_uav_buffer(dev, size, "two-pass argument scratch")?, size, dev_key),
+        None => TwoPassBuf::make(dev, size, "two-pass argument scratch")?,
     };
-    let b = block.0.clone();
+    let b = block.res.clone();
     with(this, |s| {
-        s.scratch_taken += block.1;
+        s.scratch_taken += block.bytes;
         s.scratch_used = bytes;
-        s.scratch = Some(block.clone());
+        s.scratch = Some((block.res.clone(), block.bytes));
         s.res_retired.push(block);
     });
     Ok((b, 0))
@@ -2428,10 +2491,10 @@ void main(uint t : SV_GroupIndex) {
             if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
                 return;
             }
-            let buf = default_uav_buffer(&dev.unwrap(), 1 << 16, "test").unwrap();
-            let raw = buf.as_raw() as usize;
-            let kept = |r: usize| UNKNOWN_RES.lock().unwrap().held.iter().any(|h| h.2 .0.as_raw() as usize == r);
-            hold_res_until_reset(0, vec![(buf, 1 << 16, 0)]);
+            let buf = TwoPassBuf::make(&dev.unwrap(), 1 << 16, "test").unwrap();
+            let raw = buf.res.as_raw() as usize;
+            let kept = |r: usize| UNKNOWN_RES.lock().unwrap().held.iter().any(|h| h.2.res.as_raw() as usize == r);
+            hold_res_until_reset(0, vec![buf]);
             assert!(kept(raw), "a buffer of a recording with no allocator is kept");
         }
     }
@@ -2713,13 +2776,14 @@ void main(uint t : SV_GroupIndex) {
         };
         let (from, to) = (0x7600_0001usize as *mut c_void, 0x7600_0002usize as *mut c_void);
         let (old, new) = (0x7600_0010usize, 0x7600_0020usize);
-        let buf = unsafe { default_uav_buffer(&dev, 1 << 16, "record buffer") }.unwrap();
-        let scratch = unsafe { default_uav_buffer(&dev, 1 << 16, "argument scratch") }.unwrap();
+        let record = unsafe { TwoPassBuf::make(&dev, 1 << 16, "record buffer") }.unwrap();
+        let block = unsafe { TwoPassBuf::make(&dev, 1 << 16, "argument scratch") }.unwrap();
+        let (buf, scratch) = (record.res.clone(), block.res.clone());
         with(to, |s| {
             s.allocator = old;
-            s.res_buf = Some((buf.clone(), 1 << 16, 0));
-            s.scratch = Some((scratch.clone(), 1 << 16, 0));
-            s.res_retired.push((scratch.clone(), 1 << 16, 0));
+            s.res_buf = Some(record);
+            s.scratch = Some((scratch.clone(), 1 << 16));
+            s.res_retired.push(block);
             (s.scratch_used, s.scratch_taken) = (256, 1 << 16);
         });
         inherit_for_split(from, to, new);
@@ -2728,7 +2792,7 @@ void main(uint t : SV_GroupIndex) {
             assert!(s.res_buf.is_none() && s.res_retired.is_empty() && s.scratch.is_none(), "fresh buffers for the new recording");
             assert_eq!((s.scratch_used, s.scratch_taken), (0, 0));
         });
-        let held: Vec<usize> = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&old)).unwrap_or_default().iter().map(|b| b.0.as_raw() as usize).collect();
+        let held: Vec<usize> = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&old)).unwrap_or_default().iter().map(|b| b.res.as_raw() as usize).collect();
         assert_eq!(held.len(), 2, "the record buffer and the scratch block wait for the old allocator");
         assert!(held.contains(&(buf.as_raw() as usize)) && held.contains(&(scratch.as_raw() as usize)));
         forget(from);
