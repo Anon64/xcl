@@ -116,14 +116,15 @@ impl Busy {
 
 static BUSY: Busy = Busy(Mutex::new(None));
 
-/// `res` (an adopted resource) holds one reference that is now this module's. With no work in
-/// flight it goes before this returns (the queues pass a fence value at once): a title that
-/// frees the memory under a resource right after its last `Release` finds it unpinned, as
-/// before. Otherwise the thread here lets it go.
-pub unsafe fn hold(res: usize) {
+/// `res` (an adopted resource) holds one reference that is now this module's. With `pinned` (it may
+/// be over pages that are freed next) and no work in flight it goes before this returns (the queues
+/// pass a fence value at once): a title that frees the memory under a resource right after its last
+/// `Release` finds it unpinned, as before. Otherwise the thread here lets it go – the driver takes
+/// ~100 us to end a texture, and a title ends thousands of them when it changes places.
+pub unsafe fn hold(res: usize, pinned: bool) {
     HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
     let start = Instant::now();
-    let busy = BUSY.is(start);
+    let busy = !pinned || BUSY.is(start);
     if !busy {
         drain_known(true);
         while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
@@ -140,7 +141,7 @@ pub unsafe fn hold(res: usize) {
         let n = N[0].fetch_add(1, Ordering::Relaxed) + 1;
         let left = N[1].fetch_add(busy as u64, Ordering::Relaxed) + busy as u64;
         if n.is_power_of_two() && n >= 1024 {
-            crate::xlog_info!("D3D12.X: {n} last releases with work in flight so far, {left} of them left to the thread without a look at the queues");
+            crate::xlog_info!("D3D12.X: {n} last releases left to the thread so far, {left} of them without a look at the queues");
         }
     }
     // A thread of its own lets the held ones go: the title may release a resource and then
