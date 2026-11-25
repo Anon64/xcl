@@ -179,6 +179,25 @@ fn register(res: usize, x: &[u8; 0x38], at: Option<usize>, pc_state: u32) -> boo
             inner.made_in = Some(pc_state);
         }
     }
+    // `XCL_TRACE_FRAME`: the big ones, with where they are – two buffers at one title address
+    // are one memory on the console
+    if key.width >= 1920 && super::present::trace_frame() {
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 96 {
+            crate::xlog_info!(
+                "frame trace: depth buffer with unordered access {res:#x}: {}x{}x{} mips {}, PC format {}, console format {}, {} {:#x}, made in PC state {pc_state:#x}{}",
+                key.width,
+                key.height,
+                key.array,
+                key.mips,
+                key.format,
+                u32_at(x, 0x20),
+                if key.placed { "at title address" } else { "memory of its own, object" },
+                key.at,
+                if BY_ADDRESS.with(std::cell::Cell::get) { " (for a view by address)" } else { "" }
+            );
+        }
+    }
     let gone = match OBJECTS.insert(res, Object { cell, state: pc_state }) {
         None => {
             REGISTERED.fetch_add(1, Ordering::Relaxed);
@@ -263,6 +282,23 @@ pub(super) unsafe fn resolve_uav(dev: *mut c_void, res: *mut c_void, rd: Option<
     // (no twin on a guessed state)
     let Some(o) = OBJECTS.get(res as usize) else { return Resolve::Null("XCL did not see the buffer created") };
     let key = o.cell.key;
+    // `XCL_TRACE_FRAME`: which of the big buffers shaders get a UAV of, and of which plane
+    if key.width >= 1920 && super::present::trace_frame() {
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 96 {
+            crate::xlog_info!(
+                "frame trace: UAV of depth buffer {:#x} ({}x{} PC format {}, console format {}, at {:#x}): view format {}, its {} plane",
+                res as usize,
+                key.width,
+                key.height,
+                key.format,
+                o.cell.console_format,
+                key.at,
+                view.map_or(-1, |v| v.Format.0),
+                if stencil_view(view) { "stencil" } else { "depth" }
+            );
+        }
+    }
     if !matches!(key.format, 19 | 44) || !stencil_view(view) {
         return Resolve::Null("its depth plane has no twin yet");
     }

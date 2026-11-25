@@ -6143,7 +6143,11 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         };
         PSO_LAYOUTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, elems.join(", "));
         static N: AtomicU64 = AtomicU64::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 400 {
+        // (with `XCL_TRACE_FORMATS`, only pipelines that draw into a target of those formats: a
+        // title's menus make the first 400 long before the ones looked for)
+        let formats = super::bind::trace_formats();
+        let wanted = formats.is_empty() || d.RTVFormats[..d.NumRenderTargets.min(8) as usize].iter().any(|f| formats.contains(&f.0));
+        if wanted && N.fetch_add(1, Ordering::Relaxed) < 400 {
             let b = &d.BlendState.RenderTarget[0];
             let z = &d.DepthStencilState;
             crate::xlog_info!(

@@ -1702,8 +1702,7 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize, indirect: bool) {
     // `XCL_TRACE_FORMATS=26,29` (DXGI format numbers): only draws into targets of those formats –
     // the first 160 kinds of a busy frame are its first passes, and the ones looked for (a
     // lighting target's) never got a line
-    static FORMATS: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
-    let formats = FORMATS.get_or_init(|| std::env::var("XCL_TRACE_FORMATS").unwrap_or_default().split(',').filter_map(|f| f.trim().parse().ok()).collect());
+    let formats = trace_formats();
     if !formats.is_empty() && !desc(rt).is_some_and(|d| formats.contains(&d.2)) {
         return;
     }
@@ -1756,6 +1755,13 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize, indirect: bool) {
         static CENSUS: std::sync::Once = std::sync::Once::new();
         CENSUS.call_once(super::console_heap::census);
     }
+}
+
+/// `XCL_TRACE_FORMATS=26,29` (DXGI format numbers): the render target formats the frame trace
+/// keeps to – the kinds of draws it lists, and the pipelines whose state it logs. Empty: all.
+pub(super) fn trace_formats() -> &'static [i32] {
+    static FORMATS: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+    FORMATS.get_or_init(|| std::env::var("XCL_TRACE_FORMATS").unwrap_or_default().split(',').filter_map(|f| f.trim().parse().ok()).collect())
 }
 
 /// `XCL_TRACE_SHADERS=hash,…` (dump hashes, hex): the draws traced with their root arguments
