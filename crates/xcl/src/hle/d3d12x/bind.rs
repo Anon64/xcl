@@ -59,22 +59,85 @@ static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<(ID3D12Resource, u64, usize)>>
 static FREE_RES: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
 
 fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, usize)>) {
-    if bufs.is_empty() || allocator == 0 {
+    if bufs.is_empty() {
+        return;
+    }
+    if allocator == 0 {
+        let over = UNKNOWN_RES.lock().unwrap().hold(std::time::Instant::now(), bufs.into_iter().map(|b| (b.1, b)).collect());
+        if over > 0 {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: two-pass buffers of recordings with no known allocator past {} MiB: {over} of the oldest let go early", UNKNOWN_RES_CAP >> 20);
+            }
+        }
         return;
     }
     ALLOC_RES.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().append(&mut bufs);
 }
 
 pub(super) fn release_allocator_res(allocator: usize) {
-    let Some(bufs) = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) else { return };
+    let aged = UNKNOWN_RES.lock().unwrap().take_older(std::time::Instant::now(), UNKNOWN_RES_AGE);
+    let bufs = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
+    if aged.is_empty() && bufs.is_none() {
+        return;
+    }
     let mut free = FREE_RES.lock().unwrap();
-    for b in bufs {
+    for b in bufs.into_iter().flatten().chain(aged) {
         let held: u64 = free.iter().map(|f| f.1).sum();
         if pool_keeps(free.len(), held, b.1) {
             free.push(b);
         }
     }
 }
+
+/// How long the two-pass buffers of a recording with no known allocator are kept: no fence or
+/// allocator says when the GPU is done with them (a list XCL never saw reset, a segment reset
+/// onto none), so time does – far past any frame in flight.
+const UNKNOWN_RES_AGE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Most bytes of them kept; past it the oldest go early (logged).
+const UNKNOWN_RES_CAP: u64 = 1 << 30;
+
+/// Things of `bytes` each kept from when they were handed over until they are old enough.
+struct Aging<T> {
+    held: std::collections::VecDeque<(std::time::Instant, u64, T)>,
+    bytes: u64,
+    cap: u64,
+}
+
+impl<T> Aging<T> {
+    const fn new(cap: u64) -> Self {
+        Aging { held: std::collections::VecDeque::new(), bytes: 0, cap }
+    }
+
+    /// Keep `items` (bytes, item) from `now`. Past the cap the oldest go (dropped here): how many.
+    fn hold(&mut self, now: std::time::Instant, items: Vec<(u64, T)>) -> usize {
+        for (b, t) in items {
+            self.bytes += b;
+            self.held.push_back((now, b, t));
+        }
+        let mut over = 0;
+        while self.bytes > self.cap && self.held.len() > 1 {
+            let (_, b, _) = self.held.pop_front().unwrap();
+            self.bytes -= b;
+            over += 1;
+        }
+        over
+    }
+
+    /// What has been kept `age` or longer at `now`.
+    fn take_older(&mut self, now: std::time::Instant, age: std::time::Duration) -> Vec<T> {
+        let mut out = Vec::new();
+        while self.held.front().is_some_and(|&(at, _, _)| now.saturating_duration_since(at) >= age) {
+            let (_, b, t) = self.held.pop_front().unwrap();
+            self.bytes -= b;
+            out.push(t);
+        }
+        out
+    }
+}
+
+/// the two-pass buffers of recordings with no known allocator (`hold_res_until_reset`)
+static UNKNOWN_RES: Mutex<Aging<(ID3D12Resource, u64, usize)>> = Mutex::new(Aging::new(UNKNOWN_RES_CAP));
 
 /// Whether `FREE_RES`, holding `count` buffers of `held` bytes, keeps one of `bytes` more.
 fn pool_keeps(count: usize, held: u64, bytes: u64) -> bool {
@@ -2243,6 +2306,43 @@ void main(uint t : SV_GroupIndex) {
         real::forget_pso_for_test(real_ok);
         real::forget_pso_for_test(standin_fail);
         assert!(!real::is_console_compute(standin_fail), "a released pipeline's address does not stay a console one");
+    }
+
+    /// Two-pass buffers of a recording with no known allocator are kept, not dropped at once (the
+    /// GPU may not have run the list), and go once they are 10 s old; past the cap the oldest go.
+    #[test]
+    fn buffers_with_no_allocator_are_kept_until_old_enough() {
+        use std::time::{Duration, Instant};
+        let t = Instant::now();
+        let mut a: Aging<u32> = Aging::new(100);
+        assert_eq!(a.hold(t, vec![(10, 1), (10, 2)]), 0);
+        assert_eq!(a.hold(t + Duration::from_secs(4), vec![(10, 3)]), 0);
+        assert!(a.take_older(t + Duration::from_secs(9), UNKNOWN_RES_AGE).is_empty(), "the list may still run");
+        assert_eq!(a.take_older(t + Duration::from_secs(10), UNKNOWN_RES_AGE), vec![1, 2]);
+        assert_eq!(a.take_older(t + Duration::from_secs(14), UNKNOWN_RES_AGE), vec![3]);
+        assert_eq!(a.bytes, 0);
+        // past the cap: the oldest go, never the one just handed over
+        assert_eq!(a.hold(t, vec![(60, 4)]), 0);
+        assert_eq!(a.hold(t, vec![(60, 5)]), 1);
+        assert_eq!(a.hold(t, vec![(200, 6)]), 1);
+        assert_eq!(a.take_older(t + UNKNOWN_RES_AGE, UNKNOWN_RES_AGE), vec![6]);
+        // through `hold_res_until_reset` with allocator 0: kept, not dropped
+        unsafe {
+            use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+            use windows::Win32::Graphics::Dxgi::*;
+            // (WARP only: no hardware device)
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else { return };
+            let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else { return };
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return;
+            }
+            let buf = default_uav_buffer(&dev.unwrap(), 1 << 16, "test").unwrap();
+            let raw = buf.as_raw() as usize;
+            let kept = |r: usize| UNKNOWN_RES.lock().unwrap().held.iter().any(|h| h.2 .0.as_raw() as usize == r);
+            hold_res_until_reset(0, vec![(buf, 1 << 16, 0)]);
+            assert!(kept(raw), "a buffer of a recording with no allocator is kept");
+        }
     }
 
     /// A draw decides once what its pipeline is, from what `resolve_wait` gave: the stand-in of a
