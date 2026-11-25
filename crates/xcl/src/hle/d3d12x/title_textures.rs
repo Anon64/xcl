@@ -55,6 +55,8 @@ struct Due {
     again: texture_upload::Change,
     /// (`Entry::target`)
     target: bool,
+    /// where its pages are read (`Entry::paged`)
+    pages: Option<Arc<texture_upload::PageMap>>,
 }
 
 struct Entry {
@@ -67,6 +69,9 @@ struct Entry {
     src: usize,
     /// `va` lies in a GPU view: `src` is checked again when that view's mappings change
     in_gpu_view: bool,
+    /// the title mapped pages of a GPU view under it (the queue's page mappings): `src` is `va`,
+    /// and each upload reads its pages where they are kept (`texture_upload::PageMap`)
+    paged: bool,
     tex: Arc<xg::Texture>,
     /// the state the title's submitted work leaves the texture in (uploads leave it there):
     /// the creation state, then what its transitions give – one state for every subresource,
@@ -77,6 +82,10 @@ struct Entry {
     /// the title's GPU work wrote it (CopyTextureRegion into it): its CPU view is stale from
     /// then on and no longer uploaded
     gpu_written: bool,
+    /// the calls of the queue's page mappings made when a list that writes it was last submitted
+    /// (`kernelx::mirrors::calls`): a mapping changed under it by a later call is newer than the
+    /// GPU's write
+    written_call: u64,
     /// backed by shared `vram::Pages` tiles (overlapping placements share video memory)
     placed: bool,
     /// tiles were unmapped after a different-range placement superseded this texture
@@ -128,6 +137,12 @@ static COARSE_GEN: AtomicU64 = AtomicU64::new(0);
 /// the piece (1 MiB) of an address, for `Table::src_pieces`
 const SRC_PIECE_SHIFT: usize = 20;
 
+/// Whether `src` lies in a view window of unified memory: never watched (`Uma::watch_regions`),
+/// so a texture read there (`Entry::paged`) adds no block to `Table::coarse`.
+fn in_view_window(src: usize) -> bool {
+    crate::gpu::uma::get().is_some_and(|u| u.is_view(src))
+}
+
 impl Table {
     const fn new() -> Self {
         Table {
@@ -147,6 +162,9 @@ impl Table {
         for p in (src >> SRC_PIECE_SHIFT)..=((src + size.max(1) - 1) >> SRC_PIECE_SHIFT) {
             self.src_pieces.entry(p).or_default().push(res);
         }
+        if in_view_window(src) {
+            return;
+        }
         for b in (src >> SRC_COARSE_SHIFT)..=((src + size.max(1) - 1) >> SRC_COARSE_SHIFT) {
             let c = self.coarse.entry(b).or_insert(0);
             *c += 1;
@@ -164,6 +182,9 @@ impl Table {
                     self.src_pieces.remove(&p);
                 }
             }
+        }
+        if in_view_window(src) {
+            return;
         }
         for b in (src >> SRC_COARSE_SHIFT)..=((src + size.max(1) - 1) >> SRC_COARSE_SHIFT) {
             let gone = match self.coarse.get_mut(&b) {
@@ -424,8 +445,8 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
-static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+/// cached `watch_ranges` keyed by `watch_key`
+static WATCH_CACHE: Mutex<Option<((u64, u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -479,7 +500,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
     }
-    let src = mirror_source(va);
+    let (src, paged) = source_of(va, tex.size() as usize);
     if src != va {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed) + 1;
@@ -487,16 +508,21 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
             crate::xlog_info!("D3D12.X: a texture at {va:#x} lies in a GPU view of the title's CPU memory: kept in step with {src:#x} ({n} so far)");
         }
     }
+    if paged {
+        note_paged(va);
+    }
     let in_gpu_view = crate::hle::kernelx::mirrors::source(va).is_some();
     let e = Entry {
         device: device as usize,
         va,
         src,
         in_gpu_view,
+        paged,
         tex: Arc::new(tex),
         states: vec![state],
         pending: true,
         gpu_written: false,
+        written_call: 0,
         placed: super::vram::is_placed_texture(res as usize),
         unmapped: false,
         seq: 0,
@@ -529,36 +555,117 @@ fn mirror_source(va: usize) -> usize {
         return va;
     }
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    #[cfg(test)]
+    tests::QUERIES.with(|n| n.set(n.get() + 1));
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let mapped = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
     if mapped { va } else { src }
 }
 
+/// Where a texture at `va` of `size` bytes is read, and whether through a table of its pages: a
+/// texture over pages of a GPU view the queue's page mappings named is read at `va`, each page
+/// where it is kept (no lock of AWAY, no VirtualQuery); any other as `mirror_source` says.
+fn source_of(va: usize, size: usize) -> (usize, bool) {
+    if crate::hle::kernelx::mirrors::touched(va, size) {
+        return (va, true);
+    }
+    (mirror_source(va), false)
+}
+
+/// A texture at `va` is read through the pages the title mapped under it.
+fn note_paged(va: usize) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 2 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: a texture at {va:#x} lies in a GPU view whose pages the title mapped (CopyPageMappingsBatchX): read where each page is kept ({n} so far)");
+    }
+}
+
+/// The pages of the uploads read through a table: [kept elsewhere, kept at the CPU view's same
+/// offset, at that offset never mapped, unmapped] (`kernelx::mirrors::resolve`).
+static PAGE_COUNTS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// What `PAGE_COUNTS` counted so far.
+pub fn page_counts() -> [u64; 4] {
+    PAGE_COUNTS.each_ref().map(|c| c.load(Ordering::Relaxed))
+}
+
+/// The table an upload of the texture at `va` of `size` bytes reads its pages through (None: the
+/// title mapped none of them); `count`: its pages go into `PAGE_COUNTS`.
+fn page_map(va: usize, size: usize, count: bool) -> Option<Arc<texture_upload::PageMap>> {
+    let mut at = Vec::new();
+    let counts = crate::hle::kernelx::mirrors::resolve(va, size, &mut at)?;
+    if count {
+        for (c, n) in PAGE_COUNTS.iter().zip(counts) {
+            c.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+    Some(Arc::new(texture_upload::PageMap::new(va, at)))
+}
+
+/// the changed GPU-view pages of the queue's page mappings a submit takes at most (one upload
+/// batch of them); the rest at the next
+const CHANGED_MAX: usize = BATCH_BYTES / crate::hle::kernelx::mirrors::PAGE;
+
+/// textures read again for a mapping changed under them
+static REREAD: AtomicU64 = AtomicU64::new(0);
+
+/// The textures read again so far because a mapping changed under them.
+pub fn rereads() -> u64 {
+    REREAD.load(Ordering::Relaxed)
+}
+
 /// Physical pages were mapped or unmapped in a GPU view since the last look: textures there
 /// whose source changed (a page now mapped under one, or gone from it) read from the new one,
-/// uploaded again at this submit.
+/// uploaded again at this submit. The pages the queue's page mappings changed go up again in
+/// the textures read through them (`mapping_changed`).
 fn recheck_gpu_view_sources() {
+    use crate::hle::kernelx::mirrors;
     static SEEN: AtomicU64 = AtomicU64::new(0);
+    // (the cursor of the changed pages of the queue's page mappings: one reader, under REFRESH)
+    static PAGES_SEEN: AtomicU64 = AtomicU64::new(0);
     let gen = crate::hle::kernelx::gpu_view_map_gen();
     let seen = SEEN.swap(gen, Ordering::AcqRel);
-    if seen == gen {
+    let (cursor, pages) = mirrors::changes_since(PAGES_SEEN.load(Ordering::Acquire), 0, usize::MAX, CHANGED_MAX);
+    PAGES_SEEN.store(cursor, Ordering::Release);
+    if seen == gen && pages.is_empty() {
         return;
     }
     let mut changed = false;
     // (the shadowed textures too: one comes back when the texture over it goes)
     let mut g = TEXTURES.lock().unwrap();
     let t = &mut *g;
+    // the textures over a changed page: the newest call among their changed pages, and those
+    // pages' bytes of them
+    let mut remapped: BTreeMap<usize, (u64, Vec<(usize, usize)>)> = BTreeMap::new();
+    for &(p, call) in &pages {
+        let end = p + mirrors::PAGE;
+        for (va, r, to) in t.active_overlaps(p, end).into_iter().chain(t.shadowed_overlaps(p, end)) {
+            let e = remapped.entry(r).or_insert((0, Vec::new()));
+            e.0 = e.0.max(call);
+            e.1.push((p.max(va) - va, end.min(to) - va));
+        }
+    }
     // the textures whose source may have changed: those overlapping the ranges whose mappings
     // changed since the last look (all of them when the log of changes has lost some)
-    let names: Option<std::collections::BTreeSet<usize>> = crate::hle::kernelx::gpu_view_map_changes(seen).map(|ranges| {
-        let mut s = std::collections::BTreeSet::new();
-        for (lo, hi) in ranges {
-            s.extend(t.active_overlaps(lo, hi).into_iter().map(|(_, r, _)| r));
-            s.extend(t.shadowed_overlaps(lo, hi).into_iter().map(|(_, r, _)| r));
-        }
+    let names: Option<std::collections::BTreeSet<usize>> = if seen == gen {
+        Some(std::collections::BTreeSet::new())
+    } else {
+        crate::hle::kernelx::gpu_view_map_changes(seen).map(|ranges| {
+            let mut s = std::collections::BTreeSet::new();
+            for (lo, hi) in ranges {
+                s.extend(t.active_overlaps(lo, hi).into_iter().map(|(_, r, _)| r));
+                s.extend(t.shadowed_overlaps(lo, hi).into_iter().map(|(_, r, _)| r));
+            }
+            s
+        })
+    }
+    .map(|mut s| {
+        s.extend(remapped.keys().copied());
         s
     });
     let mut moved: Vec<(usize, usize, usize, usize, bool)> = Vec::new();
+    let mut again: Vec<usize> = Vec::new();
     let Table { by_res, shadowed, .. } = t;
     let mut look = |res: usize, e: &mut Entry, active: bool| {
         let (old, size) = (e.src, e.tex.size() as usize);
@@ -566,6 +673,11 @@ fn recheck_gpu_view_sources() {
             changed = true;
             if active {
                 moved.push((res, old, e.src, size, e.pending));
+            }
+        }
+        if let Some((call, parts)) = remapped.remove(&res) {
+            if mapping_changed(e, call, parts, active) {
+                again.push(res);
             }
         }
     };
@@ -596,9 +708,32 @@ fn recheck_gpu_view_sources() {
         }
     }
     drop(g);
+    if !again.is_empty() {
+        AGAIN.lock().unwrap().extend(again);
+    }
     if changed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
+}
+
+/// The queue's page mappings changed `parts` (from, to) of `e` by call `call`. A texture read
+/// through its pages sends them again with its next upload, as known changes with no comparison
+/// (a clean pool page newly mapped holds bytes the PC texture never had): true, and it goes into
+/// AGAIN. A shadowed one goes up whole once it is uncovered, as on a change of its source. The
+/// GPU's write of a list submitted at or after that call stays; an older one gives way.
+fn mapping_changed(e: &mut Entry, call: u64, parts: Vec<(usize, usize)>, active: bool) -> bool {
+    if !e.paged || e.pending || (e.gpu_written && e.written_call >= call) {
+        return false;
+    }
+    e.gpu_written = false;
+    REREAD.fetch_add(1, Ordering::Relaxed);
+    if !active {
+        e.pending = true;
+        PENDING.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    texture_upload::stale(&e.known, parts);
+    true
 }
 
 /// `e`'s source again (a texture in a GPU view): when it changed, `e` reads the new one and is
@@ -607,11 +742,14 @@ fn recheck_source(e: &mut Entry) -> bool {
     if !e.in_gpu_view {
         return false;
     }
-    let src = mirror_source(e.va);
-    if src == e.src {
+    let (src, paged) = source_of(e.va, e.tex.size() as usize);
+    if src == e.src && paged == e.paged {
         return false;
     }
-    e.src = src;
+    if paged && !e.paged {
+        note_paged(e.va);
+    }
+    (e.src, e.paged) = (src, paged);
     if !e.pending {
         e.pending = true;
         PENDING.fetch_add(1, Ordering::Relaxed);
@@ -624,8 +762,9 @@ fn recheck_source(e: &mut Entry) -> bool {
 /// (a CPU write elsewhere on its pages – a neighbour, an allocator's header – would upload the
 /// stale view over the copy: Fortnite's font atlas is zeros in memory, its glyphs are copied in
 /// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
-/// that copies.
-pub fn note_gpu_write(res: usize) {
+/// that copies. The write counts from the submit of `list`, the PC list that records it (0:
+/// none), on (`submitted`).
+pub fn note_gpu_write(list: usize, res: usize) {
     if super::vram::level_pages() {
         // (a texture whose levels get their pages one by one: all of them before the GPU's write)
         let p = res as *mut c_void;
@@ -635,10 +774,11 @@ pub fn note_gpu_write(res: usize) {
             }
         }
     }
-    let mut marked = false;
+    let (mut marked, mut kept) = (false, false);
     {
         let mut t = TEXTURES.lock().unwrap();
         if let Some(e) = t.get_mut(res) {
+            kept = true;
             if !e.gpu_written {
                 e.gpu_written = true;
                 GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
@@ -649,7 +789,20 @@ pub fn note_gpu_write(res: usize) {
     if marked {
         STREAM_RECHECK.lock().unwrap().remove(&res);
     }
+    // (the stamp is for the queue's page mappings: with them off, a submit takes no lock for it)
+    if kept && list != 0 && crate::hle::kernelx::mirrors::page_mappings() {
+        let mut g = LIST_WRITES.lock().unwrap();
+        let v = g.entry(list).or_default();
+        if !v.contains(&res) {
+            v.push(res);
+        }
+    }
 }
+
+/// PC command list → the textures kept in step its GPU work writes (`note_gpu_write`), since it
+/// was made or last reset: when it is submitted, their GPU write is stamped with the calls of
+/// the queue's page mappings made by then (`Entry::written_call`).
+static LIST_WRITES: Mutex<BTreeMap<usize, Vec<usize>>> = Mutex::new(BTreeMap::new());
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
 
@@ -755,25 +908,34 @@ pub fn note_transitions(list: usize, transitions: &[Transition]) {
     }
 }
 
-/// PC list `list` starts a new recording (made, reset, released): its noted transitions go.
+/// PC list `list` starts a new recording (made, reset, released): its noted transitions and
+/// writes go.
 pub fn list_reset(list: usize) {
-    let mut g = LIST_NOTES.lock().unwrap();
+    {
+        let mut g = LIST_NOTES.lock().unwrap();
+        if !g.is_empty() {
+            g.remove(&list);
+        }
+    }
+    let mut g = LIST_WRITES.lock().unwrap();
     if !g.is_empty() {
         g.remove(&list);
     }
 }
 
 /// The PC lists `lists` were submitted, in this order: the textures kept in step are in the
-/// states their transitions leave them in.
+/// states their transitions leave them in, and those they write are the GPU's from this submit
+/// on (`Entry::written_call`).
 pub fn submitted(lists: &[*mut c_void]) {
     let notes: Vec<Transition> = {
         let g = LIST_NOTES.lock().unwrap();
-        if g.is_empty() {
-            return;
-        }
-        lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().copied().collect()
+        if g.is_empty() { Vec::new() } else { lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().copied().collect() }
     };
-    if notes.is_empty() {
+    let writes: Vec<usize> = {
+        let g = LIST_WRITES.lock().unwrap();
+        if g.is_empty() { Vec::new() } else { lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().copied().collect() }
+    };
+    if notes.is_empty() && writes.is_empty() {
         return;
     }
     let mut t = TEXTURES.lock().unwrap();
@@ -781,6 +943,14 @@ pub fn submitted(lists: &[*mut c_void]) {
         if let Some(e) = t.get_mut(res) {
             let n = subresource_count(&e.tex);
             apply_transition(&mut e.states, n, sub, after);
+        }
+    }
+    if !writes.is_empty() {
+        let call = crate::hle::kernelx::mirrors::calls();
+        for res in writes {
+            if let Some(e) = t.get_mut(res) {
+                (e.gpu_written, e.written_call) = (true, call);
+            }
         }
     }
 }
@@ -818,11 +988,13 @@ thread_local! {
     static WATCH_BUF: std::cell::RefCell<Vec<*mut c_void>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Reusable dirty page list for `refresh_once`.
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Reusable list of the GPU-view pages the dirty pages are written to (`views_of_written`).
+    static TWINS_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// What the watched ranges are made of, as generations.
-fn watch_key() -> (u64, u64, u64) {
-    (super::sparse::mapped_gen(), COARSE_GEN.load(Ordering::Acquire), crate::hle::kernelx::graphics_reservations_gen())
+fn watch_key() -> (u64, u64, u64, u64) {
+    (super::sparse::mapped_gen(), COARSE_GEN.load(Ordering::Acquire), crate::hle::kernelx::graphics_reservations_gen(), crate::hle::kernelx::mirrors::shown_gen())
 }
 
 /// The ranges the last look used, and whether they are still all there is.
@@ -849,6 +1021,8 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // every submit while it loads)
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().coarse.keys().map(|&b| (b << SRC_COARSE_SHIFT, (b + 1) << SRC_COARSE_SHIFT)).collect();
     wanted.extend(super::sparse::mapped_ranges());
+    // (the blocks where the pages the queue's page mappings show are kept: the pool, the CPU view)
+    wanted.extend(crate::hle::kernelx::mirrors::shown_blocks());
     let computed = watch_ranges(&regions, wanted);
     let mut g = WATCH_CACHE.lock().unwrap();
     // (ranges that came out the same stay the same object: `hot_runs` keeps its blocks by it)
@@ -1513,10 +1687,19 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
             // level 0 last)
             let content = |e: &Entry| -> usize {
                 let size = e.tex.size() as usize;
+                // (a texture read through its pages: where they are kept)
+                let pages = if e.paged { page_map(e.va, size, false) } else { None };
+                let mut sample = [0u8; 4096];
                 (0..16usize)
                     .map(|k| e.src + (size.saturating_sub(4096)) * k / 15)
-                    .filter(|&a| crate::gpu::shader::readable(a, 4096))
-                    .map(|a| std::slice::from_raw_parts(a as *const u8, 4096).iter().filter(|&&b| b != 0).count())
+                    .filter(|&a| pages.is_some() || crate::gpu::shader::readable(a, 4096))
+                    .map(|a| match &pages {
+                        Some(m) => {
+                            m.copy(a, &mut sample);
+                            sample.iter().filter(|&&b| b != 0).count()
+                        }
+                        None => std::slice::from_raw_parts(a as *const u8, 4096).iter().filter(|&&b| b != 0).count(),
+                    })
                     .sum()
             };
             let (mut with, mut without) = (0, 0);
@@ -1540,6 +1723,25 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
             super::vram::before_execute(q);
         });
     }
+    // a write where a page the queue's page mappings show is kept is a write to the GPU-view pages
+    // that show it: the textures read through their pages find it by their own range (sparse had
+    // the real addresses above)
+    let dirty_len = if crate::hle::kernelx::mirrors::any_mapped() {
+        DIRTY_BUF.with(|dcell| {
+            let mut dirty = dcell.borrow_mut();
+            TWINS_BUF.with(|tcell| {
+                let mut twins = tcell.borrow_mut();
+                twins.clear();
+                crate::hle::kernelx::mirrors::views_of_written(&dirty, &mut twins);
+                dirty.extend_from_slice(&twins);
+            });
+            dirty.sort_unstable();
+            dirty.dedup();
+            dirty.len()
+        })
+    } else {
+        dirty_len
+    };
     let recheck_frame = {
         let (p, b) = super::present::counters();
         p.max(b)
@@ -1585,7 +1787,9 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| Due { res: r.clone(), device: e.device, src: e.src, tex: Arc::clone(&e.tex), states: e.states.clone(), known: Arc::clone(&e.known), whole, again, target: e.target })
+                // (its pages resolved once, for all reads of this upload)
+                let pages = if e.paged { page_map(e.va, e.tex.size() as usize, true) } else { None };
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| Due { res: r.clone(), device: e.device, src: e.src, tex: Arc::clone(&e.tex), states: e.states.clone(), known: Arc::clone(&e.known), whole, again, target: e.target, pages })
             })
             .collect();
         AGAIN.lock().unwrap().extend(later);
@@ -1696,7 +1900,9 @@ unsafe fn seed_stream_recheck(todo: &[Due], watched: &[(usize, usize)], frame: u
     let mut unsent = Vec::new();
     for d in todo {
         let size = d.tex.size() as usize;
-        if size == 0 || range_is_fully_watched(d.src, size, watched) {
+        // (a texture read through its pages counts as watched: they are found written where they
+        // are kept, and a fingerprint of the view's own address would read zeros)
+        if size == 0 || d.pages.is_some() || range_is_fully_watched(d.src, size, watched) {
             continue;
         }
         // A partial upload sends only the written pages it knows of, or nothing when they are
@@ -1763,7 +1969,7 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
                 Some(e) if e.pending => {}
                 Some(e) => {
                     let size = e.tex.size() as usize;
-                    if range_is_fully_watched(e.src, size, watched) {
+                    if e.paged || range_is_fully_watched(e.src, size, watched) {
                         prune.push(res);
                     } else {
                         check.push((res, e.src, size, prev_fp));
@@ -2032,8 +2238,9 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
                 let (from, to) = (dirty.partition_point(|&p| p + page <= d.src), dirty.partition_point(|&p| p < d.src + size));
                 let mine = &dirty[from..to.max(from)];
                 // (a look takes the blocks written lately: the others' pages of this texture too, or
-                // it would go up in part as it was and in part as it is)
-                let also = if mine.is_empty() || all_hot(d.src, size) { Vec::new() } else { written_pages(d.src, size) };
+                // it would go up in part as it was and in part as it is; not for one read through
+                // its pages, whose own address is not watched)
+                let also = if mine.is_empty() || d.pages.is_some() || all_hot(d.src, size) { Vec::new() } else { written_pages(d.src, size) };
                 if also.iter().all(|p| mine.binary_search(p).is_ok()) {
                     return mine.into();
                 }
@@ -2047,7 +2254,7 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
             .iter()
             .filter(|d| !d.whole)
             .zip(&pages)
-            .map(|(d, pages)| texture_upload::Written { src: d.src, size: d.tex.size() as usize, dirty: pages, known: &d.known })
+            .map(|(d, pages)| texture_upload::Written { src: d.src, size: d.tex.size() as usize, dirty: pages, known: &d.known, pages: d.pages.as_deref() })
             .collect();
         let (changes, compared) = texture_upload::changed(&written, unchanged_skip());
         let same = changes.iter().filter(|c| **c == texture_upload::Change::None).count() as u64;
@@ -2084,7 +2291,7 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
             if super::vram::level_pages() && super::vram::has_lazy_levels(d.res.as_raw() as usize) {
                 // (the queue waits for these mappings before the copies: `vram::before_execute`
                 // below; what a level's fresh pages held is another texture's, so all of it goes up)
-                if !map_levels_with_texels(&d.res, &subresources(d.src, &d.tex)).is_empty() {
+                if !map_levels_with_texels(&d.res, &subresources_in(d.src, &d.tex, d.pages.as_deref())).is_empty() {
                     changed = None;
                 }
                 unmapped = super::vram::has_unmapped_levels(d.res.as_raw() as usize);
@@ -2101,9 +2308,9 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
                 texture_upload::all_sent(&d.known, d.src, d.tex.size() as usize);
             }
             if super::present::trace_frame() {
-                note_content(d.src, &d.res, &subresources(d.src, &d.tex));
+                note_content(d.src, &d.res, &subresources_in(d.src, &d.tex, d.pages.as_deref()));
             }
-            items.push(texture_upload::Item { res: d.res, src: d.src, tex: d.tex, states: d.states, changed, known: Some(Arc::clone(&d.known)) });
+            items.push(texture_upload::Item { res: d.res, src: d.src, tex: d.tex, states: d.states, changed, known: Some(Arc::clone(&d.known)), pages: d.pages });
             known.push(d.known);
         }
         let p = device as *mut c_void;
@@ -2193,7 +2400,7 @@ pub unsafe fn upload_and_wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue, re
     if mem.len() < tex.size() as usize {
         return Err(format!("{} bytes of {}", mem.len(), tex.size()));
     }
-    let item = texture_upload::Item { res: res.clone(), src: mem.as_ptr() as usize, tex, states, changed, known: None };
+    let item = texture_upload::Item { res: res.clone(), src: mem.as_ptr() as usize, tex, states, changed, known: None, pages: None };
     let (failed, job, _) = own_work(|| texture_upload::submit(dev, queue, &[item]))?;
     texture::wait(dev, queue)?;
     job.into_iter().for_each(texture_upload::give_back);
@@ -2255,7 +2462,7 @@ pub unsafe fn probe_gpu_content(res: usize) {
         }
         g.push(res);
     }
-    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().by_res.get(&res).map(|e| (e.device, e.src, Arc::clone(&e.tex), e.gpu_written)) else { return };
+    let Some((device, va, tex, gpu_written, paged)) = TEXTURES.lock().unwrap().by_res.get(&res).map(|e| (e.device, e.src, Arc::clone(&e.tex), e.gpu_written, e.paged)) else { return };
     let d = device as *mut c_void;
     let r = res as *mut c_void;
     let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
@@ -2320,7 +2527,9 @@ pub unsafe fn probe_gpu_content(res: usize) {
         rb.Unmap(0, None);
         Ok(out)
     });
-    let cpu = subresources(va, &tex);
+    // (a texture read through its pages: where they are kept, with a table of its own)
+    let pages = if paged { page_map(va, tex.size() as usize, false) } else { None };
+    let cpu = subresources_in(va, &tex, pages.as_deref());
     match result {
         Ok(gpu) => {
             let nonzero = |b: &[u8]| b.iter().filter(|&&x| x != 0).count();
@@ -2444,6 +2653,17 @@ pub(super) unsafe fn copy_readable(at: usize, to: &mut [u8]) {
     }
 }
 
+/// The bytes at `at` into `to` in one read, all zeros when it fails: for memory committed whole
+/// or not at all (a physical page where it is kept), with no question to Windows about it.
+pub(super) unsafe fn copy_or_zeros(at: usize, to: &mut [u8]) {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut read = 0usize;
+    if ReadProcessMemory(GetCurrentProcess(), at as *const c_void, to.as_mut_ptr() as *mut c_void, to.len(), &mut read) == 0 || read < to.len() {
+        to.fill(0);
+    }
+}
+
 /// The committed, readable regions of `[at, at + to.len())` into `to` (zeros before). A question a
 /// region: `copy_committed_region` finds what is not there by failing at every page of it, 2 calls
 /// a page (a retail title makes its textures before it maps their memory: 13.6 GB of them went up
@@ -2502,17 +2722,32 @@ unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> 
 }
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
+#[cfg(test)]
 pub(super) unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
+    subresources_in(va, tex, None)
+}
+
+/// Every subresource (D3D12 order) of a texture from the title's memory at `va`, read through
+/// `pages` when it has a table of them.
+unsafe fn subresources_in(va: usize, tex: &xg::Texture, pages: Option<&texture_upload::PageMap>) -> Vec<Subresource> {
     let Some(tex) = tex.texels() else { return Vec::new() };
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
+    let bytes = |at: usize, len: usize| match pages {
+        Some(m) => {
+            let mut v = vec![0u8; len];
+            m.copy(at, &mut v);
+            std::borrow::Cow::Owned(v)
+        }
+        None => title_bytes(at, len),
+    };
     if tex.depth > 0 {
-        let mem = title_bytes(va, tex.size() as usize);
+        let mem = bytes(va, tex.size() as usize);
         return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
-        let slice = title_bytes(va + s * c.slice_bytes, c.slice_bytes);
+        let slice = bytes(va + s * c.slice_bytes, c.slice_bytes);
         for (i, l) in c.levels.iter().enumerate() {
             out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
         }
@@ -2529,7 +2764,7 @@ pub(super) mod tests {
     fn r8_item(texture: &ID3D12Resource, value: u8) -> (texture_upload::Item, Vec<u8>) {
         let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 61, 1)).unwrap());
         let mem = vec![value; tex.size() as usize];
-        (texture_upload::Item { res: texture.clone(), src: mem.as_ptr() as usize, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], changed: None, known: None }, mem)
+        (texture_upload::Item { res: texture.clone(), src: mem.as_ptr() as usize, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], changed: None, known: None, pages: None }, mem)
     }
 
     unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> Vec<u8> {
@@ -2874,6 +3109,91 @@ pub(super) mod tests {
             refresh(queue.as_raw());
             assert_eq!(read_r8(dev, &queue, &texture), vec![0x9A; 64 * 64], "unmapping restores the earlier CPU view");
             assert_eq!(address(key), Some(va));
+
+            // the queue's page mappings: a texture registered over a page mapped into the GPU
+            // view reads the pool page, where it is kept
+            struct Pool(Vec<usize>);
+            impl Drop for Pool {
+                fn drop(&mut self) {
+                    unsafe { kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), self.0.len(), self.0.as_mut_ptr()) };
+                }
+            }
+            let (mut n, mut ids) = (2usize, vec![0usize; 2]);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, ids.as_mut_ptr()), 1);
+            let mut pool = Pool(ids);
+            let home = kernelx::MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pool.0.as_mut_ptr()) as usize;
+            assert_ne!(home, 0);
+            std::ptr::write_bytes(home as *mut u8, 0x51, PAGE);
+            std::ptr::write_bytes((home + PAGE) as *mut u8, 0x62, PAGE);
+            let g = va + 4 * PAGE;
+            map_pages(g, &[[0, 0, 1]], home, 2);
+            let mut paged = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut paged,
+            ).unwrap();
+            let paged: ID3D12Resource = paged.unwrap();
+            register(raw_device, paged.as_raw(), g, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            let _paged = RegisteredTexture(paged.as_raw() as usize);
+            assert!(TEXTURES.lock().unwrap().by_res.get(&(paged.as_raw() as usize)).is_some_and(|e| e.paged && e.src == g));
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x51; 64 * 64], "the pool page mapped there");
+            // a mapping that changes under it: a pool page written and looked at before it was
+            // mapped, with no write since; the same bytes in another page; an unmap
+            map_pages(g, &[[0, 1, 1]], home, 2);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x62; 64 * 64], "a clean pool page newly mapped");
+            std::ptr::write_bytes(home as *mut u8, 0x62, PAGE);
+            let reread = rereads();
+            map_pages(g, &[[0, 0, 1]], home, 2);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x62; 64 * 64], "equal bytes in the old and the new page");
+            assert!(rereads() > reread, "read again for the mapping, equal bytes or not");
+            map_pages(g, &[[2, 0, 1]], home, 2);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0; 64 * 64], "unmapped: nothing");
+            map_pages(g, &[[0, 1, 1]], home, 2);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x62; 64 * 64]);
+            // writes where the page is kept: in the pool; just before the page moves into the CPU
+            // view, with no look in between; where it is kept after that; by its page number
+            // (`mark_hot`: the looks take those blocks now, not once the walk finds them)
+            std::ptr::write_bytes((home + PAGE) as *mut u8, 0x73, PAGE);
+            mark_hot(home, 2 * PAGE);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x73; 64 * 64], "a write to the pool page");
+            std::ptr::write_bytes((home + PAGE) as *mut u8, 0x84, PAGE);
+            let kept = src + 6 * PAGE;
+            let mut one = [pool.0[1]];
+            assert_eq!(kernelx::MapTitlePhysicalPages(kept as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, kept);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x84; 64 * 64], "a write made just before the page moved");
+            std::ptr::write_bytes(kept as *mut u8, 0x95, PAGE);
+            mark_hot(kept, PAGE);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x95; 64 * 64], "a write where the page is kept now");
+            assert!(kernelx::write_physical_pages(&[pool.0[1]], 0, &[0xA6; PAGE]));
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0xA6; 64 * 64], "a write by page number");
+            // the GPU's write of a submitted list stays over a CPU write, and gives way to a later
+            // mapping; a CPU write after that goes up
+            let list = 0x7E57_0000_8000usize;
+            note_gpu_write(list, paged.as_raw() as usize);
+            submitted(&[list as *mut c_void]);
+            std::ptr::write_bytes(kept as *mut u8, 0xB7, PAGE);
+            mark_hot(kept, PAGE);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0xA6; 64 * 64], "the GPU's");
+            map_pages(g, &[[0, 0, 1]], home, 2);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0x62; 64 * 64], "a later mapping takes it back");
+            std::ptr::write_bytes(home as *mut u8, 0xC8, PAGE);
+            mark_hot(home, PAGE);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &paged), vec![0xC8; 64 * 64], "and a CPU write after it goes up");
+            list_reset(list);
+            assert_eq!(kernelx::MapTitlePhysicalPages(kept as *mut c_void, 1, 0, 4, std::ptr::null_mut()) as usize, kept);
             dev.GetDeviceRemovedReason().unwrap();
         }
     }
@@ -2907,7 +3227,7 @@ pub(super) mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0, known: Default::default(), target: false };
+            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, paged: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, written_call: 0, placed: false, unmapped: false, seq: 0, known: Default::default(), target: false };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -2927,6 +3247,196 @@ pub(super) mod tests {
             VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
             assert_eq!(after, at);
             assert_eq!(before, at, "a page mapped at the address but not used yet is its source too");
+        }
+    }
+
+    thread_local! {
+        /// the VirtualQuery calls `mirror_source` made on this thread
+        pub(super) static QUERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// One call of the queue's page-mapping method: `ranges` (kind, start, count) from GPU-view
+    /// address `dest` on, in the pool of `pages` pages at `pool`.
+    unsafe fn map_pages(dest: usize, ranges: &[[u32; 3]], pool: usize, pages: u32) {
+        // (a batch: the first destination, the number of ranges, a pointer to them)
+        let batch = [dest as u64, ranges.len() as u64, ranges.as_ptr() as u64];
+        assert!(crate::hle::kernelx::mirrors::apply_batches(1, batch.as_ptr() as usize, pool, pages).is_some());
+    }
+
+    /// A pair of views of `size` bytes (a size of the test's own: no other test's views pair with
+    /// these) and `n` physical pages of the title at their home, the pool: (CPU view, GPU view,
+    /// the pages, their home).
+    unsafe fn paged_views(size: usize, n: usize) -> (usize, usize, Vec<usize>, usize) {
+        use crate::hle::kernelx::{self, mirrors};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_READWRITE};
+        let cpu = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+        let gpu = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+        assert!(cpu != 0 && gpu != 0);
+        mirrors::reserved(cpu, size, 0x2040_2000, 0x04);
+        assert!(mirrors::reserved(gpu, size, 0x2040_2000, 0x801));
+        let (mut k, mut pages) = (n, vec![0usize; n]);
+        assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut k, pages.as_mut_ptr()), 1);
+        let home = kernelx::MapTitlePhysicalPages(std::ptr::null_mut(), n, 0, 4, pages.as_mut_ptr()) as usize;
+        assert_ne!(home, 0);
+        (cpu, gpu, pages, home)
+    }
+
+    /// The pages and the views of `paged_views` go.
+    unsafe fn drop_paged_views(cpu: usize, gpu: usize, mut pages: Vec<usize>) {
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+        crate::hle::kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), pages.len(), pages.as_mut_ptr());
+        crate::hle::kernelx::mirrors::released(cpu);
+        VirtualFree(cpu as *mut c_void, 0, MEM_RELEASE);
+        VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
+    }
+
+    /// A texture over GPU-view pages the queue's page mappings named is read at its own address
+    /// through a table of where each page is kept, found with no VirtualQuery; one over pages
+    /// never named takes the CPU view, as before. The table counts its pages by kind.
+    #[test]
+    fn a_texture_over_mapped_pages_is_read_where_they_are_kept() {
+        use crate::hle::kernelx::mirrors::PAGE;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
+            let (cpu, gpu, pages, home) = paged_views(179 * PAGE, 2);
+            std::ptr::write_bytes(home as *mut u8, 0x5A, PAGE);
+            assert_eq!(VirtualAlloc(cpu as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, cpu);
+            std::ptr::write_bytes(cpu as *mut u8, 0x77, PAGE);
+            // pool page 0 at view page 1, view page 2 unmapped
+            map_pages(gpu + PAGE, &[[0, 0, 1], [2, 0, 1]], home, 2);
+            let queries = || QUERIES.with(|n| n.get());
+            let q = queries();
+            assert_eq!(source_of(gpu + PAGE + 0x100, 0x4000), (gpu + PAGE + 0x100, true), "over a mapped page: its own address");
+            assert_eq!(source_of(gpu + 2 * PAGE, 0x4000), (gpu + 2 * PAGE, true), "over an unmapped one too");
+            assert_eq!(queries(), q, "no VirtualQuery");
+            assert_eq!(source_of(gpu + 5 * PAGE, 0x4000), (cpu + 5 * PAGE, false), "never named: the CPU view, as before");
+            assert_eq!(queries(), q + 1);
+            // a texture over view pages 0 to 3: never named, kept at the pool, nothing, never named
+            let before = page_counts();
+            let m = page_map(gpu + PAGE - 0x2000, 2 * PAGE + 0x4000, true).expect("a table");
+            let after = page_counts();
+            assert_eq!(std::array::from_fn::<u64, 4, _>(|k| after[k] - before[k]), [1, 0, 2, 1]);
+            assert!(page_map(gpu + PAGE, 0x4000, false).is_some() && page_counts() == after, "a table of its own is not counted");
+            assert!(page_map(gpu + 10 * PAGE, PAGE, true).is_none(), "no page named");
+            let mut b = vec![0xEEu8; 3 * PAGE];
+            m.copy(gpu, &mut b);
+            assert!(b[..PAGE].iter().all(|&x| x == 0x77), "the CPU view under a page never named");
+            assert!(b[PAGE..2 * PAGE].iter().all(|&x| x == 0x5A), "the pool page where it is kept");
+            assert!(b[2 * PAGE..].iter().all(|&x| x == 0), "nothing");
+            drop_paged_views(cpu, gpu, pages);
+        }
+    }
+
+    /// The GPU's write of a texture read through its pages counts from the submit of the list
+    /// that records it: a mapping changed by a later call takes the texture back (its pages go up
+    /// again as they are), one changed before that submit leaves it the GPU's – a list recorded
+    /// before the call and submitted after it, a list submitted again – and a list reset writes
+    /// nothing more.
+    #[test]
+    fn a_gpu_write_counts_from_the_submit_of_its_list() {
+        use crate::hle::kernelx::mirrors::{self, PAGE};
+        use texture_upload::{Again, Change};
+        let _guard = TEST_LOCK.lock().unwrap();
+        // (no submit looks while a texture of no resource is in the table)
+        let _refresh = REFRESH.lock().unwrap();
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
+            let (cpu, gpu, pages, home) = paged_views(181 * PAGE, 2);
+            map_pages(gpu, &[[0, 0, 1]], home, 2);
+            recheck_gpu_view_sources();
+            let tex = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+            assert_eq!(tex.size() as usize, PAGE);
+            // a key of no resource, never dereferenced
+            let res = 0x7E57_0000_5000usize;
+            let known: texture_upload::Known = Default::default();
+            texture_upload::all_sent(&known, gpu, PAGE);
+            let e = Entry { device: 0, va: gpu, src: gpu, in_gpu_view: true, paged: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, written_call: 0, placed: false, unmapped: false, seq: 0, known: Arc::clone(&known), target: false };
+            TEXTURES.lock().unwrap().insert(res, e);
+            TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
+            let state = || TEXTURES.lock().unwrap().by_res.get(&res).map(|e| (e.gpu_written, e.written_call)).unwrap();
+            let again = || (AGAIN.lock().unwrap().remove(&res), texture_upload::take_again(&known, 0, 0));
+            let page_again = || (true, Again::Now(Change::Parts(vec![(0, PAGE)])));
+            let (l1, l2) = (0x7E57_0000_6000usize, 0x7E57_0000_7000usize);
+
+            // recorded before a call, submitted after it
+            note_gpu_write(l1, res);
+            assert_eq!(state(), (true, 0), "marked as it is recorded");
+            map_pages(gpu, &[[0, 1, 1]], home, 2);
+            let c1 = mirrors::calls();
+            submitted(&[l1 as *mut c_void]);
+            assert!(state().1 >= c1, "stamped at its submit");
+            recheck_gpu_view_sources();
+            assert!(state().0, "the GPU's write came after the mapping");
+            assert_eq!(again(), (false, Again::Nothing));
+            // a mapping changed by a later call takes it back
+            map_pages(gpu, &[[2, 0, 1]], home, 2);
+            recheck_gpu_view_sources();
+            assert!(!state().0, "an older GPU write gives way");
+            assert_eq!(again(), page_again(), "the page goes up again as it is, with no comparison");
+            // a list submitted before a call and again after it
+            note_gpu_write(l2, res);
+            submitted(&[l2 as *mut c_void]);
+            map_pages(gpu, &[[0, 0, 1]], home, 2);
+            submitted(&[l1 as *mut c_void, l2 as *mut c_void]);
+            recheck_gpu_view_sources();
+            assert!(state().0, "the second submit came after the mapping");
+            assert_eq!(again(), (false, Again::Nothing));
+            // a list reset writes nothing at its next submit
+            list_reset(l1);
+            list_reset(l2);
+            map_pages(gpu, &[[0, 1, 1]], home, 2);
+            submitted(&[l1 as *mut c_void, l2 as *mut c_void]);
+            recheck_gpu_view_sources();
+            assert!(!state().0);
+            assert_eq!(again(), page_again());
+            forget(res);
+            drop_paged_views(cpu, gpu, pages);
+        }
+    }
+
+    /// A texture read through its pages finds its written pages through the GPU-view pages a
+    /// write reaches: a write where a mapped page is kept, and one in the CPU view under a page
+    /// the queue's page mappings never named; those that differ from what went up are sent.
+    #[test]
+    fn an_untouched_page_of_a_paged_texture_is_found_written() {
+        use crate::hle::kernelx::mirrors::{views_of_written, PAGE};
+        use texture_upload::{Change, Written};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
+            let (cpu, gpu, pages, home) = paged_views(191 * PAGE, 1);
+            assert_eq!(VirtualAlloc((cpu + PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, cpu + PAGE);
+            std::ptr::write_bytes(home as *mut u8, 0x21, PAGE);
+            std::ptr::write_bytes((cpu + PAGE) as *mut u8, 0x43, PAGE);
+            // a texture over view pages 0 (the pool page mapped there) and 1 (never named)
+            map_pages(gpu, &[[0, 0, 1]], home, 1);
+            let m = page_map(gpu, 2 * PAGE, false).expect("a table");
+            let known: texture_upload::Known = Default::default();
+            texture_upload::all_sent(&known, gpu, 2 * PAGE);
+            let compare = |dirty: &[usize]| texture_upload::changed(&[Written { src: gpu, size: 2 * PAGE, dirty, known: &known, pages: Some(&m) }], true).0.remove(0);
+            let all: Vec<usize> = (0..2 * PAGE / 0x1000).map(|k| gpu + k * 0x1000).collect();
+            assert_eq!(compare(&all), Change::Parts(vec![(0, 2 * PAGE)]), "nothing was known of it");
+            // a write where the mapped page is kept, and one in the CPU view under the other page
+            let (a, b) = (home + 0x2000, cpu + PAGE + 0x3000);
+            let mut written = vec![a, b];
+            written.sort_unstable();
+            let look = |written: &[usize]| {
+                let mut twins = Vec::new();
+                views_of_written(written, &mut twins);
+                twins.sort_unstable();
+                twins.dedup();
+                assert!(twins.contains(&(gpu + 0x2000)) && twins.contains(&(gpu + PAGE + 0x3000)), "{twins:x?}");
+                compare(&twins)
+            };
+            assert_eq!(look(&written), Change::None, "they hold what went up");
+            *(a as *mut u8) ^= 1;
+            *(b as *mut u8) ^= 1;
+            assert_eq!(look(&written), Change::Parts(vec![(0x2000, 0x3000), (PAGE + 0x3000, PAGE + 0x4000)]));
+            assert_eq!(look(&written), Change::None);
+            drop_paged_views(cpu, gpu, pages);
         }
     }
 
@@ -3087,7 +3597,7 @@ pub(super) mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0, known: Default::default(), target: false });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, paged: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, written_call: 0, placed: false, unmapped: false, seq: 0, known: Default::default(), target: false });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -3198,10 +3708,12 @@ pub(super) mod tests {
             va,
             src: va,
             in_gpu_view: false,
+            paged: false,
             tex: Arc::clone(tex),
             states: vec![D3D12_RESOURCE_STATE_COMMON],
             pending,
             gpu_written: false,
+            written_call: 0,
             placed,
             unmapped: false,
             seq: 0,
@@ -3586,10 +4098,12 @@ pub(super) mod tests {
             va,
             src: va,
             in_gpu_view: false,
+            paged: false,
             tex: Arc::clone(&tex),
             states: vec![D3D12_RESOURCE_STATE_COMMON],
             pending: false,
             gpu_written: false,
+            written_call: 0,
             placed: false,
             unmapped: false,
             seq: 0,
@@ -3601,10 +4115,12 @@ pub(super) mod tests {
             va: va + size,
             src: va,
             in_gpu_view: false,
+            paged: false,
             tex: Arc::clone(&tex),
             states: vec![D3D12_RESOURCE_STATE_COMMON],
             pending: false,
             gpu_written: true,
+            written_call: 0,
             placed: false,
             unmapped: false,
             seq: 0,
@@ -3709,10 +4225,12 @@ pub(super) mod tests {
                 va,
                 src: va,
                 in_gpu_view: false,
+                paged: false,
                 tex: Arc::clone(&tex),
                 states: vec![D3D12_RESOURCE_STATE_COMMON],
                 pending: false,
                 gpu_written: false,
+                written_call: 0,
                 placed: false,
                 unmapped: false,
                 seq: 0,
@@ -3734,6 +4252,7 @@ pub(super) mod tests {
                 whole,
                 again: texture_upload::Change::None,
                 target: false,
+                pages: None,
             };
 
             // The whole upload at frame 0 sets the baseline.
@@ -3814,10 +4333,12 @@ pub(super) mod tests {
                 va,
                 src: va,
                 in_gpu_view: false,
+                paged: false,
                 tex: Arc::clone(&tex),
                 states: vec![D3D12_RESOURCE_STATE_COMMON],
                 pending: false,
                 gpu_written: false,
+                written_call: 0,
                 placed: false,
                 unmapped: false,
                 seq: 0,
@@ -3839,6 +4360,7 @@ pub(super) mod tests {
                 whole,
                 again: texture_upload::Change::None,
                 target: false,
+                pages: None,
             };
             let pending = || TEXTURES.lock().unwrap().by_res.get(&res_id).unwrap().pending;
             let entry = || STREAM_RECHECK.lock().unwrap().get(&res_id).copied();
@@ -4017,7 +4539,7 @@ pub(super) mod tests {
             }
             // what the GPU writes needs pages under all of the texture: the first one's mip 0 gets
             // the pages of its address, which hold what the second one's upload put there
-            note_gpu_write(small.as_raw() as usize);
+            note_gpu_write(0, small.as_raw() as usize);
             assert_eq!(dev_pages() - p0, (all as usize) << 16, "the same pages");
             assert!(read_sub(&small, 0) == want[0].data, "a GPU-written texture has pages under all its levels");
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);

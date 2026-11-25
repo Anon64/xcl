@@ -8394,6 +8394,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        29 if crate::hle::kernelx::mirrors::page_mappings() => q_copy_page_mappings(a1 as u32, a2, a3, a4 as u32) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
@@ -8439,6 +8440,59 @@ macro_rules! queue_slots {
     };
 }
 queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
+
+/// The calls of the queue's page-mapping method recorded so far and what they did, summed, and
+/// when their line was logged last.
+static PAGE_MAPPINGS: Mutex<(u64, crate::hle::kernelx::mirrors::Mapped, Option<std::time::Instant>)> =
+    Mutex::new((0, crate::hle::kernelx::mirrors::Mapped { mapped: 0, unmapped: 0, empty: 0, elsewhere: 0 }, None));
+
+/// What the queue's page mappings did so far: `n` calls with the totals `t`, the last one's
+/// pool, then the view pages that followed their physical page (`moved`), the textures read
+/// again for a mapping changed under them (`reread`), the pages of their uploads by where they
+/// were read (`pages`: `title_textures::page_counts`) and the GPU-view tiles linked again
+/// (`tiles`: `sparse::page_tiles`).
+fn page_mapping_line(n: u64, t: crate::hle::kernelx::mirrors::Mapped, pool: usize, pool_pages: u32, moved: u64, reread: u64, pages: [u64; 4], tiles: [u64; 2]) -> String {
+    let [a, b, c, z] = pages;
+    format!(
+        "D3D12.X: queue CopyPageMappingsBatchX: {n} calls; GPU-view pages so far: {} mapped, {} unmapped, {} named a pool page with no page mapped there, {} elsewhere ignored (pool {pool:#x}, {pool_pages} pages of 64 KiB); {moved} moved with their physical page; textures: {reread} read again for a mapping changed under them, pages of their uploads: {a} where the mapping put the page, {b} at the CPU view's same offset, {c} at that offset never mapped, {z} unmapped; tiles: {} shown anew, {} followed their page",
+        t.mapped, t.unmapped, t.empty, t.elsewhere, tiles[0], tiles[1]
+    )
+}
+
+/// command queue #29 (#31 in the newer layout) `CopyPageMappingsBatchX(count, batches, pool,
+/// pool pages, flags)`: the title maps pages of its memory into GPU views – a retail game the
+/// pages its texture streaming fills into the GPU views its textures are in. Each GPU-view page
+/// it names shows the physical page mapped at its pool page from here on
+/// (`kernelx::mirrors::apply_batches`); as a stub every mapping was dropped and the view showed
+/// its CPU view (#1031). S_OK always, as the stub (what the title does with it is not known);
+/// the fifth argument does not reach `queue_dispatch`.
+unsafe fn q_copy_page_mappings(count: u32, batches: usize, pool: usize, pool_pages: u32) -> HRESULT {
+    match crate::hle::kernelx::mirrors::apply_batches(count, batches, pool, pool_pages) {
+        Some(d) => {
+            let mut t = PAGE_MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
+            t.0 += 1;
+            t.1.mapped += d.mapped;
+            t.1.unmapped += d.unmapped;
+            t.1.empty += d.empty;
+            t.1.elsewhere += d.elsewhere;
+            // at the first call, at powers of two and when 10 s have passed since the last line
+            let now = std::time::Instant::now();
+            if t.0 == 1 || t.0.is_power_of_two() || t.2.map_or(true, |l| now.duration_since(l).as_secs() >= 10) {
+                t.2 = Some(now);
+                let (n, total) = (t.0, t.1);
+                drop(t);
+                use crate::hle::kernelx::mirrors;
+                let line = page_mapping_line(n, total, pool, pool_pages, mirrors::moved_pages(), super::title_textures::rereads(), super::title_textures::page_counts(), super::sparse::page_tiles());
+                crate::xlog_info!("{line}");
+            }
+        }
+        None => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("D3D12.X: queue CopyPageMappingsBatchX({count}, {batches:#x}, {pool:#x}, {pool_pages}): a batch or range is unreadable or leaves the pool – the call is ignored"));
+        }
+    }
+    S_OK
+}
 
 /// command queue #23 SignalX(fence, value, flush flags): Signal with the console's cache flush
 /// options – the PC's Signal makes the queue's writes visible itself. (A stub that signalled
@@ -9537,6 +9591,56 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
+    }
+
+    /// The queue's page-mapping method records the pages of a GPU view it names and returns
+    /// S_OK; a call it refuses records nothing and returns S_OK too. XCL_PAGE_MAPPINGS=0, and
+    /// only that, turns it off.
+    #[test]
+    fn the_queue_page_mapping_method_records_and_can_be_switched_off() {
+        use crate::hle::kernelx::mirrors::{self, Shows, PAGE};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        assert!(mirrors::page_mappings_on(None) && mirrors::page_mappings_on(Some("1")));
+        assert!(!mirrors::page_mappings_on(Some("0")));
+        unsafe {
+            // a pair of views of a size of the test's own (no other test's views pair with these)
+            let size = 197 * PAGE;
+            let cpu = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let gpu = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(cpu != 0 && gpu != 0);
+            mirrors::reserved(cpu, size, 0x2040_2000, 0x04);
+            assert!(mirrors::reserved(gpu, size, 0x2040_2000, 0x801));
+            // (no page of the title is mapped in this pool: a pool page named shows nothing)
+            let pool = cpu + 100 * PAGE;
+            let calls = mirrors::calls();
+            // pool page 0 at view page 1, view page 2 unmapped (batch: destination, ranges, pointer)
+            let ranges: [[u32; 3]; 2] = [[0, 0, 1], [2, 0, 1]];
+            let batch = [(gpu + PAGE) as u64, 2, ranges.as_ptr() as u64];
+            assert_eq!(q_copy_page_mappings(1, batch.as_ptr() as usize, pool, 4), S_OK);
+            assert!(mirrors::calls() > calls, "the call is recorded");
+            assert_eq!(mirrors::shows(gpu), Shows::Same(cpu), "a page not named shows its CPU view");
+            assert_eq!(mirrors::shows(gpu + PAGE + 0x10), Shows::Nothing);
+            assert_eq!(mirrors::shows(gpu + 2 * PAGE), Shows::Nothing);
+            // a range of an unknown kind after a good one: nothing of the call is recorded
+            let ranges: [[u32; 3]; 2] = [[2, 0, 1], [7, 0, 1]];
+            let batch = [(gpu + 3 * PAGE) as u64, 2, ranges.as_ptr() as u64];
+            assert_eq!(q_copy_page_mappings(1, batch.as_ptr() as usize, pool, 4), S_OK);
+            assert_eq!(mirrors::shows(gpu + 3 * PAGE), Shows::Same(cpu + 3 * PAGE), "a refused call changes nothing");
+            mirrors::released(cpu);
+            assert_eq!(mirrors::shows(gpu + PAGE), Shows::NoView);
+            VirtualFree(cpu as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// The line of the queue's page mappings says each count in its place.
+    #[test]
+    fn the_page_mapping_line() {
+        let t = crate::hle::kernelx::mirrors::Mapped { mapped: 30, unmapped: 4, empty: 0, elsewhere: 2 };
+        assert_eq!(
+            page_mapping_line(8, t, 0x7200_0000_0000, 99776, 5, 6, [7, 8, 9, 10], [11, 12]),
+            "D3D12.X: queue CopyPageMappingsBatchX: 8 calls; GPU-view pages so far: 30 mapped, 4 unmapped, 0 named a pool page with no page mapped there, 2 elsewhere ignored (pool 0x720000000000, 99776 pages of 64 KiB); 5 moved with their physical page; textures: 6 read again for a mapping changed under them, pages of their uploads: 7 where the mapping put the page, 8 at the CPU view's same offset, 9 at that offset never mapped, 10 unmapped; tiles: 11 shown anew, 12 followed their page"
+        );
     }
 
     /// The newer layout's DispatchMesh (#129) is the older layout's #127, where the two-pass

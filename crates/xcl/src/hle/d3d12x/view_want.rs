@@ -140,6 +140,23 @@ pub fn cpu(va: u64) -> u64 {
     super::sparse::cpu_of(va as usize) as u64
 }
 
+/// The CPU address behind `[va, va + len)` (`cpu`) when the range is one piece there: every later
+/// 64 KiB page of it lies right behind the first (`cpu(b) == cpu(va) + (b - va)` at each page
+/// boundary `b`). None when its pages are kept apart (the queue's page mappings,
+/// `kernelx::mirrors`) or one of them lies outside the GPU view.
+pub fn cpu_run(va: u64, len: u64) -> Option<u64> {
+    let end = va.checked_add(len)?;
+    let c = cpu(va);
+    let mut b = (va | ((1 << TILE_SHIFT) - 1)).checked_add(1)?;
+    while b < end {
+        if cpu(b) != c.wrapping_add(b - va) {
+            return None;
+        }
+        b = b.checked_add(1 << TILE_SHIFT)?;
+    }
+    Some(c)
+}
+
 /// (calls, bytes asked for) of each path so far: the 64 KiB tiles each path asked for first
 /// (`sparse::map_mirror` queued them), not the length of every range given.
 pub fn totals() -> [(u64, u64); PATHS] {
@@ -216,5 +233,27 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// A range of a GPU view is its CPU view's range while the view's pages show the CPU view at
+    /// the same offset; a range running past the view's end is not one piece.
+    #[test]
+    fn a_range_in_a_gpu_view_is_one_piece_only_while_its_pages_are() {
+        use crate::hle::kernelx::mirrors;
+        const SIZE: usize = 157 << 16;
+        // (addresses far above anything Windows hands out: only the pairing is used)
+        let (c, g) = (0x72C0_0000_0000u64, 0x72C8_0000_0000u64);
+        mirrors::reserved(c as usize, SIZE, 0x2040_2000, 0x04);
+        assert!(mirrors::reserved(g as usize, SIZE, 0x2040_2000, 0x801));
+        assert_eq!(cpu_run(g + 0x1_2340, 0x100), Some(c + 0x1_2340), "inside one page");
+        assert_eq!(cpu_run(g + 0x1_fff0, 0x5_0000), Some(c + 0x1_fff0), "across five page boundaries");
+        assert_eq!(cpu_run(g, SIZE as u64), Some(c), "the whole view");
+        assert_eq!(cpu_run(g + 0x40, 0), Some(c + 0x40));
+        assert_eq!(cpu_run(g + SIZE as u64 - 0x100, 0x100), Some(c + SIZE as u64 - 0x100));
+        assert_eq!(cpu_run(g + SIZE as u64 - 0x100, 0x101), None, "past the view's end");
+        assert_eq!(cpu_run(g - 0x10, 0x20), None, "from before the view into it");
+        assert_eq!(cpu_run(u64::MAX - 0x10, 0x20), None, "past the end of the address space");
+        mirrors::released(c as usize);
+        assert_eq!(cpu_run(g + 0x1_fff0, 0x20), Some(g + 0x1_fff0), "unpaired: the address itself");
     }
 }
