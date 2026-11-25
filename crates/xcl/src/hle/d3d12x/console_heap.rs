@@ -142,7 +142,8 @@ unsafe fn copy_views(dev: &ID3D12Device, n: u32, dst: u64, src: u64) {
 /// not updated yet, a sample of weight zero). On the PC the slot would keep a descriptor of a
 /// destroyed resource: a shader that samples it touches an unmapped address.
 struct Names {
-    /// index → the resource its descriptor names (0: none, a null view, or not known); the truth
+    /// index → the resource its descriptor names (0: none, a null view, or not known; `GONE`: the
+    /// null view `resource_gone` wrote there); the truth
     slots: Vec<AtomicUsize>,
     /// resource → indexes that named it (some may name another since: `slots` says)
     by: super::sharded::Sharded<Vec<u32>>,
@@ -157,11 +158,11 @@ impl Names {
         self.slots.get(i as usize).map_or(0, |s| s.load(Relaxed))
     }
 
-    /// The descriptor at `i` names `res` now (0: none). With `SLOT_WRITES` held, along with the
-    /// write of the descriptor.
+    /// The descriptor at `i` names `res` now (0: none; `GONE`: it was made the null view of a
+    /// destroyed resource's). With `SLOT_WRITES` held, along with the write of the descriptor.
     fn note(&self, i: u32, res: usize) {
         let Some(s) = self.slots.get(i as usize) else { return };
-        if s.swap(res, Relaxed) == res || res == 0 {
+        if s.swap(res, Relaxed) == res || res == 0 || res == GONE {
             return;
         }
         self.by.with(res, |v| {
@@ -189,13 +190,18 @@ impl Names {
         self.by.remove(res)
     }
 
-    /// Whether the descriptor at `i` still names `res`: then it names nothing from now on (the
-    /// caller writes a null view there, with `SLOT_WRITES` held). One overwritten since names
-    /// another resource and stays.
+    /// Whether the descriptor at `i` still names `res`: then it is `GONE` from now on (the caller
+    /// writes a null view there, with `SLOT_WRITES` held). One overwritten since names another
+    /// resource and stays.
     fn claim(&self, i: u32, res: usize) -> bool {
-        self.slots.get(i as usize).is_some_and(|s| s.compare_exchange(res, 0, Relaxed, Relaxed).is_ok())
+        self.slots.get(i as usize).is_some_and(|s| s.compare_exchange(res, GONE, Relaxed, Relaxed).is_ok())
     }
 }
+
+/// What `Names` (and `names_of`) give for a descriptor `resource_gone` made a null view. The
+/// title's own CPU-only mirror slot still holds the destroyed resource's view there, so a copy
+/// of that slot writes the null view in the shared heap instead of the mirror's (`publish_range`).
+pub const GONE: usize = usize::MAX;
 
 /// (made with the first view written to the shared heap: 8 bytes an index)
 static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
@@ -742,7 +748,9 @@ pub fn names_of(s: &Slot) -> (usize, usize) {
 
 /// `n` view or sampler slots from `first` were copied (in the title's heap): they go to the shared
 /// heap, a run per page (a heap's pages lie apart there). `names`: what the source view slots' SRV
-/// and UAV name (`names_of`), one pair a slot (none for samplers).
+/// and UAV name (`names_of`), one pair a slot (none for samplers). A source descriptor that is
+/// `GONE` gets the null view in the shared heap, not the copy of the destroyed resource's view
+/// the title's heap still holds.
 pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
     let page_slots = if first.sampler { SAMPLER_PAGE_SLOTS } else { PAGE_SLOTS };
     let step = if first.sampler { SAMPLER_SLOT } else { SLOT };
@@ -753,6 +761,8 @@ pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
         let Some(d) = GLOBAL.lock().unwrap().as_ref().map(|g| g.dev.clone()) else { return };
         Some(d)
     };
+    // the null views, taken before `SLOT_WRITES` when a source descriptor is `GONE`
+    let nulls = if names.iter().any(|&(srv, uav)| srv == GONE || uav == GONE) { null_source() } else { None };
     let mut done = 0;
     while done < n {
         let s = if done == 0 { Some(*first) } else { slot((first.at + (done * step) as usize) as u64) };
@@ -774,8 +784,12 @@ pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
                 let m = self::names();
                 for j in 0..run {
                     let (srv, uav) = names.get((done + j) as usize).copied().unwrap_or((0, 0));
-                    m.note(s.index + 2 * j, srv);
-                    m.note(s.index + 2 * j + 1, uav);
+                    for (i, res) in [(s.index + 2 * j, srv), (s.index + 2 * j + 1, uav)] {
+                        if let Some((ndev, cpu, inc, at)) = nulls.as_ref().filter(|_| res == GONE) {
+                            fill_nulls(ndev, *cpu, *inc, i, i + 1, *at);
+                        }
+                        m.note(i, res);
+                    }
                 }
             }
         }
@@ -1289,7 +1303,7 @@ mod tests {
         let mut claimed: Vec<u32> = n.candidates(a).unwrap().into_iter().filter(|&i| n.claim(i, a)).collect();
         claimed.sort_unstable();
         assert_eq!(claimed, vec![4, 5, 12, 13], "a's views and their copies; not 8 (b's now), not 20 (nulled)");
-        assert_eq!((n.name(4), n.name(8), n.name(12)), (0, b, 0));
+        assert_eq!((n.name(4), n.name(8), n.name(12)), (GONE, b, GONE));
         assert!(n.candidates(a).is_none(), "forgotten");
         // b goes: its one view
         let claimed: Vec<u32> = n.candidates(b).unwrap().into_iter().filter(|&i| n.claim(i, b)).collect();

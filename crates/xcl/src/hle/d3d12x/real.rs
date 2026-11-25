@@ -8921,6 +8921,83 @@ mod descriptor_heap_tests {
             assert!(console_heap_desc(p as usize).is_none(), "released");
         }
     }
+
+    /// A view of a texture in a CPU-only console heap, the texture destroyed (its view in the
+    /// shared heap made the null view), then the slot copied into a shader-visible heap, as from
+    /// a stale material table: the title's own heap still holds the destroyed texture's view, but
+    /// the copy in the shared heap is the null view and is recorded so (`console_heap::GONE`), as
+    /// is a copy of that copy. On WARP, in a process of its own (the shared heap is the process's).
+    #[test]
+    fn a_copy_of_a_destroyed_resources_view_is_the_null_view() {
+        const CHILD: &str = "XCL_TEST_GONE_VIEW_COPY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::real::descriptor_heap_tests::a_copy_of_a_destroyed_resources_view_is_the_null_view", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use super::super::console_heap::{in_global, names_of, slot, start, GONE, SLOT};
+        let Some(dev) = warp_device() else { return crate::gpu::recomp::runner::skip_test("no WARP device") };
+        if crate::gpu::uma::get().is_none() {
+            return crate::gpu::recomp::runner::skip_test("no UMA");
+        }
+        let riid = &ID3D12DescriptorHeap::IID as *const windows::core::GUID as *const GUID;
+        unsafe {
+            let heap = |flags: D3D12_DESCRIPTOR_HEAP_FLAGS| {
+                let d = [D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32, 4, flags.0 as u32, 0];
+                let mut p = std::ptr::null_mut();
+                let hr = dev_create_descriptor_heap_x(dev.as_raw(), &d, riid, &mut p);
+                assert!(hr >= 0 && !p.is_null(), "{hr:#x}");
+                ID3D12DescriptorHeap::from_raw(p)
+            };
+            let (cpu_only, visible) = (heap(D3D12_DESCRIPTOR_HEAP_FLAG_NONE), heap(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE));
+            assert!(in_global(cpu_only.as_raw() as usize) && in_global(visible.as_raw() as usize), "both heaps in the shared heap");
+            // slot 0 of the CPU-only heap, slots 0 and 1 of the shader-visible one
+            let (a, b) = (start(cpu_only.as_raw() as usize).unwrap(), start(visible.as_raw() as usize).unwrap());
+            let c = b + SLOT as u64;
+            let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let mut tex: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut tex).expect("a texture");
+            let tex = tex.unwrap();
+            let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: desc.Format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } },
+            };
+            dev_create_srv_x(dev.as_raw(), tex.as_raw(), &view, a);
+            let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let bytes = |at: u64| std::slice::from_raw_parts(at as *const u8, inc).to_vec();
+            let (sa, sb, sc) = (slot(a).unwrap(), slot(b).unwrap(), slot(c).unwrap());
+            let texture_view = bytes(sa.pc_srv);
+            assert_eq!(bytes(sa.shared_srv), texture_view, "the view in the shared heap");
+            assert_eq!(names_of(&sa).0, tex.as_raw() as usize);
+            resource_ending(tex.as_raw() as usize);
+            let null = bytes(sa.shared_srv);
+            assert_ne!(null, texture_view, "the texture's view in the shared heap is the null view now");
+            assert_eq!(names_of(&sa).0, GONE);
+            assert_eq!(bytes(sa.pc_srv), texture_view, "the title's heap keeps the destroyed texture's view");
+            dev_copy_descriptors_simple_x(dev.as_raw(), 1, b, a, XBOX_EXTRA_CBV_SRV_UAV);
+            assert_eq!(bytes(sb.pc_srv), texture_view, "the title's heap: a copy of what it held");
+            assert_eq!(bytes(sb.shared_srv), null, "the copy in the shared heap: the null view");
+            assert_eq!(names_of(&sb).0, GONE, "recorded as a destroyed resource's null view");
+            dev_copy_descriptors_simple_x(dev.as_raw(), 1, c, b, XBOX_EXTRA_CBV_SRV_UAV);
+            assert_eq!((bytes(sc.shared_srv), names_of(&sc).0), (null, GONE), "a copy of the copy");
+        }
+    }
 }
 
 #[cfg(test)]
