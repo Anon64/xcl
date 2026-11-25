@@ -7577,6 +7577,23 @@ fn only_compute_programs_with_a_loop_read_the_dispatch_loop_budget() {
     assert!(!straight.hlsl.contains("xcl_cap") && !straight.hlsl.contains("xcl_gb") && !straight.hlsl.contains("xcl_budget--"), "{}", straight.hlsl);
 }
 
+/// DXC takes a compute program's loop counts (the GPU test above needs a GPU before it compiles).
+#[test]
+fn compute_loop_counts_compile() {
+    if super::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let cs = super::CsInterface { threads: [8, 4, 2], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    for wave64 in [false, true] {
+        let compute = Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() };
+        for code in [endless_loop_program(), endless_loop_entered_three_times()] {
+            let t = translate(&code, &compute).unwrap();
+            assert!(t.hlsl.contains("xcl_cap;"), "{}", t.hlsl);
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("wave64 {wave64}: {e}\n{}", t.hlsl));
+        }
+    }
+}
+
 /// A compute program's loop that never meets its exit runs the passes its dispatch gives one
 /// entry of a loop: `IO_LOOP_BUDGET` among the group's threads, between 1024 and 65 536 a
 /// lane, the same in every thread (both halves of a split wave64). A dispatch that does not
