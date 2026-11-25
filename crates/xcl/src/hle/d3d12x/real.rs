@@ -10673,6 +10673,11 @@ mod depth_uav_twin_tests {
             String::from_utf8_lossy(&output.stderr)
         );
         print!("{}", String::from_utf8_lossy(&output.stdout));
+        // a skip in the child is a skip of this test: its line goes where the suite's skips go
+        use std::io::Write;
+        for l in String::from_utf8_lossy(&output.stderr).lines().filter(|l| l.starts_with("SKIPPED")) {
+            let _ = writeln!(std::io::stderr(), "{l}");
+        }
         false
     }
 
