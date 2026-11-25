@@ -116,6 +116,13 @@ pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Resul
 /// A geometry-mode (ES+GS) program: the compute pass that writes one mesh record per
 /// group of 21 triangles into `res` (the recompiler's `Mode::Geometry`). Always wave64.
 pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Result<Kernel, String> {
+    // The split form's ES phase runs in both hardware halves (`Partner::Present`): every ballot
+    // and lane read meets at a group barrier, the pattern that hung NVIDIA GPUs (#1727). The
+    // HLSL path's exchange spins by default: such a pass is left to it (`XCL_SAFE_BARRIER=0`:
+    // as before). The GS alone runs in the lower half without a partner.
+    if o.split && g.gs_start != Some(0) && crate::gpu::recomp::emit::safe_barrier_wanted() {
+        return Err("split wave64 geometry: the ES phase exchanges at group barriers".into());
+    }
     translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None)
 }
 

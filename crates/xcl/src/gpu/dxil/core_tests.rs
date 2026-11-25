@@ -372,7 +372,19 @@ fn geometry_mode_validates() {
     for (name, code, g) in cases {
         for split in [true, false] {
             let o = KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
-            super::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{name} split {split}: {}", &e[..e.len().min(3000)]));
+            match super::kernel::translate_geometry(&code, o, &g) {
+                Ok(_) => {}
+                // a split pass with an ES phase is left to the HLSL path (the safe barrier):
+                // complete there, and DXC compiles it
+                Err(e) if e.contains("split wave64 geometry: the ES phase exchanges at group barriers") => {
+                    let t = crate::gpu::recomp::translate_geometry(&code, g.clone(), true, 1).unwrap_or_else(|e| panic!("{name} HLSL: {e}"));
+                    assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
+                    if crate::gpu::recomp::dxc::location().is_ok() {
+                        crate::gpu::recomp::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{name} HLSL: {e}"));
+                    }
+                }
+                Err(e) => panic!("{name} split {split}: {}", &e[..e.len().min(3000)]),
+            }
         }
     }
 }
