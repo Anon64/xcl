@@ -4,7 +4,7 @@
 //! pipeline (shaders that draw nothing) at once and the real one is built on a worker; binding
 //! (`SetPipelineState`, console list replay, the two-pass lookups) uses the real one as soon
 //! as it is there. A lazy pipeline (`lazy`) is built at its first use or ahead of it
-//! (`Backlog`: every graphics one, at the lowest priority). A draw or dispatch with a pipeline
+//! (`Backlog`: every one, at the lowest priority). A draw or dispatch with a pipeline
 //! still being built waits for it (`resolve_wait`): a dispatch until it is built (a skipped one
 //! corrupts what it computes) unless `XCL_CS_PSO_WAIT_MS` limits that, a draw only while its
 //! thread has waited less than `XCL_GFX_PSO_WAIT_MS` in the last second when that is set
@@ -389,8 +389,8 @@ pub fn lazy() -> bool {
 
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`) – and built ahead of it
 /// at the lowest priority (`Backlog`): first when an earlier run used a pipeline of these
-/// shaders (`key`; `used`), after those a graphics one of any other shaders. `key` 0: only at
-/// its first use.
+/// shaders (`key`; `used`), after those one of any other shaders (`Backlog` has the order).
+/// `key` 0: only at its first use.
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
     submit_lazy_with(standin, compute, job, key, None, 0);
 }
@@ -454,7 +454,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, warm
         return;
     }
     let known = used::known(key);
-    if !known && (compute || key == 0 || ahead_cap() == 0) {
+    if !known && (key == 0 || ahead_cap() == 0) {
         return;
     }
     if let Some(q) = preload() {
@@ -474,8 +474,8 @@ pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
 /// The pipelines a title used, by a hash of their shaders, kept between runs
 /// (`used-pipelines.txt` beside the DXIL cache, a key a line).
 ///
-/// A lazy pipeline is built at its first use (a graphics one also ahead of it, after those of
-/// earlier runs: `Backlog`): until then it is waited for on the title's thread. A retail
+/// A lazy pipeline is built at its first use (also ahead of it, after those of earlier runs:
+/// `Backlog`): until then it is waited for on the title's thread. A retail
 /// title's first frames of its world use hundreds of pipelines for the first time at once. The pipelines of an earlier run are
 /// built while the title loads instead (`preload`): measured on a build that skips a dispatch
 /// instead of waiting for its pipeline, ~2 170 dispatches were skipped in those frames without
@@ -555,17 +555,23 @@ struct Preload {
     cv: Condvar,
 }
 
-/// The lazy pipelines to build ahead of their first use, in this order: those of shaders an
-/// earlier run used (`used`); then the title's other graphics pipelines, first translated and
-/// compiled by DXC all of them (`Warm`: milliseconds to seconds each, no driver memory kept, and
-/// the disk caches hold them for the next run), then built by the driver one by one. A retail
-/// title made its ~2 700 pipelines in its first 6 s and bound some of them for the first time
-/// up to 150 s later: each such bind waited 7 – 15 s for its pipeline, one after another, and no
-/// frame came for 156 s. A pipeline a bind wants is not taken from here (`unclaimed`): the
-/// workers build it at once, and a huge driver compile ahead of its use gives its turn to any
-/// other (`real::big_compile_turn`).
+/// The lazy pipelines to build ahead of their first use, in this order: the compute ones of
+/// shaders an earlier run used (`used`); the title's other compute pipelines; the graphics ones
+/// of shaders an earlier run used; then the title's other graphics pipelines, first translated
+/// and compiled by DXC all of them (`Warm`: milliseconds to seconds each, no driver memory kept,
+/// and the disk caches hold them for the next run), then built by the driver one by one. A
+/// retail title made its ~2 700 pipelines in its first 6 s and bound some of them for the first
+/// time up to 150 s later: each such bind waited 7 – 15 s for its pipeline, one after another,
+/// and no frame came for 156 s. A compute pipeline is waited for at its first dispatch (or its
+/// dispatches are skipped: `XCL_CS_PSO_WAIT_MS`), and one no earlier run used was built only
+/// then: a retail title's thread spent 57 s in the driver on one. A pipeline a bind wants is
+/// not taken from here (`unclaimed`): the workers build it at once, and a huge driver compile
+/// ahead of its use gives its turn to any other (`real::big_compile_turn`).
 #[derive(Default)]
 struct Backlog {
+    known_compute: std::collections::VecDeque<Arc<Pending>>,
+    /// compute pipelines no earlier run used
+    compute: std::collections::VecDeque<Arc<Pending>>,
     known: std::collections::VecDeque<Arc<Pending>>,
     warm: std::collections::VecDeque<Arc<Pending>>,
     cold: std::collections::VecDeque<Arc<Pending>>,
@@ -581,7 +587,11 @@ enum Step {
 
 impl Backlog {
     fn push(&mut self, p: Arc<Pending>, known: bool) {
-        if known {
+        if known && p.compute {
+            self.known_compute.push_back(p);
+        } else if p.compute {
+            self.compute.push_back(p);
+        } else if known {
             self.known.push_back(p);
         } else if p.warm.lock().unwrap().is_some() {
             self.warm.push_back(p);
@@ -591,13 +601,25 @@ impl Backlog {
     }
 
     fn len(&self) -> usize {
-        self.known.len() + self.warm.len() + self.cold.len()
+        self.known_compute.len() + self.compute.len() + self.known.len() + self.warm.len() + self.cold.len()
     }
 
     /// The next piece of work. `ahead`: pipelines no earlier run used may be worked on now
     /// (`XCL_PSO_AHEAD`, free commit: `ahead_room`); `builds`: one more of them may be built by
     /// the driver (`ahead_cap`). Without them those wait here.
     fn next(&mut self, ahead: bool, builds: bool) -> Option<(Arc<Pending>, Step)> {
+        while let Some(p) = self.known_compute.pop_front() {
+            if p.unclaimed() {
+                return Some((p, Step::Build { ahead: false }));
+            }
+        }
+        if ahead && builds {
+            while let Some(p) = self.compute.pop_front() {
+                if p.unclaimed() {
+                    return Some((p, Step::Build { ahead: true }));
+                }
+            }
+        }
         while let Some(p) = self.known.pop_front() {
             if p.unclaimed() {
                 return Some((p, Step::Build { ahead: false }));
@@ -1021,6 +1043,11 @@ mod used_tests {
         Arc::new(Pending::new(Box::new(|| 0), false, false, key, warm.then(|| Box::new(|| {}) as Warm), 0))
     }
 
+    /// A compute pipeline for the backlog, never built.
+    fn pending_compute(key: u64) -> Arc<Pending> {
+        Arc::new(Pending::new(Box::new(|| 0), false, true, key, None, 0))
+    }
+
     /// Work from the backlog as its workers do (a translated one goes back for its build): the
     /// key and step of each piece, in order.
     fn drain(b: &mut Backlog, ahead: bool, builds: bool) -> Vec<(u64, &'static str)> {
@@ -1076,6 +1103,54 @@ mod used_tests {
         assert_eq!(ahead_cap_of(Some("lots")), 4096);
     }
 
+    /// Compute pipelines no earlier run used have a lane of their own, after the known compute
+    /// ones and before the known graphics ones; like every pipeline no earlier run used they are
+    /// built only with room (`ahead`) and under the cap (`builds`), and one a bind wants is left
+    /// to the workers.
+    #[test]
+    fn new_compute_pipelines_are_built_after_known_compute_and_before_known_graphics_ones() {
+        let mut b = Backlog::default();
+        let wanted = pending_compute(6);
+        wanted.sent.store(true, Ordering::Release);
+        b.push(pending(1, true), false);
+        b.push(pending(2, false), true);
+        b.push(pending_compute(3), false);
+        b.push(wanted, false);
+        b.push(pending_compute(4), true);
+        b.push(pending_compute(5), false);
+        assert_eq!(drain(&mut b, true, true), [(4, "build"), (3, "build ahead"), (5, "build ahead"), (2, "build"), (1, "warm"), (1, "build ahead")]);
+        assert_eq!(b.len(), 0);
+        b.push(pending_compute(3), false);
+        b.push(pending(2, false), true);
+        b.push(pending_compute(4), true);
+        assert_eq!(drain(&mut b, false, true), [(4, "build"), (2, "build")]);
+        assert_eq!(b.len(), 1, "short of commit: it waits");
+        assert!(drain(&mut b, true, false).is_empty());
+        assert_eq!(b.len(), 1, "past the cap: it waits");
+        assert_eq!(drain(&mut b, true, true), [(3, "build ahead")]);
+    }
+
+    /// A lazy compute pipeline of shaders no run used yet is built with no bind – when commit is
+    /// free.
+    #[test]
+    fn a_lazy_compute_pipeline_of_new_shaders_is_built_ahead_of_its_first_use() {
+        let standin = 0x7E57_C011usize;
+        let room = ahead_room();
+        submit_lazy(standin, true, Box::new(|| 0x6969), 0x5EED_C011);
+        let start = std::time::Instant::now();
+        let limit = std::time::Duration::from_secs(if room { 10 } else { 1 });
+        while is_pending(standin) && start.elapsed() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if room {
+            assert!(!is_pending(standin), "built with no bind");
+            assert_eq!(resolve(standin), 0x6969);
+        } else {
+            assert!(is_pending(standin), "short of commit: not built ahead");
+        }
+        released(standin);
+    }
+
     /// A lazy graphics pipeline of shaders no run used yet is translated, then built, with no
     /// bind – when commit is free.
     #[test]
@@ -1107,7 +1182,9 @@ mod used_tests {
     }
 
     /// A lazy pipeline of shaders an earlier run used is built without a bind; a compute one of
-    /// other shaders is built only at its first use, and that use is kept for the next run.
+    /// other shaders is not used before its first bind (built ahead or not:
+    /// `a_lazy_compute_pipeline_of_new_shaders_is_built_ahead_of_its_first_use`), and that use is
+    /// kept for the next run.
     #[test]
     fn a_pipeline_an_earlier_run_used_is_built_ahead_of_its_first_use() {
         let (known, unknown) = (0x7E57_7001usize, 0x7E57_7002usize);
@@ -1121,8 +1198,7 @@ mod used_tests {
         }
         assert!(!is_pending(known), "built by the workers that build ahead, with no bind");
         assert_eq!(resolve(known), 0x4321);
-        assert!(is_pending(unknown), "nobody used it and no earlier run did");
-        assert!(!used::noted(unknown_key));
+        assert!(!used::noted(unknown_key), "nobody used it and no earlier run did");
         assert_eq!(resolve_wait(unknown), 0x4322);
         assert!(used::noted(unknown_key) && used::noted(known_key), "a first use is kept for the next run");
         released(known);
