@@ -52,8 +52,8 @@ impl DxilIr {
 
     /// `new` in the split form (two hardware wave32s per console wave64): #1426's `Lw` numbers
     /// the threads as the hardware waves arrive and lays out the halves' exchange storage; its
-    /// `ballot` / `read_lane_uniform` meet the other half (a group barrier for one console
-    /// wave per group, the spin meet for more).
+    /// `ballot` / `read_lane_uniform` meet the other half (the spin meet for a compute group of
+    /// one console wave or more, a group barrier for the kernel form).
     fn split(insts: &[Decoded], entry: &Entry) -> DxilIr {
         Self::with(insts, KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }, entry)
     }

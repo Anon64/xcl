@@ -4664,7 +4664,8 @@ impl Em {
     /// Split wave64: meet through bounded arrival counters (`XCL_X_SPIN 1`) by default so
     /// divergent wave32 halves can never permanently deadlock a GPU SM at an unbounded
     /// `GroupMemoryBarrierWithGroupSync()`. Set `XCL_WAVE64_SPIN=0` to force group barriers
-    /// for 1-wave64 groups.
+    /// for 1-wave64 groups – in this path only: the direct DXIL translator always exchanges by
+    /// counters for one split wave of a compute or mesh group (`dxil::kernel`'s `Lw::new`).
     fn x64_spin(&self) -> bool {
         self.x64_threads() > 64 || std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0")
     }
