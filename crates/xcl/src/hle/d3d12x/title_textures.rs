@@ -696,6 +696,7 @@ fn hot_looks() -> bool {
 }
 
 const HOT_BLOCK: usize = 2 << 20;
+const HOT_GAP: usize = 4 << 20;
 /// a block nothing was written to for this long is left to the walk again
 const HOT_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -754,7 +755,9 @@ unsafe fn take_hot(ranges: &Arc<Vec<(usize, usize)>>, buf: &mut [*mut c_void], d
                 let (lo, hi) = (b.max(base), (b + HOT_BLOCK).min(base + size));
                 if lo < hi {
                     match runs.last_mut() {
-                        Some(last) if last.0 + last.1 == lo && lo > base => last.1 += hi - lo,
+                        // one call for hot blocks up to HOT_GAP apart in the same range: a call costs
+                        // about as much as walking 6 MiB of committed pages
+                        Some(last) if last.0 >= base && lo - (last.0 + last.1) <= HOT_GAP => last.1 = hi - last.0,
                         _ => runs.push((lo, hi - lo)),
                     }
                 }
