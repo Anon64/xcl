@@ -235,6 +235,9 @@ struct TilePool {
     free_total: usize,
     /// Tiles given back, reusable after `COOL`.
     cooling: std::collections::VecDeque<(Tile, std::time::Instant)>,
+    /// Whether heap index h has a heap (false: given back by `take_free_heaps`, free for the
+    /// next `add_heap`).
+    live: Vec<bool>,
 }
 
 impl TilePool {
@@ -244,15 +247,44 @@ impl TilePool {
             dirty_sort: Vec::new(),
             free_total: 0,
             cooling: std::collections::VecDeque::new(),
+            live: Vec::new(),
         }
     }
 
-    fn add_heap(&mut self, pool_pages: u32) -> u32 {
-        let h = self.free_by_heap.len() as u32;
-        self.free_by_heap.push((0..pool_pages).rev().collect());
-        self.dirty_sort.push(false);
+    /// The index the next heap gets: a given-back one first.
+    fn next_heap(&self) -> u32 {
+        self.live.iter().position(|&l| !l).unwrap_or(self.live.len()) as u32
+    }
+
+    /// Heap `h` (`next_heap`) with all its tiles free.
+    fn add_heap(&mut self, h: u32, pool_pages: u32) {
+        let i = h as usize;
+        if i == self.free_by_heap.len() {
+            self.free_by_heap.push(Vec::new());
+            self.dirty_sort.push(false);
+            self.live.push(false);
+        }
+        self.free_by_heap[i] = (0..pool_pages).rev().collect();
+        self.dirty_sort[i] = false;
+        self.live[i] = true;
         self.free_total += pool_pages as usize;
-        h
+    }
+
+    /// Heaps all of whose `pool_pages` tiles are free (none in use, idle or cooling) leave the
+    /// pool: their indices, which `add_heap` gives the next heaps. No tile of theirs is handed
+    /// out after this – a page still mapped onto one would be a page of whatever heap comes next.
+    fn take_free_heaps(&mut self, pool_pages: u32) -> Vec<u32> {
+        let mut gone = Vec::new();
+        for h in 0..self.free_by_heap.len() {
+            if self.live[h] && self.free_by_heap[h].len() == pool_pages as usize {
+                self.free_by_heap[h].clear();
+                self.dirty_sort[h] = false;
+                self.live[h] = false;
+                self.free_total -= pool_pages as usize;
+                gone.push(h as u32);
+            }
+        }
+        gone
     }
 
     fn push_cooling(&mut self, tile: Tile, now: std::time::Instant) {
@@ -265,7 +297,7 @@ impl TilePool {
         while self.cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL) {
             let Some(((h, t), _)) = self.cooling.pop_front() else { break };
             let idx = h as usize;
-            if idx < self.free_by_heap.len() {
+            if idx < self.free_by_heap.len() && self.live[idx] {
                 self.free_by_heap[idx].push(t);
                 self.dirty_sort[idx] = true;
                 self.free_total += 1;
@@ -276,7 +308,7 @@ impl TilePool {
     fn return_tiles(&mut self, tiles: &[Tile]) {
         for &(h, t) in tiles {
             let idx = h as usize;
-            if idx < self.free_by_heap.len() {
+            if idx < self.free_by_heap.len() && self.live[idx] {
                 self.free_by_heap[idx].push(t);
                 self.dirty_sort[idx] = true;
                 self.free_total += 1;
@@ -317,15 +349,15 @@ impl TilePool {
     }
 
     /// Allocate `count` tiles, preferring a single heap and ascending contiguous offsets.
-    /// `make_heap` allocates a new backing pool heap of `pool_pages` tiles when `free_total == 0`.
-    /// On failure, any tiles already taken are returned untouched.
+    /// `make_heap(h)` puts a backing pool heap of `pool_pages` tiles at index `h` when
+    /// `free_total == 0` (false: none). On failure, any tiles already taken are returned untouched.
     fn take_batch(
         &mut self,
         count: usize,
         preferred: Option<u32>,
         now: std::time::Instant,
         pool_pages: u32,
-        mut make_heap: impl FnMut() -> Option<u32>,
+        mut make_heap: impl FnMut(u32) -> bool,
     ) -> Option<Vec<Tile>> {
         if count == 0 {
             return Some(Vec::new());
@@ -337,13 +369,13 @@ impl TilePool {
             let h = match self.pick_heap(rem, preferred) {
                 Some(h) => h,
                 None => {
-                    let Some(new_h) = make_heap() else {
+                    let new_h = self.next_heap();
+                    if !make_heap(new_h) {
                         self.return_tiles(&out);
                         return None;
-                    };
-                    let added = self.add_heap(pool_pages);
-                    debug_assert_eq!(added, new_h);
-                    added as usize
+                    }
+                    self.add_heap(new_h, pool_pages);
+                    new_h as usize
                 }
             };
             if self.dirty_sort[h] {
@@ -359,6 +391,48 @@ impl TilePool {
             self.free_total -= take;
         }
         Some(out)
+    }
+}
+
+/// a pool heap all of whose pages came free is kept this long (and until the page-mapping fence
+/// is past what was mapped before) before it is let go
+const RETIRED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Pool heaps all of whose pages came free (`TilePool::take_free_heaps`), apart from D3D12 (`H`:
+/// the heap; numbers in the tests): each with the page-mapping fence value and the moment it
+/// came free. One is taken back for the next pool before a heap is made (placing and freeing in
+/// turn would make and end a 64 MiB heap each time, as `sparse`'s pools did, #913).
+struct Retired<H> {
+    list: Vec<(H, u64, std::time::Instant)>,
+}
+
+impl<H> Retired<H> {
+    const fn new() -> Self {
+        Retired { list: Vec::new() }
+    }
+
+    fn retire(&mut self, heap: H, value: u64, now: std::time::Instant) {
+        self.list.push((heap, value, now));
+    }
+
+    /// The heap that came free last.
+    fn take_back(&mut self) -> Option<H> {
+        self.list.pop().map(|(h, _, _)| h)
+    }
+
+    /// The heaps to let go: the fence is at `done`, past their value, and `RETIRED_FOR` went by.
+    fn due(&mut self, done: u64, now: std::time::Instant) -> Vec<H> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.list.len() {
+            let (_, v, at) = &self.list[i];
+            if done >= *v && now.duration_since(*at) >= RETIRED_FOR {
+                out.push(self.list.remove(i).0);
+            } else {
+                i += 1;
+            }
+        }
+        out
     }
 }
 
@@ -385,8 +459,11 @@ struct Pages {
     /// signalled after each mapping; title queues wait for it before their next work
     fence: ID3D12Fence,
     value: u64,
-    pools: Vec<ID3D12Heap>,
+    /// pool heaps by `Tile` index (None: given back, as `TilePool::live` has it)
+    pools: Vec<Option<ID3D12Heap>>,
     pool: TilePool,
+    /// pool heaps all of whose pages came free (`retire_free_pools`)
+    retired: Retired<ID3D12Heap>,
     /// title page address → its video memory
     pages: std::collections::HashMap<usize, Page>,
     /// extra / sub-64 KiB tiles keyed by `(va, tile_index)` so repeated placements at the same
@@ -432,6 +509,7 @@ impl Pages {
             value: 0,
             pools: Vec::new(),
             pool: TilePool::new(),
+            retired: Retired::new(),
             pages: std::collections::HashMap::new(),
             extra_pages: std::collections::HashMap::new(),
             idle: std::collections::VecDeque::new(),
@@ -450,6 +528,11 @@ impl Pages {
         sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.pool.cooling, now);
     }
 
+    /// Pool heaps held: the pool's and those retired and not let go yet.
+    fn pool_heaps(&self) -> usize {
+        self.pools.iter().flatten().count() + self.retired.list.len()
+    }
+
     /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
     unsafe fn map(&mut self, res: &ID3D12Resource, tiles: &[Tile]) {
         if tiles.is_empty() {
@@ -461,6 +544,8 @@ impl Pages {
         self.scratch_heaps.dedup();
         for i in 0..self.scratch_heaps.len() {
             let h = self.scratch_heaps[i];
+            // (a tile is only ever of a heap the pool has: `TilePool::take_free_heaps`)
+            let Some(heap) = self.pools.get(h as usize).and_then(Option::as_ref) else { continue };
             let ranges = heap_ranges_trimmed(h, tiles);
             if ranges.is_empty() {
                 continue;
@@ -482,7 +567,7 @@ impl Pages {
                 1,
                 Some(&coord),
                 Some(&region),
-                &self.pools[h as usize],
+                heap,
                 ranges.len() as u32,
                 Some(self.scratch_flags.as_ptr()),
                 Some(self.scratch_offsets.as_ptr()),
@@ -575,10 +660,15 @@ impl Pages {
 
         let pools = &mut self.pools;
         let pool = &mut self.pool;
-        let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
-            let heap = alloc_pool_heap(dev)?;
-            pools.push(heap);
-            Some(pools.len() as u32 - 1)
+        let retired = &mut self.retired;
+        let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, |h| {
+            let Some(heap) = retired.take_back().or_else(|| alloc_pool_heap(dev)) else { return false };
+            let h = h as usize;
+            if h >= pools.len() {
+                pools.resize_with(h + 1, || None);
+            }
+            pools[h] = Some(heap);
+            true
         })?;
         let mut fresh_iter = fresh.into_iter();
 
@@ -622,7 +712,30 @@ impl Pages {
             tiles.push(tile);
         }
         self.map(res, &tiles);
+        self.retire_free_pools(now);
         Some((used, used_extra))
+    }
+
+    /// Pool heaps all of whose pages are free and cooled go: 64 MiB of video memory each, which
+    /// the pools only ever grew by (a retail game's streaming left 350 MB free in them). A heap
+    /// is kept `RETIRED_FOR` after it came free and until this queue is past the mappings made
+    /// before (an unmapped page's tiles are off it then), and is then let go as a resource the
+    /// title released is (`late_release::hold_heap`): a texture the title released may still map
+    /// pages of it, and work queued before its release still read them – a heap gone under that
+    /// work is a page fault of the GPU, where a page reused under it is only wrong texels.
+    unsafe fn retire_free_pools(&mut self, now: std::time::Instant) {
+        for h in self.pool.take_free_heaps(POOL_PAGES) {
+            if let Some(heap) = self.pools.get_mut(h as usize).and_then(Option::take) {
+                self.retired.retire(heap, self.value, now);
+            }
+        }
+        if self.retired.list.is_empty() {
+            return;
+        }
+        let done = super::real::fence_completed(&self.fence);
+        for heap in self.retired.due(done, now) {
+            super::late_release::hold_heap(heap);
+        }
     }
 }
 
@@ -852,14 +965,14 @@ pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let g = PAGES.lock().unwrap();
     let Some(Some(p)) = g.get(&device) else { return (0, 0) };
-    ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
+    ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pool_heaps() * POOL_PAGES as usize * PAGE)
 }
 
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
     let g = PAGES.lock().unwrap();
     g.values().flatten().fold((0, 0), |(used, pools), p| {
-        (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.len() * POOL_PAGES as usize * PAGE)
+        (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pool_heaps() * POOL_PAGES as usize * PAGE)
     })
 }
 
@@ -1002,10 +1115,10 @@ mod tests {
         let t0 = Instant::now();
         let mut pool = TilePool::new();
         let heaps_made = std::cell::Cell::new(0u32);
-        let mut make = || {
-            let h = heaps_made.get();
+        let mut make = |h: u32| {
+            assert_eq!(h, heaps_made.get(), "no heap was given back: a new index each");
             heaps_made.set(h + 1);
-            Some(h)
+            true
         };
 
         // Fill 100 pools (64 tiles each for a fast unit test, same multi-heap topology as 1024).
@@ -1055,9 +1168,83 @@ mod tests {
         // Rollback on OOM: requesting more tiles than available when make_heap fails returns every
         // popped tile cleanly so free_total is preserved.
         assert_eq!(pool.free_total, 8);
-        let fail = pool.take_batch(16, None, t2, P, || None);
+        let fail = pool.take_batch(16, None, t2, P, |_| false);
         assert!(fail.is_none());
         assert_eq!(pool.free_total, 8, "OOM rollback must return all popped tiles");
+    }
+
+    /// A pool heap goes once every tile of it is free and cooled – not while one is in use or
+    /// cooling – and its index is not used again until a new heap takes it: not as `preferred`,
+    /// not for a tile of it that comes back to the pool, only for the next heap made.
+    #[test]
+    fn tile_pool_gives_back_wholly_free_heaps_and_reuses_their_index() {
+        let t0 = Instant::now();
+        const P: u32 = 4;
+        let mut pool = TilePool::new();
+        let made = std::cell::RefCell::new(Vec::new());
+        let mut make = |h: u32| {
+            made.borrow_mut().push(h);
+            true
+        };
+        let a = pool.take_batch(P as usize, None, t0, P, &mut make).unwrap();
+        let b = pool.take_batch(P as usize, None, t0, P, &mut make).unwrap();
+        let c = pool.take_batch(2, None, t0, P, &mut make).unwrap();
+        assert_eq!(*made.borrow(), [0, 1, 2]);
+        assert!(a.iter().all(|t| t.0 == 0) && b.iter().all(|t| t.0 == 1) && c.iter().all(|t| t.0 == 2));
+        assert!(pool.take_free_heaps(P).is_empty(), "heap 2 has 2 tiles in use");
+
+        // heap 0 given back whole, heap 1 but one tile
+        for &t in &a {
+            pool.push_cooling(t, t0);
+        }
+        for &t in &b[1..] {
+            pool.push_cooling(t, t0);
+        }
+        pool.drain_cooling(t0 + COOL / 2);
+        assert!(pool.take_free_heaps(P).is_empty(), "heap 0's tiles are still cooling");
+        pool.drain_cooling(t0 + COOL);
+        assert_eq!(pool.take_free_heaps(P), [0], "heap 1 has a tile in use");
+        assert_eq!(pool.free_total, 3 + 2, "heap 1's 3 and heap 2's 2 free tiles, heap 0's gone");
+        assert!(pool.take_free_heaps(P).is_empty(), "given back once");
+
+        // a tile of heap 0 that came back (none should) is not handed out
+        pool.push_cooling((0, 1), t0);
+        pool.drain_cooling(t0 + COOL);
+        pool.return_tiles(&[(0, 2)]);
+        assert_eq!(pool.free_total, 5);
+
+        // heap 0 is never picked, also as the heap the texture's other pages are on
+        let t1 = t0 + COOL;
+        let d = pool.take_batch(5, Some(0), t1, P, &mut make).unwrap();
+        assert!(d.iter().all(|t| t.0 == 1 || t.0 == 2), "{d:?}");
+        assert_eq!(made.borrow().len(), 3, "no heap made while the pool had tiles");
+        // the next heap takes the index given back, with all its tiles free
+        let e = pool.take_batch(2, None, t1, P, &mut make).unwrap();
+        assert_eq!(*made.borrow(), [0, 1, 2, 0]);
+        assert_eq!(e, [(0, 0), (0, 1)]);
+        assert_eq!(pool.free_total, P as usize - 2);
+        // and a new index after it
+        pool.take_batch(P as usize, None, t1, P, &mut make).unwrap();
+        assert_eq!(*made.borrow(), [0, 1, 2, 0, 3]);
+    }
+
+    /// A retired pool heap is let go once the page-mapping fence is past its value and
+    /// `RETIRED_FOR` went by, and the one retired last is taken back first.
+    #[test]
+    fn retired_pool_heaps_go_after_the_fence_and_a_moment() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut r: Retired<u32> = Retired::new();
+        r.retire(7, 5, at(0));
+        r.retire(8, 9, at(1000));
+        assert!(r.due(4, at(5000)).is_empty(), "the fence is not past heap 7's mappings");
+        assert!(r.due(9, at(1999)).is_empty(), "too soon for both");
+        assert_eq!(r.due(5, at(2000)), [7]);
+        assert!(r.due(8, at(9000)).is_empty(), "heap 8: the fence is not past it");
+        r.retire(9, 9, at(2000));
+        assert_eq!(r.take_back(), Some(9), "the one retired last");
+        assert_eq!(r.due(9, at(3000)), [8]);
+        assert_eq!(r.take_back(), None);
     }
 
     /// Idle pages go back after `IDLE`, and a sweep looks at the queue of idle pages alone: one
