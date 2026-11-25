@@ -444,6 +444,9 @@ struct State {
     runs: BTreeMap<usize, usize>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
+    /// `XCL_LOOK_STATS=2`: the title's pages XCL wrote itself since the last look (copies back
+    /// landed, immediates stored; `OWN_PAGES_MAX` at most), for `look_stats::own_writes`
+    own_pages: Vec<usize>,
     /// CPU tile → the window tiles over it (tiles of a GPU view, `map_mirror`), with video memory
     /// or not: what the CPU writes there goes to each of them. Several can show one CPU tile
     mirrors: FxHashMap<usize, Vec<usize>>,
@@ -585,11 +588,13 @@ fn push_run(out: &mut Vec<(usize, usize)>, addr: usize, len: usize) {
 
 /// Copy `len` bytes from `src` to offset `at` of the title's page `pg`, 64-byte chunk by chunk:
 /// a chunk the CPU wrote since it was last sent keeps its (newer) bytes and goes up with the next
-/// look; a chunk as it was sent gets what the GPU copied back, and its hash with it.
-unsafe fn land_page(slot: &mut Option<Box<[u64; CHUNKS]>>, pg: usize, at: usize, src: *const u8, len: usize) {
+/// look; a chunk as it was sent gets what the GPU copied back, and its hash with it. Whether it
+/// wrote any.
+unsafe fn land_page(slot: &mut Option<Box<[u64; CHUNKS]>>, pg: usize, at: usize, src: *const u8, len: usize) -> bool {
     let sent = slot.get_or_insert_with(|| Box::new(ZERO_HASHES));
     let end = at + len;
     let mut o = at;
+    let mut wrote = false;
     while o < end {
         let k = o / CHUNK;
         let chunk_end = ((k + 1) * CHUNK).min(end);
@@ -597,9 +602,25 @@ unsafe fn land_page(slot: &mut Option<Box<[u64; CHUNKS]>>, pg: usize, at: usize,
         if chunk_hash(chunk) == sent[k] {
             std::ptr::copy_nonoverlapping(src.add(o - at), (pg + o) as *mut u8, chunk_end - o);
             sent[k] = chunk_hash(std::slice::from_raw_parts((pg + k * CHUNK) as *const u8, CHUNK));
+            wrote = true;
         }
         o = chunk_end;
     }
+    wrote
+}
+
+/// `State::own_pages` keeps this many pages at most (a look's worth)
+const OWN_PAGES_MAX: usize = 1 << 16;
+
+thread_local! {
+    /// `XCL_LOOK_STATS=2`: the next `before_execute` on this thread follows a look (`note_look`)
+    static LOOKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The submit about to call `before_execute` on this thread looked for CPU writes
+/// (`XCL_LOOK_STATS=2`): XCL's own writes since the look before are counted against it.
+pub(super) fn note_look() {
+    LOOKED.with(|l| l.set(true));
 }
 
 /// Scan a 4 KiB page at `pg`, appending any changed 64-byte chunk runs directly to `out`
@@ -841,6 +862,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         waited: FxHashMap::default(),
         runs: BTreeMap::new(),
         scratch_runs: Vec::new(),
+        own_pages: Vec::new(),
         mirrors: FxHashMap::default(),
         mirror_src: FxHashMap::default(),
         src_runs: BTreeMap::new(),
@@ -1432,7 +1454,10 @@ impl State {
             if let Some(entry) = self.mapped.get_mut(&t) {
                 let here = entry.cpu(t);
                 if entry.holes & (1u16 << idx) == 0 && entry.gen == gen {
-                    land_page(&mut entry.sent[idx], here + (pg - t), at - pg, p.add(src_off), step);
+                    let wrote = land_page(&mut entry.sent[idx], here + (pg - t), at - pg, p.add(src_off), step);
+                    if wrote && self.own_pages.len() < OWN_PAGES_MAX && super::look_stats::deep() {
+                        self.own_pages.push(here + (pg - t));
+                    }
                 }
             }
             at += step;
@@ -1464,6 +1489,9 @@ impl State {
             }
             8 => (*(cpu as *const AtomicU64)).store(value, Ordering::Release),
             _ => return,
+        }
+        if self.own_pages.len() < OWN_PAGES_MAX && super::look_stats::deep() {
+            self.own_pages.push(cpu & !(PAGE - 1));
         }
         if clean {
             self.sync_sent_range(va, (bytes & 0x7f) as usize);
@@ -3067,6 +3095,24 @@ struct PageSlot {
     slot: *mut Option<Box<[u64; CHUNKS]>>,
 }
 
+/// Of the pages `found` (CPU addresses, sorted), how many slots of `pages` the scan went over and
+/// how many of those it found unchanged: no run of `runs` (window addresses, sorted, as the scan
+/// made them) in the slot's window page.
+fn own_scanned(found: &[usize], pages: &[PageSlot], runs: &[(usize, usize)]) -> (usize, usize) {
+    if found.is_empty() {
+        return (0, 0);
+    }
+    let (mut scanned, mut unchanged) = (0, 0);
+    for p in pages.iter().filter(|p| found.binary_search(&p.cpu).is_ok()) {
+        scanned += 1;
+        let k = runs.partition_point(|r| r.0 + r.1 <= p.win);
+        if !runs.get(k).is_some_and(|r| r.0 < p.win + PAGE) {
+            unchanged += 1;
+        }
+    }
+    (scanned, unchanged)
+}
+
 /// The pages of one submit, shared with the worker threads (`worker_pool`).
 struct SharedPages<'a>(&'a [PageSlot]);
 // SAFETY: the slots are disjoint, and the scan finishes before the state's lock is given up
@@ -3229,6 +3275,15 @@ impl State {
         let split = super::look_stats::deep();
         let stamp = || split.then(std::time::Instant::now);
         let work0: [u64; 4] = std::array::from_fn(|k| if split { TILE_WORK[k].load(Ordering::Relaxed) } else { 0 });
+        // XCL's own writes since the look before, and those of them this look found (before the
+        // copies back below land: those the next look finds)
+        let own = (split && LOOKED.with(|l| l.replace(false))).then(|| {
+            let mut own = std::mem::take(&mut s.own_pages);
+            own.sort_unstable();
+            own.dedup();
+            let found: Vec<usize> = own.iter().copied().filter(|p| dirty.binary_search(p).is_ok()).collect();
+            (own.len(), found)
+        });
         // (copies back done before the tiles change below: a page that stops being a hole there
         // would take what the GPU had in it)
         s.drain_readbacks(Drain::Finished);
@@ -3341,6 +3396,10 @@ impl State {
         super::look_stats::scan(pages.len(), &dirty_runs);
         if let Some(t_gathered) = t_gathered {
             super::look_stats::scan_split(t_gathered - t_locked, t_scanned - t_gathered, shares);
+        }
+        if let Some((written, found)) = own {
+            let (scanned, unchanged) = own_scanned(&found, &pages, &dirty_runs);
+            super::look_stats::own_writes(written, found.len(), scanned, unchanged);
         }
         PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
         PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
@@ -3512,6 +3571,23 @@ mod tests {
             }
         }
         runs.into_iter().collect()
+    }
+
+    /// XCL's own writes in a look: a slot counts as scanned when its CPU page is one of them, and
+    /// as unchanged when no changed run lies in its window page (a GPU view's slot has its own).
+    #[test]
+    fn own_writes_scanned_and_found_unchanged() {
+        let slot = |cpu: usize, win: usize| PageSlot { cpu, win, slot: std::ptr::null_mut() };
+        let (c, w) = (0x10_0000usize, 0x8000_0000usize);
+        // CPU pages 0..4, and page 1 shown again by a GPU view's tile at `w`
+        let pages = [slot(c, c), slot(c + PAGE, c + PAGE), slot(c + PAGE, w + PAGE), slot(c + 2 * PAGE, c + 2 * PAGE), slot(c + 3 * PAGE, c + 3 * PAGE)];
+        // changed: a chunk of page 0, the end of page 1 (own address only), page 3 whole
+        let runs = [(c + 0x40, 0x40), (c + 2 * PAGE - CHUNK, CHUNK), (c + 3 * PAGE, PAGE)];
+        // XCL wrote pages 1, 2 and 3 (and 9, which was not scanned)
+        let found = [c + PAGE, c + 2 * PAGE, c + 3 * PAGE, c + 9 * PAGE];
+        assert_eq!(own_scanned(&found, &pages, &runs), (4, 2));
+        assert_eq!(own_scanned(&[], &pages, &runs), (0, 0));
+        assert_eq!(own_scanned(&found, &pages, &[]), (4, 4));
     }
 
     /// The sparse lock split: the parts and the rest are the whole, as averages a submit.
@@ -3730,6 +3806,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
+                own_pages: Vec::new(),
                 mirrors: FxHashMap::default(),
                 mirror_src: FxHashMap::default(),
                 src_runs: BTreeMap::new(),
@@ -4013,6 +4090,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
+                own_pages: Vec::new(),
                 mirrors: FxHashMap::default(),
                 mirror_src: FxHashMap::default(),
                 src_runs: BTreeMap::new(),
@@ -4241,6 +4319,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
+                own_pages: Vec::new(),
                 mirrors: FxHashMap::default(),
                 mirror_src: FxHashMap::default(),
                 src_runs: BTreeMap::new(),
@@ -4358,6 +4437,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
+                own_pages: Vec::new(),
                 mirrors: FxHashMap::default(),
                 mirror_src: FxHashMap::default(),
                 src_runs: BTreeMap::new(),

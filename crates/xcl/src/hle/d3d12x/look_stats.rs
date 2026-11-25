@@ -91,9 +91,46 @@ impl<const N: usize> Sums<N> {
         self.0[k].fetch_add(v, Ordering::Relaxed) + v
     }
 
+    pub(super) fn max(&self, k: usize, v: u64) {
+        self.0[k].fetch_max(v, Ordering::Relaxed);
+    }
+
     pub(super) fn take(&self) -> [u64; N] {
         std::array::from_fn(|k| self.0[k].swap(0, Ordering::Relaxed))
     }
+}
+
+/// How stale a look can be (`walk_stale`, `walk_pass`): [looks, looks that began with a block
+/// the walk found that no look had taken, walk passes, ns walking, the longest pass's ns]. A look
+/// takes the blocks written lately only; a write to another block waits for the walk to find it.
+static STALE: Sums<5> = Sums::new();
+
+/// A look began (`deep` only); `stale`: the walk had made a block hot since the look before began.
+pub(super) fn walk_stale(stale: bool) {
+    STALE.add(0, 1);
+    STALE.add(1, stale as u64);
+}
+
+/// A pass of the walk over all watched memory took `took` (`deep` only).
+pub(super) fn walk_pass(took: Duration) {
+    STALE.add(2, 1);
+    STALE.add(3, took.as_nanos() as u64);
+    STALE.max(4, took.as_nanos() as u64);
+}
+
+/// The pages XCL wrote into the title's memory itself (`own_writes`): [looks, pages written since
+/// the look before (copies back landed, immediates stored), those in the look, those scanned,
+/// those the scan found unchanged]. The write watch reports them like the title's writes, and a
+/// look and a scan spent on them is spent on nothing new.
+static OWN: Sums<5> = Sums::new();
+
+/// What a look's submit found of XCL's own writes since the look before (`deep` only).
+pub(super) fn own_writes(written: usize, in_look: usize, scanned: usize, unchanged: usize) {
+    OWN.add(0, 1);
+    OWN.add(1, written as u64);
+    OWN.add(2, in_look as u64);
+    OWN.add(3, scanned as u64);
+    OWN.add(4, unchanged as u64);
 }
 
 /// The scans (`scan_split`): [submits, ns gathering, ns scanning, jobs shared, their items, those
@@ -197,6 +234,23 @@ pub(super) fn look(pages: &[usize], ahead: usize, took: Duration, closed: Option
             c[0],
             c[7]
         );
+        let w = STALE.take();
+        crate::xlog_info!(
+            "D3D12.X: walk staleness (256 looks): {} of {} looks began with a block the walk found that no look had taken yet; a walk pass took {:.1} ms ({:.1} ms the longest, {} passes)",
+            w[1],
+            w[0],
+            per(w[3], w[2]) / 1e6,
+            w[4] as f64 / 1e6,
+            w[2]
+        );
+        let o = OWN.take();
+        crate::xlog_info!(
+            "D3D12.X: XCL's own writes (256 looks): {:.1} pages a look written by XCL since the look before (copies back landed, immediates stored), {:.1} of them in the look, {:.1} scanned, {:.0} % of those found unchanged",
+            per(o[1], o[0]),
+            per(o[2], o[0]),
+            per(o[3], o[0]),
+            per(o[4] * 100, o[3])
+        );
     }
     if s.looks % 256 == 0 {
         let a = |v: u64| v / 256;
@@ -294,5 +348,19 @@ mod tests {
         });
         assert_eq!(S.take(), [4000, 0, 6000]);
         assert_eq!(S.take(), [0, 0, 0]);
+    }
+
+    #[test]
+    fn staleness_and_own_writes_are_summed() {
+        // (only `deep` runs add to these, and no test is: this one has them alone)
+        for stale in [true, false, true] {
+            walk_stale(stale);
+        }
+        walk_pass(Duration::from_millis(3));
+        walk_pass(Duration::from_millis(7));
+        assert_eq!(STALE.take(), [3, 2, 2, 10_000_000, 7_000_000]);
+        own_writes(40, 30, 28, 25);
+        own_writes(2, 0, 0, 0);
+        assert_eq!(OWN.take(), [2, 42, 30, 28, 25]);
     }
 }

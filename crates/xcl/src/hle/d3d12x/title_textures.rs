@@ -1200,6 +1200,9 @@ unsafe fn walk() {
             std::thread::sleep(std::time::Duration::from_millis(5));
             continue;
         };
+        // (`XCL_LOOK_STATS=2`: how long a pass takes – how long a write to a block no look takes
+        // may wait to be found)
+        let pass = super::look_stats::deep().then(std::time::Instant::now);
         for &(base, size) in ranges.iter() {
             let end = base + size;
             let mut at = base;
@@ -1242,6 +1245,9 @@ unsafe fn walk() {
                 }
                 at = stop;
             }
+        }
+        if let Some(pass) = pass {
+            super::look_stats::walk_pass(pass.elapsed());
         }
         // a pass takes the process's memory lock some hundred times (a call each); the pause keeps
         // the thread from holding up the title's own calls
@@ -1419,6 +1425,13 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
             dirty.sort_unstable();
             dirty.dedup();
             return dirty.len();
+        }
+        if super::look_stats::deep() {
+            // (the walk made a block hot since the look before began: written up to a walk pass
+            // ago, and only this look takes it)
+            let before = LOOK_BEGAN.load(Ordering::Acquire);
+            super::look_stats::walk_stale(before != 0 && WALK_FOUND.load(Ordering::Acquire) >= before);
+            super::sparse::note_look();
         }
         LOOK_BEGAN.fetch_max(began, Ordering::AcqRel);
         WATCH_BUF.with(|wcell| {
