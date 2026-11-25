@@ -6569,6 +6569,36 @@ unsafe fn report_dred_lists(head: *const D3D12_AUTO_BREADCRUMB_NODE, mut report:
 }
 
 #[cfg(test)]
+mod own_program_tests {
+    use super::*;
+
+    /// A program the driver refuses: a title's becomes one that does nothing, so the title goes on;
+    /// XCL's own gets the refusal (its user has another way).
+    #[test]
+    fn a_refused_program_of_xcls_own_is_refused() {
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw = device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap();
+            let no_program = [0x5Au8; 64];
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: std::mem::transmute_copy(&rs), CS: bytecode(&no_program), ..Default::default() };
+            let made = super::super::title_textures::own_work(|| dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc).is_ok());
+            assert!(!made, "XCL's own program that is none was taken");
+            let made = super::super::title_textures::own_work(|| dev.CreateRootSignature::<ID3D12RootSignature>(0, &no_program).is_ok());
+            assert!(!made, "XCL's own root signature that is none was taken");
+            assert!(dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc).is_ok(), "a title's gets a stand-in");
+        }
+    }
+}
+
+#[cfg(test)]
 mod dred_tests {
     use super::*;
 

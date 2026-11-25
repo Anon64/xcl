@@ -301,6 +301,9 @@ impl Table {
                     old.unmapped = true;
                     to_unmap.push(ores);
                 }
+                if old.placed && entry.placed {
+                    texture_upload::inherit(&entry.known, &old.known);
+                }
                 self.max_shadowed_size = self.max_shadowed_size.max(oend.saturating_sub(ova));
                 self.shadowed_by_va.insert((ova, ores), oend);
                 self.shadowed.insert(ores, old);
@@ -1535,6 +1538,8 @@ unsafe fn written_pages(src: usize, size: usize) -> Vec<usize> {
     let (mut at, end) = (src / PAGE * PAGE, (src + size).next_multiple_of(PAGE));
     let mut out = Vec::new();
     let mut buf = [std::ptr::null_mut::<c_void>(); 512];
+    // (the walk stays out of the way, as in a look)
+    let was = LOOKING.swap(true, Ordering::AcqRel);
     while at < end {
         let (mut n, mut page) = (buf.len(), PAGE as u32);
         if GetWriteWatch(0, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, &mut page) != 0 {
@@ -1546,7 +1551,18 @@ unsafe fn written_pages(src: usize, size: usize) -> Vec<usize> {
         }
         at = buf[n - 1] as usize + PAGE;
     }
+    LOOKING.store(was, Ordering::Release);
     out
+}
+
+/// Whether the looks take every block `[src, src + size)` lies in.
+fn all_hot(src: usize, size: usize) -> bool {
+    if !hot_looks() {
+        return true;
+    }
+    let g = HOT.lock().unwrap();
+    let Some(h) = g.as_ref() else { return false };
+    (src & !(HOT_BLOCK - 1)..src + size).step_by(HOT_BLOCK).all(|b| h.hot.contains_key(&b))
 }
 
 /// What changed of the textures `todo` (written pages: `dirty`, sorted) goes up, in batches of up to
@@ -1572,7 +1588,7 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
                 let mine = &dirty[from..to.max(from)];
                 // (a look takes the blocks written lately: the others' pages of this texture too, or
                 // it would go up in part as it was and in part as it is)
-                let also = if mine.is_empty() { Vec::new() } else { written_pages(d.src, size) };
+                let also = if mine.is_empty() || all_hot(d.src, size) { Vec::new() } else { written_pages(d.src, size) };
                 if also.iter().all(|p| mine.binary_search(p).is_ok()) {
                     return mine.into();
                 }
@@ -1605,7 +1621,12 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
             texture_upload::Change::Parts(_) if d.target || !upload_parts() => None,
             texture_upload::Change::Parts(p) => Some(p),
         };
-        let bytes = changed.as_ref().map_or(d.tex.size() as usize, |p| p.iter().map(|r| r.1 - r.0).sum());
+        let size = d.tex.size() as usize;
+        // (whole blocks go up, and whole volumes)
+        const BLOCK: usize = 0x1_0000;
+        let volume = d.tex.texels().is_some_and(|s| s.depth > 0);
+        let parts = changed.as_ref().filter(|_| !volume);
+        let bytes = parts.map_or(size, |p| p.iter().map(|r| (r.1.div_ceil(BLOCK) - r.0 / BLOCK) * BLOCK).sum::<usize>().min(size));
         Some((d, changed, bytes))
     }).peekable();
     while todo.peek().is_some() {
@@ -2119,6 +2140,80 @@ pub(super) mod tests {
                 OWN_WAITED.lock().unwrap().remove(&(q.as_raw() as usize));
             }
             *OWN_UPLOADS.lock().unwrap() = was;
+        }
+    }
+
+    /// Uploads of one texture that go to different queues end in the order they were made, whichever
+    /// queue stands still: an older one on XCL's own queue behind a newer one of a direct queue's
+    /// submit, and an older one on a direct queue behind a newer one of a compute queue's.
+    #[test]
+    fn gpu_uploads_of_a_texture_on_two_queues_keep_their_order() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let Some(mem) = crate::gpu::uma::get().and_then(|u| u.alloc(0x1_0000, 0x1_0000)) else { return };
+            let direct: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let compute: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let own = upload_queue(dev, raw_device as usize).unwrap();
+            let mut texture = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let key = texture.as_raw() as usize;
+            std::ptr::write_bytes(mem, 0, 0x1_0000);
+            register(raw_device, texture.as_raw(), mem as usize, &console_desc(3, 64, 64, 1, 1, DXGI_FORMAT_R8_UNORM.0 as u32, 1), D3D12_RESOURCE_STATE_COMMON).unwrap();
+            let write = |value: u8, q: &ID3D12CommandQueue| {
+                std::ptr::write_bytes(mem, value, 0x1_0000);
+                note_known_write(mem as usize, 0x1_0000);
+                refresh(q.as_raw());
+            };
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            write(0x11, &direct);
+            assert_eq!(read_r8(dev, &direct, &texture), vec![0x11; 64 * 64]);
+
+            // XCL's own queue stands; an upload for the compute queue is behind that, then one for
+            // the direct queue, which has to wait for it
+            own.Wait(&gate, 1).unwrap();
+            write(0x22, &compute);
+            write(0x33, &direct);
+            let after: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            direct.Signal(&after, 1).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert_eq!(super::super::real::fence_completed(&after), 0, "the direct queue did not wait for the older upload");
+            gate.Signal(1).unwrap();
+            assert_eq!(read_r8(dev, &direct, &texture), vec![0x33; 64 * 64], "the newer upload is the one that stays");
+
+            // the direct queue stands with an upload on it; one for the compute queue runs at once on
+            // XCL's own queue, and goes up again behind the older one with the direct queue's next
+            direct.Wait(&gate, 2).unwrap();
+            write(0x44, &direct);
+            write(0x55, &compute);
+            assert!(AGAIN.lock().unwrap().contains(&key), "it can be overtaken");
+            refresh(compute.as_raw());
+            assert!(AGAIN.lock().unwrap().contains(&key), "not behind the older one yet");
+            refresh(direct.as_raw());
+            assert!(!AGAIN.lock().unwrap().contains(&key), "went up again on the direct queue");
+            gate.Signal(2).unwrap();
+            assert_eq!(read_r8(dev, &direct, &texture), vec![0x55; 64 * 64], "the newer upload is the one that stays");
+            // with nothing pending nothing goes up again
+            write(0x66, &compute);
+            texture::wait(dev, &own).unwrap();
+            assert!(!AGAIN.lock().unwrap().contains(&key));
+            refresh(direct.as_raw());
+            assert_eq!(read_r8(dev, &direct, &texture), vec![0x66; 64 * 64]);
+            forget(key);
+            crate::gpu::uma::get().unwrap().free(mem as usize);
+            dev.GetDeviceRemovedReason().unwrap();
         }
     }
 
