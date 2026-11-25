@@ -32,8 +32,13 @@ pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
 /// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
 /// slots; the recompiler's `xcl_iw{srsrc}`)
 pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
-/// loop iterations a lane may run (the recompiler's `xcl_budget`)
+/// loop iterations a lane may run (the recompiler's `xcl_budget`). The plain form of a compute
+/// program also counts each entry of a loop (`VAR_LOOP_PASSES`, `kernel::loop_passes`); the
+/// compact form (`compact`) and the per-lane form (`recomp::lower_dxil`) keep this budget alone.
 pub const LOOP_BUDGET: u32 = 1 << 16;
+/// the passes left to the current entry of the loop whose header is CFG block `b`:
+/// `VAR_LOOP_PASSES + b` (above the temporaries and `reload::VAR_RELOAD`'s variables)
+pub const VAR_LOOP_PASSES: u32 = 1 << 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dst {

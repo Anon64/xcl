@@ -712,3 +712,226 @@ fn window_at_lowers_to_32bit_carry_without_int64() {
         assert!(!body0.contains("icmp ult"), "zero-offset window_at must not emit carry compare:\n{dis0}");
     }
 }
+
+/// A loop that only ends when its counter wraps to 0, then global_store_dword [v0 * 4], the
+/// counter (the recompiler tests' `endless_loop_program`).
+fn endless_loop() -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 10)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ])
+}
+
+/// The same loop inside one of three passes (`endless_loop_entered_three_times`).
+fn endless_loop_entered_three_times() -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 12), ("SSRC1", 10)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 11), ("SSRC0", 11), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 11), ("SSRC1", 131)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF8)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 12)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ])
+}
+
+/// The blocks of the emitted `main`: (label, predecessors, text); the entry block is `%0`.
+fn main_blocks(dis: &str) -> Vec<(String, Vec<String>, String)> {
+    let body = dis.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+    let mut out = vec![("%0".to_string(), Vec::new(), String::new())];
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("; <label>:") {
+            let (label, preds) = rest.split_once(';').unwrap_or((rest, ""));
+            let preds = preds.trim().strip_prefix("preds = ").unwrap_or("").split(", ").filter(|p| !p.is_empty()).map(str::to_string).collect();
+            out.push((format!("%{}", label.trim()), preds, String::new()));
+        } else {
+            let last = out.last_mut().unwrap();
+            last.2.push_str(line);
+            last.2.push('\n');
+        }
+    }
+    out
+}
+
+/// What a direct compute program's text shows of its loop counts (`kernel::loop_passes`):
+/// (loads of `IO_LOOP_BUDGET`, `sub ..., 1` decrements, and with one load the count `cap`
+/// made of it, the phis that take it from the entry block, the other blocks they take it from).
+fn loop_counts(dis: &str) -> (usize, usize, Option<(String, Vec<String>, Vec<String>)>) {
+    let slot = format!("i32 {}, i32 undef, i8 1, i32 4)", crate::gpu::recomp::IO_LOOP_BUDGET * 4);
+    let loads: Vec<&str> = dis.lines().filter(|l| l.contains("@dx.op.rawBufferLoad.i32(") && l.contains(&slot)).collect();
+    let subs = dis.lines().filter(|l| l.trim_end().ends_with(", 1") && l.contains(" = sub i32 %")).count();
+    let [load] = loads[..] else { return (loads.len(), subs, None) };
+    let name = |l: &str| l.trim().split_once(" = ").map(|(n, _)| n.to_string()).expect("a definition");
+    let def = |hit: &str| name(dis.lines().find(|l| l.contains(hit)).unwrap_or_else(|| panic!("no {hit}:\n{dis}")));
+    // %v = extractvalue (the load), %z = icmp eq i32 %v, 0, %cap = select i1 %z, i32 65536, …
+    let v = def(&format!("extractvalue %dx.types.ResRet.i32 {}, 0", name(load)));
+    let z = def(&format!("= icmp eq i32 {v}, 0"));
+    let cap = def(&format!("= select i1 {z}, i32 65536, i32 %"));
+    let at_entry = dis.lines().filter(|l| l.contains(" = phi i32 ") && l.contains(&format!("[ {cap}, %0 ]"))).map(name).collect();
+    let again = main_blocks(dis).into_iter().filter(|(b, _, _)| b != "%0" && dis.contains(&format!("[ {cap}, {b} ]"))).map(|(b, _, _)| b).collect();
+    (1, subs, Some((cap, at_entry, again)))
+}
+
+/// Whether the count `n` leaves the program at 0: `%z = icmp eq i32 n, 0` drives a `br i1 %z`
+/// whose taken label is the block that returns.
+fn leaves_to_ret(dis: &str, n: &str) -> bool {
+    let name = |l: &str| l.trim().split_once(" = ").map(|(n, _)| n.to_string());
+    let Some(z) = dis.lines().find(|l| l.contains(&format!("= icmp eq i32 {n}, 0"))).and_then(name) else { return false };
+    let br = format!("br i1 {z}, label ");
+    let Some(to) = dis.lines().find_map(|l| l.trim().strip_prefix(br.as_str())).and_then(|r| r.split(',').next()) else { return false };
+    main_blocks(dis).iter().any(|(b, _, text)| b == to && text.contains("ret void"))
+}
+
+/// The count phis of `dis` that take `cap` from block `b`.
+fn count_phis(dis: &str, cap: &str, b: &str) -> Vec<String> {
+    dis.lines().filter(|l| l.contains(" = phi i32 ") && l.contains(&format!("[ {cap}, {b} ]"))).filter_map(|l| l.trim().split_once(" = ").map(|(n, _)| n.to_string())).collect()
+}
+
+/// The direct translator counts each entry of a compute program's loop as the HLSL path does
+/// (`only_compute_programs_with_a_loop_read_the_dispatch_loop_budget`): `IO_LOOP_BUDGET` is
+/// loaded once, every loop has a count besides the lane's budget, and the outer loop's head
+/// sets the inner loop's count back. A loop-free compute program and other entries have neither.
+#[test]
+fn direct_compute_loops_count_each_entry() {
+    use crate::gpu::recomp::CsInterface;
+    let cs = CsInterface { threads: [8, 4, 2], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let straight = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    for (wave64, split) in [(false, false), (true, true)] {
+        let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let dis = |code: &[u8]| super::validate::disassemble(&super::kernel::translate_compute(code, o, &cs).unwrap_or_else(|e| panic!("{e}")).dxil);
+        let Ok(one) = dis(&endless_loop()) else {
+            return crate::gpu::recomp::runner::skip_test("no DXC");
+        };
+        // one loop: its count, set at the entry, and the lane's budget, both counted down at its head
+        let (loads, subs, counts) = loop_counts(&one);
+        let (_, at_entry, again) = counts.unwrap_or_default();
+        assert_eq!((loads, subs, at_entry.len(), again.len()), (1, 2, 1, 0), "wave64 {wave64}:\n{one}");
+        assert!(leaves_to_ret(&one, &at_entry[0]), "wave64 {wave64}: a count of 0 in {} ends the program:\n{one}", at_entry[0]);
+        // nested: the outer count set at the entry; the inner one set back to `cap` on a path
+        // from the outer loop's head, after the outer count was counted down there
+        let nested = dis(&endless_loop_entered_three_times()).unwrap();
+        let (loads, subs, counts) = loop_counts(&nested);
+        let (cap, at_entry, again) = counts.unwrap_or_default();
+        assert_eq!((loads, subs, at_entry.len(), again.len()), (1, 4, 1, 1), "wave64 {wave64}:\n{nested}");
+        let inner = count_phis(&nested, &cap, &again[0]);
+        assert_eq!(inner.len(), 1, "wave64 {wave64}:\n{nested}");
+        for n in [&at_entry[0], &inner[0]] {
+            assert!(leaves_to_ret(&nested, n), "wave64 {wave64}: a count of 0 in {n} ends the program:\n{nested}");
+        }
+        let blocks = main_blocks(&nested);
+        let mut b = again[0].clone();
+        let after_outer_head = loop {
+            let (_, preds, text) = blocks.iter().find(|(l, _, _)| *l == b).expect("the block");
+            if text.contains(&format!("= sub i32 {}, 1", at_entry[0])) {
+                break true;
+            }
+            match &preds[..] {
+                [p] => b = p.clone(),
+                _ => break false,
+            }
+        };
+        assert!(after_outer_head, "wave64 {wave64}: the inner count is set back in {} after {} - 1:\n{nested}", again[0], at_entry[0]);
+        // neither for a loop-free compute program nor for a kernel with the loop
+        let none = dis(&straight).unwrap();
+        assert_eq!(loop_counts(&none), (0, 0, None), "wave64 {wave64}:\n{none}");
+        let kernel = super::validate::disassemble(&translate(&endless_loop(), o).unwrap()).unwrap();
+        assert_eq!(loop_counts(&kernel), (0, 1, None), "wave64 {wave64}:\n{kernel}");
+    }
+}
+
+/// A loop of `passes` passes (0: one that only ends when its counter wraps to 0) inside one
+/// of `entries` passes; each pass stores the inner passes run so far to [v0 * 4], so what a
+/// thread stored last is what it ran before its loops (or its program) ended.
+fn counted_loops(passes: u32, entries: u32) -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        // the outer loop
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        // the inner loop
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 12), ("SSRC1", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 12)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 255)], Some(passes)),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF8)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 11), ("SSRC0", 11), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 11), ("SSRC1", 255)], Some(entries)),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF3)], None),
+    ])
+}
+
+/// One loop that only ends when its counter wraps to 0, storing its passes so far to [v0 * 4]
+/// in each.
+fn endless_storing_loop() -> Vec<u8> {
+    prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 10)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFA)], None),
+    ])
+}
+
+/// The direct translator's compute loops on the GPU (the HLSL path's
+/// `gpu_compute_loop_passes_follow_the_dispatch`): an entry of a loop runs the passes the
+/// dispatch's share gives a thread (`IO_LOOP_BUDGET` among the group's threads, between 1024
+/// and 65 536; 0: the lane's 65 536), the same in every thread, in wave32 and split wave64. A
+/// loop that runs out ends the thread's program (the HLSL path goes on after it): the last
+/// store shows where. Each entry of an inner loop has a fresh count: three entries of 1024
+/// passes run under a share of 1024, and a 1025th pass in one entry ends the program.
+#[test]
+fn gpu_direct_compute_loop_passes_follow_the_dispatch() {
+    use crate::gpu::recomp::{runner, CsInterface, IO_LOOP_BUDGET, KERNEL_SGPRS};
+    match runner::wave32_supported() {
+        Ok(true) => {}
+        Ok(false) => return runner::skip_test("no wave32"),
+        Err(e) => return runner::skip_test(&e),
+    }
+    let threads = 64u32;
+    let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    for wave64 in [false, true] {
+        let o = KernelOptions { wave64, split: wave64, mem_windows: 1, sampler_base: 0 };
+        let run = |code: &[u8], slot: u32| -> u32 {
+            let k = super::kernel::translate_compute(code, o, &cs).unwrap_or_else(|e| panic!("{e}"));
+            let mut io = vec![0u32; KERNEL_SGPRS];
+            io[IO_LOOP_BUDGET] = slot;
+            let mem = runner::dispatch(&k.dxil, [1, 1, 1], &io, &vec![0xFFFF_FFFFu32; threads as usize]).expect("GPU run");
+            for (t, &got) in mem.iter().take(threads as usize).enumerate() {
+                assert_eq!(got, mem[0], "wave64 {wave64}, slot {slot}: thread {t}");
+            }
+            mem[0]
+        };
+        // (the slot, passes): not known; 5000 a thread; shares below and above the bounds
+        for (slot, passes) in [(0u32, 65_536u32), (threads * 5000, 5000), (1, 1024), (u32::MAX, 65_536)] {
+            assert_eq!(run(&endless_storing_loop(), slot), passes, "wave64 {wave64}, slot {slot}");
+        }
+        assert_eq!(run(&counted_loops(1024, 3), 1), 3 * 1024, "wave64 {wave64}: three entries of 1024");
+        assert_eq!(run(&counted_loops(1025, 3), 1), 1024, "wave64 {wave64}: a 1025th pass");
+        assert_eq!(run(&counted_loops(1025, 3), 0), 3 * 1025, "wave64 {wave64}: no share");
+        assert_eq!(run(&counted_loops(0, 1), 1), 1024, "wave64 {wave64}: an endless inner loop");
+    }
+}

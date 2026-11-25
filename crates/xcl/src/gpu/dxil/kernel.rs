@@ -9,11 +9,11 @@
 //! `recomp::CsInterface`): user SGPRs from `io`, then the enabled group ids
 //! and TG_SIZE; v0..v2 = thread id in the group; results only through memory.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::cfg::{Cfg, Term};
 use super::container::Stage;
-use super::lower::{ComputeInit, Init, Lw, Partner, VAR_BUDGET, VAR_SCC, VAR_VGPR};
+use super::lower::{ComputeInit, Init, Lw, Partner, LOOP_BUDGET, VAR_BUDGET, VAR_LOOP_PASSES, VAR_SCC, VAR_VGPR};
 use super::module::{Block, Pred, Value};
 use super::shader::{RawUav, Shader};
 use super::ssa::Ssa;
@@ -319,6 +319,8 @@ fn translate_on_this_thread(
         lw.edge(Block(0), h0);
     }
     let switch = if two_phase { Some(lw.block(None)) } else { None };
+    // a compute program's loops: each entry has its own count of passes besides the lane's budget
+    let passes = if compute && plan.is_none() && !cfg.headers.is_empty() { Some(loop_passes(&mut lw, &cfg, numthreads.iter().product())) } else { None };
     // scalar loads the program repeats keep their first values (compute programs and kernels:
     // the other stages enter their code by edges the CFG does not hold)
     let reloads = if follow_loads { super::reload::analyze(&cfg) } else { Default::default() };
@@ -344,6 +346,26 @@ fn translate_on_this_thread(
         }
         let end = if es_block { switch.unwrap() } else { exit };
         if cfg.headers.contains(&b) {
+            if let Some((cap, inside)) = &passes {
+                // this entry of the loop has a pass less (`Em::loop_guard`'s `xcl_n<k>`), and the
+                // loops directly inside it start afresh. In a reducible CFG every path that enters
+                // a loop, first or again, passes the head of the loop around it, which lies outside
+                // the inner one: a reset there is one on each entry. A loop that runs out leaves to
+                // `end` and ends the lane's program, where the HLSL path's break goes on after the
+                // loop: both end a loop that ran away, neither gives a right result.
+                let var = VAR_LOOP_PASSES + b as u32;
+                let n = lw.rd(var);
+                let none = lw.cmpc(Pred::Eq, n, 0);
+                let cont = lw.block(Some(1));
+                lw.cond_br(none, end, cont);
+                lw.s.m.set_block(cont);
+                let one = lw.c(1);
+                let n = lw.sub(n, one);
+                lw.wr(var, n);
+                for &c in inside.get(&b).into_iter().flatten() {
+                    lw.wr(VAR_LOOP_PASSES + c as u32, *cap);
+                }
+            }
             // a lane's loop iterations are capped (the recompiler's LOOP_GUARD)
             let left = lw.rd(VAR_BUDGET);
             let none = lw.cmpc(Pred::Eq, left, 0);
@@ -693,6 +715,39 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
         }
     }
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
+}
+
+/// A compute program's count of passes for each entry of a loop (the HLSL compute mode's
+/// `xcl_cap`): the dispatch's share for a group (`IO_LOOP_BUDGET`, loaded once in the entry
+/// block; 0 = not known: `LOOP_BUDGET`) among its `threads`, between `DISPATCH_LOOP_PASSES_MIN`
+/// and `LOOP_BUDGET`, set there for every loop. Returns it and the loops directly inside each
+/// loop (`cfg::loop_parents`), whose counts that loop's head sets back to it.
+fn loop_passes(lw: &mut Lw, cfg: &Cfg, threads: u32) -> (Value, BTreeMap<usize, Vec<usize>>) {
+    use crate::gpu::recomp::{DISPATCH_LOOP_PASSES_MIN, IO_LOOP_BUDGET};
+    let cur = lw.cur();
+    let before = lw.s.m.set_insert_before_term(true);
+    lw.s.m.set_block(lw.init.entry);
+    let io = lw.init.io.expect("io");
+    let off = lw.c(IO_LOOP_BUDGET as u32 * 4);
+    let share = lw.s.raw_load(io, off, 1)[0];
+    let k = lw.c(threads.max(1));
+    let each = lw.bin(super::module::BinOp::UDiv, share, k);
+    let lo = lw.c(DISPATCH_LOOP_PASSES_MIN);
+    let each = lw.umax(each, lo);
+    let hi = lw.c(LOOP_BUDGET);
+    let each = lw.umin(each, hi);
+    let unknown = lw.cmpc(Pred::Eq, share, 0);
+    let cap = lw.sel(unknown, hi, each);
+    let mut inside: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (h, around) in super::cfg::loop_parents(cfg) {
+        lw.wr(VAR_LOOP_PASSES + h as u32, cap);
+        if let Some(p) = around {
+            inside.entry(p).or_default().push(h);
+        }
+    }
+    lw.s.m.set_block(cur);
+    lw.s.m.set_insert_before_term(before);
+    (cap, inside)
 }
 
 /// The mesh entry's registers (the HLSL mesh mode's prologue): SGPRs from `io` with the
