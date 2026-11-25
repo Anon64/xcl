@@ -3545,6 +3545,18 @@ fn gpu_mesh_mode_exports_stay_inside_the_record() {
     let count = |what: &str| hlsl.hlsl.matches(what).count();
     assert_eq!((count("res.Store((xcl_vtx"), count("res.Store(xcl_prm")), (4, 1), "{}", hlsl.hlsl);
     assert_eq!((count("if (xcl_vok) res.Store((xcl_vtx"), count("if (xcl_pok) res.Store(xcl_prm")), (4, 1), "an export without its bound:\n{}", hlsl.hlsl);
+    // a title's layout on a 32-lane GPU: split wave64, 16 memory windows from the descriptor
+    // heap (the direct translator leaves this s_barrier of two console waves to the HLSL path)
+    let split = translate(&code, &Options { mode: Mode::Mesh(ms.clone()), wave64: true, split_wave64: true, mem_windows: super::HEAP_WINDOWS | 16, ..Default::default() }).unwrap();
+    assert!(split.complete(), "split, 16 heap windows: {:?}", split.unsupported_why);
+    if std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0") {
+        assert!(split.hlsl.contains("xcl_s_barrier();"), "split, 16 heap windows: expected xcl_s_barrier()");
+    }
+    if dxc::location().is_ok() {
+        dxc::compile(&split.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("split, 16 heap windows: {e}\n{}", split.hlsl));
+    } else {
+        runner::skip_test("no DXC");
+    }
     if !gpu_ready() || !mesh_ready() {
         return;
     }
@@ -4816,10 +4828,20 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     } else {
         runner::skip_test("no wave64");
     }
-    // the direct DXIL translator's compute pass computes the same, split and native
+    // the direct DXIL translator's compute pass computes the same, split and native (the split
+    // form with an ES phase is left to the HLSL path while the safe barrier is wanted, as
+    // `pso::console_geometry` falls back)
     let direct = |split: bool| {
         let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
-        let cs = crate::gpu::dxil::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(2000)])).dxil;
+        let cs = match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
+            Ok(k) => k.dxil,
+            Err(e) if e.contains("split wave64 geometry: the ES phase exchanges at group barriers") => {
+                let t = translate_geometry(&code, g.clone(), split, 1).unwrap();
+                assert!(t.complete(), "{:?}", t.unsupported_why);
+                dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"))
+            }
+            Err(e) => panic!("{}", &e[..e.len().min(2000)]),
+        };
         let mem = runner::dispatch(&cs, [1, 1, 1], &io, &vec![0u32; 0x400 / 4 + 3 * 64]).unwrap();
         let got: Vec<[u32; 3]> = (0..64).map(|l| [0, 1, 2].map(|k| mem[0x100 + 64 * k + l])).collect();
         let wrong: Vec<_> = (0..64).filter(|&l| got[l] != want[l]).map(|l| (l, got[l], want[l])).collect();

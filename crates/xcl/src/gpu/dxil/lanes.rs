@@ -4,10 +4,13 @@
 //! value built with `WaveActiveBallot`; a lane tests its own bit
 //! ([`Lw::lanebit`], cached per block). In the split form (a wave64 console
 //! program on a GPU with 32-lane waves only, `docs/wave64-on-wave32.md`) the
-//! two hardware halves of the console wave are the whole thread group and
-//! meet at a group barrier to exchange one word each: ballot words and
-//! `v_readlane` values. Lane reads the ISA keeps inside a 32-lane half (DPP,
-//! `ds_swizzle`, permlane) need no exchange.
+//! two hardware halves of a console wave exchange one word each: ballot words
+//! and `v_readlane` values. Those of a compute or mesh group meet through
+//! bounded groupshared counters (`Partner::Spin`), however many console waves
+//! it has; only the ES phase of a geometry pass (direct only with
+//! `XCL_SAFE_BARRIER=0`) and the tests' kernel form meet at a group barrier.
+//! Lane reads the ISA keeps inside a 32-lane half (DPP, `ds_swizzle`,
+//! permlane) need no exchange.
 
 use super::lower::{Lw, Partner};
 use super::module::{BinOp, Pred, RmwOp, Value};
@@ -255,8 +258,8 @@ impl Lw {
         out
     }
 
-    /// The spin exchange (several console waves per group): the HLSL `xcl_x_meet` with
-    /// `XCL_X_SPIN`. Each half stores its words in its slot (double-buffered by the parity
+    /// The spin exchange (a compute or mesh group, of one console wave or several): the HLSL
+    /// `xcl_x_meet` with `XCL_X_SPIN`. Each half stores its words in its slot (double-buffered by the parity
     /// of the exchange count), fences, adds its lane count to its arrival counter and waits
     /// (one lane, bounded) for the partner's counter; a partner that never arrives marks
     /// the wave dead and its exchanges give 0 from then on.

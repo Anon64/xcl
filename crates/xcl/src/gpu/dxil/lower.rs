@@ -25,8 +25,8 @@ pub const VAR_BUDGET: u32 = 128 + 256;
 pub const VAR_FP16_RM: u32 = VAR_BUDGET + 1;
 /// the memory window the next access uses (`xcl_w`)
 pub const VAR_WIN: u32 = VAR_BUDGET + 2;
-/// split form, several console waves per group: exchanges so far, and the "partner never
-/// arrived" flag (`xcl_xk`, `xcl_x_dead`)
+/// split form, the spin exchange (compute and mesh groups): exchanges so far, and the "partner
+/// never arrived" flag (`xcl_xk`, `xcl_x_dead`)
 pub const VAR_XK: u32 = VAR_BUDGET + 3;
 pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
 /// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
@@ -157,7 +157,8 @@ impl Init {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Partner {
     Present,
-    /// several console waves per group: the halves pair up through arrival counters
+    /// a compute or mesh group (one console wave or several): the halves pair up through
+    /// arrival counters
     Spin,
     Missing,
     Unsupported(&'static str),
