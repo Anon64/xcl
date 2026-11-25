@@ -95,16 +95,19 @@ fn direct_or_hlsl(code: &[u8], o: KernelOptions, g: &GsInterface) -> Vec<u8> {
     }
 }
 
-/// Both forms, ES alone, GS alone and four memory windows translate and validate (the split
-/// form with an ES phase on the HLSL path while the safe barrier is wanted).
+/// Both forms, ES alone, GS alone, four memory windows and a title's (the heap's and 16) translate
+/// and validate (the split form with an ES phase on the HLSL path while the safe barrier is wanted).
 #[test]
 fn geometry_forms_validate() {
     let (code, g) = branchy_program();
+    let heap = crate::gpu::recomp::HEAP_WINDOWS | 16;
     for split in [false, true] {
         direct_or_hlsl(&code, opts(split, 1), &g);
         direct_or_hlsl(&code, opts(split, 4), &g);
+        direct_or_hlsl(&code, opts(split, heap), &g);
         let es_alone = GsInterface { gs_start: None, ..g.clone() };
         direct_or_hlsl(&code[..4], opts(split, 1), &es_alone);
+        direct_or_hlsl(&code[..4], opts(split, heap), &es_alone);
         let gs_alone = GsInterface { gs_start: Some(0), ..g.clone() };
         translate_geometry(&code[4..], opts(split, 1), &gs_alone).unwrap_or_else(|e| panic!("GS alone: {e}"));
     }
