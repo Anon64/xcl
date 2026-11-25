@@ -416,11 +416,20 @@ mod tests {
         assert_eq!(parents(deep), [(1, None), (2, Some(1)), (3, Some(2))]);
     }
 
-    /// Both back edges make the loop: the inner loop 3 lies only on the path of the second (4 → 1).
+    /// Both back edges make the loop: each of 3 → 1 and 5 → 1 has an inner loop (2 ⟲, 4 ⟲) only
+    /// on its own path, so a body of either back edge alone leaves one of them outermost.
     #[test]
     fn loop_parents_of_a_loop_with_two_back_edges() {
-        let b = vec![blk(Jump(1)), blk(Cond(0, 2, 3)), blk(Cond(0, 1, 5)), blk(Cond(0, 3, 4)), blk(Jump(1)), blk(End)];
-        assert_eq!(parents(b), [(1, None), (3, Some(1))]);
+        let b = vec![blk(Jump(1)), blk(Cond(0, 2, 4)), blk(Cond(0, 2, 3)), blk(Jump(1)), blk(Cond(0, 4, 5)), blk(Cond(0, 1, 6)), blk(End)];
+        assert_eq!(parents(b), [(1, None), (2, Some(1)), (4, Some(1))]);
+    }
+
+    /// A loop entered in the middle, after `make_reducible` split it (0 → {3 | 1}, 1 → 2's copy,
+    /// cycle 2 → 3 → {2 | 4}): one loop, at 3.
+    #[test]
+    fn loop_parents_of_a_split_loop() {
+        let b = vec![blk(Cond(0, 3, 1)), blk(Jump(2)), blk(Jump(3)), blk(Cond(0, 2, 4)), blk(End)];
+        assert_eq!(parents(b), [(3, None)]);
     }
 
     /// The outer body enters the inner loop 4 from two blocks (2 and 3).
