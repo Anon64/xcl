@@ -446,11 +446,19 @@ fn reserve_global(count: u32) -> Option<u32> {
     let (cap, mut next) = (s.cap, s.next);
     let r = take_range(&mut s.free, &mut next, cap, count);
     s.next = next;
-    if r.is_none() {
+    let used = in_use(s.next, &s.free);
+    if r.is_some() {
+        let placed = PAGES_PLACED.fetch_add(1, Relaxed) + 1;
+        let marks = marks_passed(used, cap);
+        if marks > FILL_SAID.fetch_max(marks, Relaxed) {
+            crate::xlog_info!("console descriptor heaps: the shared heap is past {} % full: {used} of its {cap} descriptors in use, {placed} pages placed", FILL_MARKS[marks - 1]);
+        }
+    } else {
         let n = NO_ROOM.fetch_add(1, Relaxed) + 1;
         if n.is_power_of_two() {
             crate::xlog_warn!(
-                "console descriptor heaps: the shared heap ({cap}) is full – a page of slots found no place there ({n} times so far): those slots name the null views at 0 / 1, shaders see none of their views"
+                "console descriptor heaps: the shared heap ({cap}) is full – a page of slots found no place there ({n} times so far; {used} descriptors in use, {} pages placed): those slots name the null views at 0 / 1, shaders see none of their views",
+                PAGES_PLACED.load(Relaxed)
             );
         }
     }
@@ -459,6 +467,24 @@ fn reserve_global(count: u32) -> Option<u32> {
 
 /// Pages that asked for a place in the shared heap and found no room (each try counts).
 static NO_ROOM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Pages of console heaps with a place in the shared heap now.
+static PAGES_PLACED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// How many of `FILL_MARKS` the log has said the shared heap passed.
+static FILL_SAID: AtomicUsize = AtomicUsize::new(0);
+
+/// How full the shared heap is said to be in the log (percent), each once, the first time.
+const FILL_MARKS: [u32; 3] = [50, 75, 90];
+
+/// Descriptors of the shared heap handed out: those below the cursor `next` but the released
+/// ranges in `free` (the null views and the memory windows at its start count).
+fn in_use(next: u32, free: &[(u32, u32)]) -> u32 {
+    next.saturating_sub(free.iter().map(|&(_, n)| n).sum())
+}
+
+/// How many of `FILL_MARKS` `used` descriptors of a shared heap of `cap` are past.
+fn marks_passed(used: u32, cap: u32) -> usize {
+    FILL_MARKS.iter().filter(|&&m| used as u64 * 100 > m as u64 * cap as u64).count()
+}
 
 /// The place in the shared heap of the page slot `k` of `h` is in – (index of the page's
 /// first SRV there, the page's first slot) – given now if the page has none yet. None: the
@@ -601,6 +627,7 @@ pub fn unregister(obj: usize) {
     if let Some(h) = gone {
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
             release_global(f, page_descriptors(h.n, p as u32));
+            PAGES_PLACED.fetch_sub(1, Relaxed);
         }
         match h.memory {
             Memory::Sparse => {
@@ -851,6 +878,18 @@ mod tests {
         assert_eq!(take_range(&mut free, &mut next, 100, 20), Some(80));
         assert_eq!(take_range(&mut free, &mut next, 100, 10), Some(30));
         assert!(free.is_empty());
+    }
+
+    /// How full the shared heap is: descriptors below the cursor but the released ones, and the
+    /// marks (50, 75, 90 %) that use is past.
+    #[test]
+    fn shared_heap_use_and_the_marks_it_passes() {
+        assert_eq!(in_use(100, &[]), 100);
+        assert_eq!(in_use(100, &[(20, 10), (50, 6)]), 84);
+        for (used, marks) in [(0, 0), (500, 0), (501, 1), (750, 1), (751, 2), (900, 2), (901, 3), (1000, 3)] {
+            assert_eq!(marks_passed(used, 1000), marks, "{used} of 1000");
+        }
+        assert_eq!(marks_passed(1 << 21, 1 << 21), 3, "no overflow at the largest heap");
     }
 
     #[test]
@@ -1183,6 +1222,7 @@ mod tests {
             assert_eq!((s.index, s.shared_srv), (0, 0), "slot {k} of the second heap: no room for its page");
         }
         assert_eq!(NO_ROOM.load(Relaxed), 17, "every page that found no room, each time");
+        assert_eq!((PAGES_PLACED.load(Relaxed), FILL_SAID.load(Relaxed)), (1, FILL_MARKS.len()), "one page placed; the heap is past every mark");
         // a 2D T# copied into a slot without a place names the null views
         write(&placed, &[base + 4, 0x0470_0000, 0, 9 << 28, 0, 0, 0, 0]);
         copy_words(&placed, &s);
@@ -1193,7 +1233,9 @@ mod tests {
         let s = slot(b + 2 * SLOT as u64).unwrap();
         assert_eq!(s.index, base + 4);
         assert_ne!(s.shared_srv, 0);
+        assert_eq!(PAGES_PLACED.load(Relaxed), 1, "the first heap's page went with it");
         unregister(0xC2);
+        assert_eq!(PAGES_PLACED.load(Relaxed), 0);
         *GLOBAL.lock().unwrap() = None;
     }
 
