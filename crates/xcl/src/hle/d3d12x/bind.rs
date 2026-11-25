@@ -71,11 +71,61 @@ struct TwoPassBuf {
 }
 
 impl TwoPassBuf {
+    /// A new buffer of `bytes`, if the two-pass buffers alive stay within `two_pass_cap` with it
+    /// (the free ones in `FREE_RES` go first to make room). Past it: an error, and the draw that
+    /// asked is skipped.
     unsafe fn make(dev: &ID3D12Device, bytes: u64, what: &str) -> Result<Self, String> {
-        let res = default_uav_buffer(dev, bytes, what)?;
-        TWO_PASS[TP_ALIVE].fetch_add(bytes, Ordering::Relaxed);
+        let cap = two_pass_cap();
+        if !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
+            // (the GPU is done with those: let go outside the lock)
+            let over = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed).saturating_add(bytes).saturating_sub(cap);
+            let gone = FREE_RES.lock().unwrap().take_room(over);
+            drop(gone);
+            if !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
+                note_two_pass(TP_REFUSED);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::xlog_warn!(
+                        "D3D12.X: a {what} of {} KiB would take the two-pass buffers alive past {} MiB (XCL_TWO_PASS_MB): its draw is skipped",
+                        bytes >> 10,
+                        cap >> 20
+                    );
+                }
+                return Err(format!("the two-pass buffers alive are at {} MiB (XCL_TWO_PASS_MB)", cap >> 20));
+            }
+        }
+        let res = match default_uav_buffer(dev, bytes, what) {
+            Ok(r) => r,
+            Err(e) => {
+                TWO_PASS[TP_ALIVE].fetch_sub(bytes, Ordering::Relaxed);
+                return Err(e);
+            }
+        };
         note_two_pass(TP_MADE);
         Ok(TwoPassBuf { res, bytes, dev: dev.as_raw() as usize })
+    }
+}
+
+/// Most bytes of two-pass buffers alive at once (`XCL_TWO_PASS_MB`, 1024 MiB by default): those
+/// recordings hold until the GPU is done with them, and the free ones. Each is a committed buffer
+/// in video memory, on a card that may be nearly full.
+fn two_pass_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let mb = std::env::var("XCL_TWO_PASS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024);
+        mb.saturating_mul(1 << 20)
+    })
+}
+
+/// `bytes` more counted in `alive` if it stays within `cap` (whether it did).
+fn reserve(alive: &AtomicU64, bytes: u64, cap: u64) -> bool {
+    let mut a = alive.load(Ordering::Relaxed);
+    loop {
+        let Some(n) = a.checked_add(bytes).filter(|&n| n <= cap) else { return false };
+        match alive.compare_exchange_weak(a, n, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(now) => a = now,
+        }
     }
 }
 
@@ -86,12 +136,14 @@ impl Drop for TwoPassBuf {
     }
 }
 
-/// Two-pass buffers made, taken again from `FREE_RES`, let go, and the bytes of those alive.
-static TWO_PASS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Two-pass buffers made, taken again from `FREE_RES`, let go, the bytes of those alive, and
+/// buffers not made for `two_pass_cap`.
+static TWO_PASS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 const TP_MADE: usize = 0;
 const TP_REUSED: usize = 1;
 const TP_GONE: usize = 2;
 const TP_ALIVE: usize = 3;
+const TP_REFUSED: usize = 4;
 
 /// One more of `TWO_PASS[k]`. Logged at most every 2 s while they change (always: each buffer
 /// made or let go is the driver's memory manager at work, in video memory that may be short).
@@ -113,12 +165,13 @@ fn note_two_pass(k: usize) {
     if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
-    let [made, reused, gone, alive] = std::array::from_fn(|i| TWO_PASS[i].load(Ordering::Relaxed));
+    let [made, reused, gone, alive, refused] = std::array::from_fn(|i| TWO_PASS[i].load(Ordering::Relaxed));
     crate::xlog_info!(
-        "D3D12.X: two-pass buffers: {made} made, {reused} taken again, {gone} let go; {} alive ({} MiB), {kept} of them kept for reuse ({} MiB)",
+        "D3D12.X: two-pass buffers: {made} made, {reused} taken again, {gone} let go; {} alive ({} MiB), {kept} of them kept for reuse ({} MiB); {refused} not made past {} MiB (XCL_TWO_PASS_MB)",
         made.saturating_sub(gone),
         alive >> 20,
-        kept_bytes >> 20
+        kept_bytes >> 20,
+        two_pass_cap() >> 20
     );
 }
 
@@ -259,6 +312,27 @@ impl<T> FreePool<T> {
         let (_, b, _, t) = self.free.remove(i);
         self.bytes -= b;
         Some(t)
+    }
+
+    /// The oldest kept, of any size and device, until they come to `bytes` or none is left.
+    fn take_room(&mut self, bytes: u64) -> Vec<T> {
+        let mut freed = 0;
+        let n = self
+            .free
+            .iter()
+            .take_while(|&&(_, b, ..)| {
+                let more = freed < bytes;
+                freed += b;
+                more
+            })
+            .count();
+        self.free
+            .drain(..n)
+            .map(|(_, b, _, t)| {
+                self.bytes -= b;
+                t
+            })
+            .collect()
     }
 
     /// What was kept `age` or longer at `now`, no recording having taken it.
@@ -2924,6 +2998,32 @@ void main(uint t : SV_GroupIndex) {
         assert!(p.take_idle(t + Duration::from_millis(1999), FREE_RES_IDLE).is_empty());
         assert_eq!(p.take_idle(t + FREE_RES_IDLE, FREE_RES_IDLE).len(), 32);
         assert_eq!((p.bytes, p.free.len()), (0, 0));
+    }
+
+    /// Two-pass buffers alive stay within the cap: one that would pass it is not counted (and not
+    /// made), and freed ones go first to make room for it, oldest first, as many as it takes.
+    #[test]
+    fn two_pass_buffers_alive_stay_within_the_cap() {
+        use std::time::Instant;
+        let mib = 1u64 << 20;
+        let alive = AtomicU64::new(0);
+        assert!(reserve(&alive, 32 * mib, 64 * mib));
+        assert!(reserve(&alive, 32 * mib, 64 * mib), "up to the cap itself");
+        assert!(!reserve(&alive, mib, 64 * mib));
+        assert_eq!(alive.load(Ordering::Relaxed), 64 * mib, "a refused one is not counted");
+        assert!(!reserve(&AtomicU64::new(u64::MAX), 1, u64::MAX), "no wrap");
+        // room from the free ones
+        let t = Instant::now();
+        let mut p: FreePool<&str> = FreePool::new(1 << 30);
+        p.put(t, 4 * mib, 1, "4");
+        p.put(t, 32 * mib, 2, "32");
+        p.put(t, mib, 1, "1");
+        assert!(p.take_room(0).is_empty());
+        assert_eq!(p.take_room(5 * mib), vec!["4", "32"]);
+        assert_eq!(p.bytes, mib);
+        assert_eq!(p.take_room(64 * mib), vec!["1"], "all there are");
+        assert_eq!((p.bytes, p.free.len()), (0, 0));
+        assert!(two_pass_cap() > 0);
     }
 
     /// A recording takes the smallest freed buffer that is large enough, of its device and within
