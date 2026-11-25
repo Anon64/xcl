@@ -8395,9 +8395,23 @@ macro_rules! queue_slots {
 }
 queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
 
-/// The calls of the queue's page-mapping method recorded so far and what they did, summed.
-static PAGE_MAPPINGS: Mutex<(u64, crate::hle::kernelx::mirrors::Mapped)> =
-    Mutex::new((0, crate::hle::kernelx::mirrors::Mapped { mapped: 0, unmapped: 0, empty: 0, elsewhere: 0 }));
+/// The calls of the queue's page-mapping method recorded so far and what they did, summed, and
+/// when their line was logged last.
+static PAGE_MAPPINGS: Mutex<(u64, crate::hle::kernelx::mirrors::Mapped, Option<std::time::Instant>)> =
+    Mutex::new((0, crate::hle::kernelx::mirrors::Mapped { mapped: 0, unmapped: 0, empty: 0, elsewhere: 0 }, None));
+
+/// What the queue's page mappings did so far: `n` calls with the totals `t`, the last one's
+/// pool, then the view pages that followed their physical page (`moved`), the textures read
+/// again for a mapping changed under them (`reread`), the pages of their uploads by where they
+/// were read (`pages`: `title_textures::page_counts`) and the GPU-view tiles linked again
+/// (`tiles`: `sparse::page_tiles`).
+fn page_mapping_line(n: u64, t: crate::hle::kernelx::mirrors::Mapped, pool: usize, pool_pages: u32, moved: u64, reread: u64, pages: [u64; 4], tiles: [u64; 2]) -> String {
+    let [a, b, c, z] = pages;
+    format!(
+        "D3D12.X: queue CopyPageMappingsBatchX: {n} calls; GPU-view pages so far: {} mapped, {} unmapped, {} named a pool page with no page mapped there, {} elsewhere ignored (pool {pool:#x}, {pool_pages} pages of 64 KiB); {moved} moved with their physical page; textures: {reread} read again for a mapping changed under them, pages of their uploads: {a} where the mapping put the page, {b} at the CPU view's same offset, {c} at that offset never mapped, {z} unmapped; tiles: {} shown anew, {} followed their page",
+        t.mapped, t.unmapped, t.empty, t.elsewhere, tiles[0], tiles[1]
+    )
+}
 
 /// command queue #29 (#31 in the newer layout) `CopyPageMappingsBatchX(count, batches, pool,
 /// pool pages, flags)`: the title maps pages of its memory into GPU views – a retail game the
@@ -8415,6 +8429,16 @@ unsafe fn q_copy_page_mappings(count: u32, batches: usize, pool: usize, pool_pag
             t.1.unmapped += d.unmapped;
             t.1.empty += d.empty;
             t.1.elsewhere += d.elsewhere;
+            // at the first call, at powers of two and when 10 s have passed since the last line
+            let now = std::time::Instant::now();
+            if t.0 == 1 || t.0.is_power_of_two() || t.2.map_or(true, |l| now.duration_since(l).as_secs() >= 10) {
+                t.2 = Some(now);
+                let (n, total) = (t.0, t.1);
+                drop(t);
+                use crate::hle::kernelx::mirrors;
+                let line = page_mapping_line(n, total, pool, pool_pages, mirrors::moved_pages(), super::title_textures::rereads(), super::title_textures::page_counts(), super::sparse::page_tiles());
+                crate::xlog_info!("{line}");
+            }
         }
         None => {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -9532,6 +9556,16 @@ mod queue_tests {
             VirtualFree(cpu as *mut c_void, 0, MEM_RELEASE);
             VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    /// The line of the queue's page mappings says each count in its place.
+    #[test]
+    fn the_page_mapping_line() {
+        let t = crate::hle::kernelx::mirrors::Mapped { mapped: 30, unmapped: 4, empty: 0, elsewhere: 2 };
+        assert_eq!(
+            page_mapping_line(8, t, 0x7200_0000_0000, 99776, 5, 6, [7, 8, 9, 10], [11, 12]),
+            "D3D12.X: queue CopyPageMappingsBatchX: 8 calls; GPU-view pages so far: 30 mapped, 4 unmapped, 0 named a pool page with no page mapped there, 2 elsewhere ignored (pool 0x720000000000, 99776 pages of 64 KiB); 5 moved with their physical page; textures: 6 read again for a mapping changed under them, pages of their uploads: 7 where the mapping put the page, 8 at the CPU view's same offset, 9 at that offset never mapped, 10 unmapped; tiles: 11 shown anew, 12 followed their page"
+        );
     }
 
     /// The newer layout's DispatchMesh (#129) is the older layout's #127, where the two-pass
