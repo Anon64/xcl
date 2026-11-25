@@ -35,6 +35,7 @@ mod scatter;
 mod shader_cache_session;
 mod sharded;
 pub mod sparse;
+mod standin;
 mod targets;
 mod watch;
 pub mod title_list;

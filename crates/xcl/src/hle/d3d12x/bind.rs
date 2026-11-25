@@ -1059,7 +1059,7 @@ fn draw_pipeline(raw: usize, resolved: usize) -> DrawPipeline {
     if let Some(tp) = super::real::two_pass_entry(resolved) {
         return DrawPipeline::TwoPass(tp);
     }
-    if resolved == raw && super::pso_async::stands_in(raw) {
+    if super::pso_async::gave_standin(raw, resolved) {
         return DrawPipeline::StandIn;
     }
     DrawPipeline::Other
@@ -1304,7 +1304,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // as for Dispatch. The PC call would run it with the list's compute root signature, which
         // can still be XCL's ABI one from a translated dispatch before it (debug layer 953).
         // A native PC compute pipeline is not one of these and still goes to the PC call.
-        if signature_dispatches(sig) && super::real::is_console_compute(pso) {
+        // (a shared stand-in's failed build resolves to the driver pipeline, which is not
+        // registered: the title's object is)
+        if signature_dispatches(sig) && (super::real::is_console_compute(pso) || super::real::is_console_compute(raw_pso)) {
             super::targets::note_dispatch();
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2606,6 +2608,25 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 1, "a dispatch of an untranslated console compute pipeline must not reach the PC ExecuteIndirect");
         assert!(after[DISPATCHES_SKIPPED] > before[DISPATCHES_SKIPPED]);
 
+        // 3b. The same with a shared stand-in (`standin::shell`): the failed build resolves to the
+        // driver pipeline, which was never registered – the title's object is
+        let shell_fail = 0x7200_0005usize;
+        let driver = 0x7200_0006usize;
+        pso_async::submit(shell_fail, true, Box::new(|| 0));
+        pso_async::shared(shell_fail, driver);
+        assert_eq!(pso_async::resolve_wait(shell_fail), driver);
+        real::register_console_compute_for_test(shell_fail);
+        reset(list_ptr, 0x7200_0100, shell_fail);
+        let before = counts_snapshot();
+        unsafe {
+            execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
+        }
+        let after = counts_snapshot();
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 1, "a failed shared stand-in's dispatch must not reach the PC ExecuteIndirect");
+        assert!(after[DISPATCHES_SKIPPED] > before[DISPATCHES_SKIPPED]);
+        let _ = pso_async::released(shell_fail);
+        real::forget_pso_for_test(shell_fail);
+
         // 4. A native PC compute pipeline (not made from a console shader) with the same Dispatch
         // signature still goes to the PC call, as on main
         let native = 0x7200_0004usize;
@@ -2689,6 +2710,12 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(pso_async::resolve_wait(failed), failed);
         assert!(matches!(draw_pipeline(failed, failed), DrawPipeline::Other), "a failed build's stand-in draws as before");
         assert!(matches!(draw_pipeline(native, native), DrawPipeline::Other));
+        // a shared stand-in (`standin::shell`): `resolve_wait` gives the driver pipeline behind it
+        let (shell, driver) = (0x7E57_7005usize, 0x7E57_7006usize);
+        pso_async::submit_lazy(shell, false, Box::new(|| 0), 0);
+        pso_async::shared(shell, driver);
+        assert!(matches!(draw_pipeline(shell, driver), DrawPipeline::StandIn), "a shared stand-in being built");
+        pso_async::released(shell);
         pso_async::released(standin);
         pso_async::released(failed);
         real::forget_pso_for_test(real_mesh);
