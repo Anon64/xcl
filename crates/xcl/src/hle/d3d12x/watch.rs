@@ -43,9 +43,11 @@ static RING_PSO: [AtomicUsize; RING] = [const { AtomicUsize::new(0) }; RING];
 /// frame (28 bits) << 36 | work (32 bits) << 4 | kind
 static RING_INFO: [AtomicU64; RING] = [const { AtomicU64::new(0) }; RING];
 
-/// kinds of work in the ring (`gpu_profile::Kind` + 1, then the two-pass mesh draws)
+/// kinds of work in the ring (`gpu_profile::Kind` + 1, then the mesh draws; 4 bits)
 pub(super) const MESH: u8 = 6;
 pub(super) const INDIRECT_MESH: u8 = 7;
+/// a DispatchMesh with a PC pipeline (a translated pass-through one)
+pub(super) const PC_MESH: u8 = 8;
 
 fn kind_name(kind: u8) -> &'static str {
     match kind {
@@ -56,6 +58,7 @@ fn kind_name(kind: u8) -> &'static str {
         5 => "ExecuteIndirect with a PC pipeline",
         MESH => "DispatchMesh in two passes",
         INDIRECT_MESH => "ExecuteIndirect (DispatchMesh) in two passes",
+        PC_MESH => "DispatchMesh",
         _ => "?",
     }
 }
@@ -78,7 +81,7 @@ fn unpack(info: u64) -> (u8, u32, u32) {
     ((info & 15) as u8, (info >> 4) as u32, (info >> 36) as u32)
 }
 
-/// A draw or dispatch with pipeline `pso` (the title's handle) goes onto a list.
+/// A draw or dispatch with pipeline `pso` (the title's handle) is recorded on a list.
 pub(super) fn note(pso: usize, kind: u8, size: [u32; 3]) {
     let i = AT.fetch_add(1, Ordering::Relaxed) & (RING - 1);
     RING_PSO[i].store(pso, Ordering::Relaxed);
@@ -112,7 +115,7 @@ fn snapshot() -> Vec<Entry> {
 /// known of a pipeline.
 fn summarise(entries: &[Entry], name: impl Fn(usize) -> String) -> Vec<String> {
     if entries.is_empty() {
-        return vec!["in flight: no draw or dispatch recorded yet".into()];
+        return vec!["recorded last: no draw or dispatch recorded yet".into()];
     }
     // (pipeline, kind) → calls, work in all, largest, last frame
     let mut by: std::collections::HashMap<(usize, u8), (u64, u64, u32, u32)> = std::collections::HashMap::new();
@@ -124,7 +127,7 @@ fn summarise(entries: &[Entry], name: impl Fn(usize) -> String) -> Vec<String> {
         s.3 = e.frame;
     }
     let (first, last) = (entries[0].frame, entries[entries.len() - 1].frame);
-    let mut lines = vec![format!("in flight: the last {} draws and dispatches (frames {first} to {last}), {} pipelines", entries.len(), by.len())];
+    let mut lines = vec![format!("recorded last: the last {} draws and dispatches (frames {first} to {last}), {} pipelines", entries.len(), by.len())];
     let mut all: Vec<((usize, u8), (u64, u64, u32, u32))> = by.into_iter().collect();
     // dispatches by the groups given (a program that runs long runs on every one of them),
     // then draws by calls; ties by address, for a stable order
@@ -141,19 +144,22 @@ fn summarise(entries: &[Entry], name: impl Fn(usize) -> String) -> Vec<String> {
         if *shown > if dispatches(*kind) { 24 } else { 12 } {
             continue;
         }
-        lines.push(format!("in flight:   {} {pso:#x} ({}): {calls} calls, {work} in all, largest {largest}, last in frame {frame}", kind_name(*kind), name(*pso)));
+        lines.push(format!("recorded last:   {} {pso:#x} ({}): {calls} calls, {work} in all, largest {largest}, last in frame {frame}", kind_name(*kind), name(*pso)));
     }
     let tail: Vec<String> = entries[entries.len().saturating_sub(24)..].iter().map(|e| format!("{} {:#x} {}", kind_name(e.kind), e.pso, e.work)).collect();
-    lines.push(format!("in flight: the last {} in order: {}", tail.len(), tail.join("; ")));
+    lines.push(format!("recorded last: the last {} in order: {}", tail.len(), tail.join("; ")));
     lines
 }
 
-/// What is known of the pipeline behind the title's handle `pso`: its console shaders.
+/// What is known of the pipeline behind the title's handle `pso`: its console shaders (no side
+/// effects: a report must not start a pipeline build). Graphics pipelines are in `pso_shaders`
+/// only while profiling; DRED's label names them otherwise.
 fn pipeline_name(pso: usize) -> String {
-    match super::real::pso_shaders(super::pso_async::resolve(pso)) {
+    let real = super::pso_async::peek(pso);
+    match super::real::pso_shaders(real) {
         Some((cs, 0)) => format!("cs {cs:016x}"),
         Some((vs, ps)) => format!("vs {vs:016x} ps {ps:016x}"),
-        None => "no console shader known".into(),
+        None => super::dred::on().then(|| super::dred::label_of(real)).flatten().unwrap_or_else(|| "no console shader known".into()),
     }
 }
 
@@ -166,7 +172,7 @@ pub(super) fn report(why: &str) {
         return;
     }
     LAST.store(now, Ordering::Relaxed);
-    crate::xlog_error!("in flight ({why}):");
+    crate::xlog_error!("recorded last ({why}):");
     for line in summarise(&snapshot(), pipeline_name) {
         crate::xlog_error!("{line}");
     }
@@ -479,9 +485,10 @@ mod tests {
 
     #[test]
     fn an_entry_packs_and_unpacks() {
-        for (kind, work, frame) in [(1u8, 0u32, 0u64), (7, u32::MAX, 0x0FFF_FFFF), (3, 1234, 5)] {
+        for (kind, work, frame) in [(1u8, 0u32, 0u64), (7, u32::MAX, 0x0FFF_FFFF), (3, 1234, 5), (PC_MESH, 9, 1)] {
             assert_eq!(unpack(pack(kind, work, frame)), (kind, work, frame as u32));
         }
+        assert_eq!(kind_name(PC_MESH), "DispatchMesh");
         // a frame count past 28 bits wraps, and does not reach the work
         assert_eq!(unpack(pack(2, 7, 0x1_0000_0003)), (2, 7, 3));
         assert_eq!(work_of([4, 5, 6]), 120);
@@ -502,13 +509,13 @@ mod tests {
             e(0x40, MESH, 12, 2),
         ];
         let lines = summarise(&entries, |pso| format!("p{pso:x}"));
-        assert_eq!(lines[0], "in flight: the last 6 draws and dispatches (frames 1 to 2), 4 pipelines");
+        assert_eq!(lines[0], "recorded last: the last 6 draws and dispatches (frames 1 to 2), 4 pipelines");
         assert!(lines[1].contains("Dispatch 0x30 (p30): 1 calls, 4000000 in all, largest 4000000, last in frame 2"), "{}", lines[1]);
         assert!(lines[2].contains("Dispatch 0x20 (p20): 2 calls, 200 in all, largest 100"), "{}", lines[2]);
         assert!(lines[3].contains("draw 0x10 (p10): 2 calls"), "{}", lines[3]);
         assert!(lines[4].contains("DispatchMesh in two passes 0x40 (p40): 1 calls"), "{}", lines[4]);
-        assert!(lines[5].starts_with("in flight: the last 6 in order: draw 0x10 6; Dispatch 0x20 100; "), "{}", lines[5]);
-        assert_eq!(summarise(&[], |_| String::new()), vec!["in flight: no draw or dispatch recorded yet".to_string()]);
+        assert!(lines[5].starts_with("recorded last: the last 6 in order: draw 0x10 6; Dispatch 0x20 100; "), "{}", lines[5]);
+        assert_eq!(summarise(&[], |_| String::new()), vec!["recorded last: no draw or dispatch recorded yet".to_string()]);
     }
 
     #[test]

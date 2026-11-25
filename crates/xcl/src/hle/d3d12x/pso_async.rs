@@ -1292,6 +1292,21 @@ mod used_tests {
         released(standin);
     }
 
+    /// `peek` names the real pipeline once built and, unlike `resolve`, neither notes a use nor
+    /// sends a lazy one to the workers.
+    #[test]
+    fn a_peek_changes_nothing() {
+        let standin = 0x7E57_C0DEusize;
+        let p = pending(0x5EED_C0DE, false);
+        PENDING.insert(standin, p.clone());
+        assert_eq!(peek(standin), standin, "not built");
+        assert!(!p.sent.load(Ordering::Acquire) && !p.used.load(Ordering::Relaxed));
+        p.real.store(0x6A6B, Ordering::Release);
+        assert_eq!(peek(standin), 0x6A6B);
+        assert_eq!(peek(0x7E57_C0DF), 0x7E57_C0DF, "not async");
+        let _ = PENDING.remove(standin);
+    }
+
     /// A pipeline for the backlog (`warm`: with its translation on its own), never built.
     fn pending(key: u64, warm: bool) -> Arc<Pending> {
         Arc::new(Pending::new(Box::new(|| 0), false, false, key, warm.then(|| Box::new(|| {}) as Warm), 0))
@@ -1725,6 +1740,12 @@ pub fn resolve(pso: usize) -> usize {
         }
         r => r,
     }
+}
+
+/// `resolve` with no side effects (for a report): the real pipeline behind `pso` once built,
+/// else `pso` itself – no use noted, nothing sent to the workers.
+pub(super) fn peek(pso: usize) -> usize {
+    entry(pso).map(|p| p.real.load(Ordering::Acquire)).filter(|&r| r != 0).unwrap_or(pso)
 }
 
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started

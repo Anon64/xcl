@@ -1161,6 +1161,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     }
     mesh_work(this, super::targets::PC);
     count(DRAWS_PC);
+    super::watch::note(raw_pso, super::watch::PC_MESH, [x, y, z]);
     pc_dm(this, x, y, z);
 }
 
