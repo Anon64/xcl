@@ -48,9 +48,15 @@ const ZERO_BUF: usize = 1 << 20;
 /// bytes of the GPU→CPU readback staging buffer
 const READBACK_STAGING: usize = 16 << 20;
 
+/// changed runs of fewer bytes go up together in a compute dispatch (`scatter`) when there are
+/// this many of them, of this many chunks at most (4 MiB, so the ring fills in pieces)
+const SCATTER_RUN: usize = 4 << 10;
+const SCATTER_FROM: usize = 16;
+const SCATTER_CHUNKS: usize = 1 << 16;
+
 const PAGE: usize = 0x1000;
 const PAGES_PER_TILE: usize = TILE / PAGE;
-const CHUNK: usize = 64;
+const CHUNK: usize = super::scatter::CHUNK;
 const CHUNKS: usize = PAGE / CHUNK;
 
 /// Fast non-cryptographic integer hasher for page/tile lookup maps on the hot submit path.
@@ -1497,7 +1503,11 @@ impl State {
         // the copies into the ring (source address, ring offset, bytes), done before their slot is
         // submitted, by the worker threads when there are many
         let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
-        for &(a, n) in runs {
+        // the many small ones first, together (the windows the open slot's dispatches write are
+        // UAVs in it until their first copy)
+        let mut uavs: Vec<usize> = Vec::new();
+        let single = self.scatter_small(runs, p, &mut open_slot, &mut jobs, &mut uavs);
+        for &(a, n) in single.as_deref().unwrap_or(runs) {
             let mut done = 0usize;
             while done < n {
                 let cur = a + done;
@@ -1514,29 +1524,20 @@ impl State {
                 let b = self.windows[wi].0;
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let (aligned, chunk) = plan_ring_chunk(self.ring_write, (n - done).min(to_win_end), STAGING);
-                if (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
-                    self.reclaim_ring();
-                    if (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
-                        if let Some(slot_idx) = open_slot.take() {
-                            run_copies(&mut jobs, p);
-                            self.submit_slot(slot_idx);
-                            self.reclaim_ring();
-                        }
-                        while (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
-                            let Some(&(fv, _)) = self.inflight.front() else { break };
-                            self.wait_for(fv);
-                            self.reclaim_ring();
-                        }
-                    }
-                }
+                self.ring_room(aligned + chunk as u64, p, &mut open_slot, &mut jobs);
                 let slot_idx = match open_slot {
                     Some(idx) => idx,
                     None => {
+                        uavs.clear();
                         let idx = self.begin_slot();
                         open_slot = Some(idx);
                         idx
                     }
                 };
+                if let Some(k) = uavs.iter().position(|&w| w == wi) {
+                    uavs.swap_remove(k);
+                    self.slots[slot_idx].list.ResourceBarrier(&[uav_to_copy(&self.windows[wi].1)]);
+                }
                 let dst_off = (aligned as usize) % STAGING;
                 jobs.push((cur, dst_off, chunk));
                 let staging_res = &self.staging.as_ref().unwrap().0;
@@ -1549,6 +1550,111 @@ impl State {
             run_copies(&mut jobs, p);
             self.submit_slot(slot_idx);
         }
+    }
+
+    /// Room in the upload ring up to its position `end`: what the GPU is done with is taken back;
+    /// when that is not enough, the open slot is submitted and the GPU waited for.
+    unsafe fn ring_room(&mut self, end: u64, p: *mut u8, open_slot: &mut Option<usize>, jobs: &mut Vec<(usize, usize, usize)>) {
+        if end.saturating_sub(self.ring_free) <= STAGING as u64 {
+            return;
+        }
+        self.reclaim_ring();
+        if end.saturating_sub(self.ring_free) <= STAGING as u64 {
+            return;
+        }
+        if let Some(slot_idx) = open_slot.take() {
+            run_copies(jobs, p);
+            self.submit_slot(slot_idx);
+            self.reclaim_ring();
+        }
+        while end.saturating_sub(self.ring_free) > STAGING as u64 {
+            let Some(&(fv, _)) = self.inflight.front() else { break };
+            self.wait_for(fv);
+            self.reclaim_ring();
+        }
+    }
+
+    /// Record the small ones of `runs` as dispatches (`scatter`) that put many of them in their
+    /// places at once, in the open slot: the runs left for a copy each (None: all of them). `uavs`
+    /// are the windows the open slot's dispatches write.
+    unsafe fn scatter_small(&mut self, runs: &[(usize, usize)], p: *mut u8, open_slot: &mut Option<usize>, jobs: &mut Vec<(usize, usize, usize)>, uavs: &mut Vec<usize>) -> Option<Vec<(usize, usize)>> {
+        if runs.len() < SCATTER_FROM || !super::scatter::on() {
+            return None;
+        }
+        // (a run that ends in the next window is cut where the window ends, by the copies)
+        let small = |&(a, n): &(usize, usize)| n < SCATTER_RUN && a % CHUNK == 0 && n % CHUNK == 0 && self.window_index(a).is_some_and(|w| a + n <= self.windows[w].0 + crate::gpu::uma::WINDOW);
+        let (small, single): (Vec<_>, Vec<_>) = runs.iter().copied().partition(small);
+        if small.len() < SCATTER_FROM {
+            return None;
+        }
+        let pass = super::scatter::of(&self.dev)?;
+        let ring_va = self.staging.as_ref()?.0.GetGPUVirtualAddress();
+        let pieces = super::scatter::pieces(&small, SCATTER_CHUNKS, |a| self.window_index(a).map(|w| (w, self.windows[w].0)));
+        let mut bound = None;
+        for piece in &pieces {
+            // the table of the piece and its chunks in one part of the ring
+            let bytes = super::scatter::Scatter::bytes(piece.chunks);
+            let mut at = self.ring_write.next_multiple_of(RING_ALIGN as u64);
+            let to_end = STAGING - at as usize % STAGING;
+            if bytes > to_end {
+                at += to_end as u64;
+            }
+            self.ring_room(at + bytes as u64, p, open_slot, jobs);
+            let slot_idx = match *open_slot {
+                Some(idx) => idx,
+                None => {
+                    uavs.clear();
+                    let idx = self.begin_slot();
+                    *open_slot = Some(idx);
+                    idx
+                }
+            };
+            let list = self.slots[slot_idx].list.clone();
+            if bound != Some((slot_idx, self.slots[slot_idx].fence_val)) {
+                bound = Some((slot_idx, self.slots[slot_idx].fence_val));
+                pass.bind(&list);
+            }
+            let off = at as usize % STAGING;
+            let mut place = p.add(off) as *mut u32;
+            let mut data = off + super::scatter::Scatter::data_at(piece.chunks);
+            for &(a, n) in &small[piece.runs.clone()] {
+                for k in 0..n / CHUNK {
+                    place.write((a - piece.base + k * CHUNK) as u32);
+                    place = place.add(1);
+                }
+                jobs.push((a, data, n));
+                data += n;
+            }
+            let (base, buf) = &self.windows[piece.window];
+            pass.dispatch(&list, piece.chunks, ring_va + off as u64, buf.GetGPUVirtualAddress() + (piece.base - base) as u64);
+            if !uavs.contains(&piece.window) {
+                uavs.push(piece.window);
+            }
+            self.ring_write = at + bytes as u64;
+            SCATTERED[0].fetch_add(1, Ordering::Relaxed);
+        }
+        SCATTERED[1].fetch_add(small.len() as u64, Ordering::Relaxed);
+        Some(single)
+    }
+}
+
+/// dispatches of `scatter_small` so far, and the runs in them
+static SCATTERED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `r`, written by a dispatch of the list, becomes the destination of a copy.
+fn uav_to_copy(r: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                // SAFETY: the list keeps no reference and the window outlives it
+                pResource: unsafe { std::mem::transmute_copy(r) },
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                StateAfter: D3D12_RESOURCE_STATE_COPY_DEST,
+            }),
+        },
     }
 }
 
@@ -2124,13 +2230,15 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             crate::xlog_info!("sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped", b >> 20, us / 1000, s.mapped.len());
             let ms = |x: &AtomicU64| x.load(Ordering::Relaxed) / 1000;
             crate::xlog_info!(
-                "sparse windows timing: write-watch {} ms ({} dirty pages), lock wait {} ms, chunk scan {} ms, upload {} ms ({} runs)",
+                "sparse windows timing: write-watch {} ms ({} dirty pages), lock wait {} ms, chunk scan {} ms, upload {} ms ({} runs, {} of them in {} dispatches)",
                 ms(&WATCH[0]),
                 WATCH[1].load(Ordering::Relaxed),
                 ms(&PHASES[0]),
                 ms(&PHASES[1]),
                 ms(&PHASES[2]),
-                PHASES[3].load(Ordering::Relaxed)
+                PHASES[3].load(Ordering::Relaxed),
+                SCATTERED[1].load(Ordering::Relaxed),
+                SCATTERED[0].load(Ordering::Relaxed)
             );
         }
     }
@@ -2205,6 +2313,110 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device of the test's own (a software one without a GPU).
+    unsafe fn test_device() -> ID3D12Device {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+        }
+        dev.expect("D3D12 device")
+    }
+
+    /// The small ones of an upload's runs go up in dispatches: each lands where it belongs (far
+    /// into the window too, next to runs that go up with a copy), and what lies between them keeps
+    /// what the GPU has there.
+    #[test]
+    fn small_runs_go_up_in_dispatches_and_leave_what_lies_between() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+        const SIZE: usize = 3 << 30;
+        unsafe {
+            let dev = test_device();
+            let mut reserved: Option<ID3D12Resource> = None;
+            if dev.CreateReservedResource(&buffer_desc(SIZE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).is_err() {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+            let window = reserved.expect("reserved buffer");
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert!(base != 0 && base % TILE == 0);
+            let mut s = new_state(&dev, vec![(base, window.clone())]).expect("state");
+            // (the 1 GiB a dispatch reaches from its base ends between the third and the fourth)
+            let tiles = [base, base + TILE, base + (1 << 30) - TILE, base + (1 << 30), base + SIZE - TILE];
+            let mut seed = 0x1234_5678_9ABC_DEF1u64;
+            let mut random = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            for &t in &tiles {
+                assert!(!VirtualAlloc(t as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                s.commit_range(t, TILE);
+                for i in 0..TILE / 8 {
+                    *(t as *mut u64).add(i) = random();
+                }
+            }
+            // all of it goes up, then the CPU writes all of it again and only some runs go up
+            let all: Vec<(usize, usize)> = tiles.iter().map(|&t| (t, TILE)).collect();
+            s.upload_dirty(&all);
+            let on_gpu: Vec<Vec<u8>> = tiles.iter().map(|&t| std::slice::from_raw_parts(t as *const u8, TILE).to_vec()).collect();
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for &t in &tiles {
+                for i in 0..TILE / 8 {
+                    *(t as *mut u64).add(i) = random();
+                }
+                let mut o = 0;
+                loop {
+                    o += CHUNK * (1 + random() as usize % 9);
+                    let n = if random() % 23 == 0 { SCATTER_RUN + CHUNK * (random() as usize % 40) } else { CHUNK * (1 + random() as usize % 12) };
+                    if o + n > TILE {
+                        break;
+                    }
+                    runs.push((t + o, n));
+                    o += n;
+                }
+            }
+            let small = runs.iter().filter(|r| r.1 < SCATTER_RUN).count() as u64;
+            let counts = || (SCATTERED[0].load(Ordering::Relaxed), SCATTERED[1].load(Ordering::Relaxed));
+            let before = counts();
+            s.upload_dirty(&runs);
+            let after = counts();
+            assert!(small > 300 && runs.len() as u64 > small, "{small} small runs of {}", runs.len());
+            assert!(after.0 - before.0 >= 3 && after.1 - before.1 >= small, "{} dispatches of {} runs", after.0 - before.0, after.1 - before.1);
+
+            let mut d = buffer_desc((tiles.len() * TILE) as u64);
+            d.Flags = D3D12_RESOURCE_FLAG_NONE;
+            let mut back: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut back).expect("readback buffer");
+            let back = back.expect("readback buffer");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+            for (k, &t) in tiles.iter().enumerate() {
+                list.CopyBufferRegion(&back, (k * TILE) as u64, &window, (t - base) as u64, TILE as u64);
+            }
+            list.Close().expect("Close");
+            s.queue.ExecuteCommandLists(&[Some(list.cast().expect("list"))]);
+            s.signal();
+            s.wait_for(s.value);
+            let mut p = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut p)).expect("Map");
+            for (k, &t) in tiles.iter().enumerate() {
+                let mut want = on_gpu[k].clone();
+                for &(a, n) in runs.iter().filter(|r| r.0 >= t && r.0 < t + TILE) {
+                    want[a - t..a - t + n].copy_from_slice(std::slice::from_raw_parts(a as *const u8, n));
+                }
+                let got = std::slice::from_raw_parts((p as *const u8).add(k * TILE), TILE);
+                let wrong = (0..TILE / CHUNK).filter(|c| got[c * CHUNK..][..CHUNK] != want[c * CHUNK..][..CHUNK]).collect::<Vec<_>>();
+                assert!(wrong.is_empty(), "tile {k}: chunks {:?}… of {} are not what they should be", &wrong[..wrong.len().min(8)], TILE / CHUNK);
+            }
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
 
     /// A copy back after a title submission does not wait for the title's queue: that queue can
     /// be waiting for work the title submits next, from the thread that is in here. The copy
