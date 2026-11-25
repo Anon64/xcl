@@ -1351,10 +1351,11 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     }
     away.at.remove(&old);
     away.page.remove(&page);
-    std::ptr::copy_nonoverlapping(old as *const u8, at as *mut u8, PHYS_PAGE);
+    // (before its bytes come, as in `map_pages`)
     if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
         crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
     }
+    std::ptr::copy_nonoverlapping(old as *const u8, at as *mut u8, PHYS_PAGE);
     release_at(old);
     away.at.insert(at, page);
     away.page.insert(page, at);
@@ -1540,7 +1541,13 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
             return std::ptr::null_mut();
         }
+        let in_sparse = crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at));
         if committed_page(home) {
+            // (told before its bytes come: a look for CPU writes between the two would take the
+            // written pages of a tile that has no video memory yet, and nothing reported them again)
+            if in_sparse {
+                crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
+            }
             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
             // (giving homes back decommits them, and one may be an address in the run)
             if sparse_run.holds(home) || away.gone.len() + 1 >= GIVE_BACK_PAGES {
@@ -1549,11 +1556,13 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             if move_home_away(away, home) {
                 (at_run, home_run) = Default::default();
             }
-        } else if !fresh {
-            std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
-        }
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-            sparse_run.add(at);
+        } else {
+            if !fresh {
+                std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
+            }
+            if in_sparse {
+                sparse_run.add(at);
+            }
         }
         away.at.insert(at, p);
         away.page.insert(p, at);
