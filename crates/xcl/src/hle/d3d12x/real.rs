@@ -4354,6 +4354,28 @@ pub(super) fn huge_pso_bytes() -> usize {
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_BYTES").ok().as_deref(), 256 << 10, 1, usize::MAX))
 }
 
+/// `XCL_SKIP_CS_KB=<n>`: the DXIL size in bytes from which a compute program gets no pipeline
+/// (a diagnostic); None: not set, 0 or not a number.
+fn skip_cs_bytes() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| skip_cs_bytes_of(std::env::var("XCL_SKIP_CS_KB").ok().as_deref()))
+}
+
+fn skip_cs_bytes_of(v: Option<&str>) -> Option<usize> {
+    v.and_then(|v| v.trim().parse::<usize>().ok()).filter(|&kb| kb > 0).map(|kb| kb.saturating_mul(1024))
+}
+
+#[cfg(test)]
+mod skip_cs_tests {
+    #[test]
+    fn the_skip_size_is_in_kib_and_off_unless_a_positive_number() {
+        assert_eq!(super::skip_cs_bytes_of(Some(" 400 ")), Some(400 << 10));
+        assert_eq!(super::skip_cs_bytes_of(Some("0")), None);
+        assert_eq!(super::skip_cs_bytes_of(Some("big")), None);
+        assert_eq!(super::skip_cs_bytes_of(None), None);
+    }
+}
+
 /// Huge driver compiles at once on the workers (default 1, `XCL_HUGE_PSO_CONCURRENCY`).
 fn huge_pso_concurrency() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -4855,6 +4877,18 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         }
     };
     let dxil = compiled.dxil;
+    // `XCL_SKIP_CS_KB=<n>` (a diagnostic): a program with n KiB of DXIL or more gets no pipeline
+    // and its dispatches are skipped. The biggest programs are most of the driver code a retail
+    // title's world has in use at once, and an NVIDIA driver removes the device when that passes
+    // 512 MiB (xcl-dev/xcl#2403): without them a run lives long enough to look at the rest.
+    if skip_cs_bytes().is_some_and(|n| dxil.len() >= n) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: XCL_SKIP_CS_KB: a compute program of {} KiB of DXIL (record {:016x}) gets no pipeline, its dispatches are skipped ({n} so far)", dxil.len() >> 10, crate::gpu::shader::fnv64(cs));
+        }
+        return Some(Err(()));
+    }
     // a big program: the driver's compile takes it seconds to a minute (a retail game's 1 MB
     // ray-tracing resolve programs ~30 s each, ~600 of them): built in the background like one
     // whose DXIL is missing – the title's loading does not wait for it, its first bind does
