@@ -1666,6 +1666,14 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
     let Some((vs, ps)) = super::real::pso_shaders(super::pso_async::resolve(pso)) else { return };
     let rt = super::present::rt0_resource(this as usize).unwrap_or(0);
     let desc = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0, d.SampleDesc.Count) });
+    // `XCL_TRACE_FORMATS=26,29` (DXGI format numbers): only draws into targets of those formats –
+    // the first 160 kinds of a busy frame are its first passes, and the ones looked for (a
+    // lighting target's) never got a line
+    static FORMATS: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+    let formats = FORMATS.get_or_init(|| std::env::var("XCL_TRACE_FORMATS").unwrap_or_default().split(',').filter_map(|f| f.trim().parse().ok()).collect());
+    if !formats.is_empty() && !desc(rt).is_some_and(|d| formats.contains(&d.2)) {
+        return;
+    }
     {
         let mut g = SEEN.lock().unwrap();
         let key = (vs, ps, desc(rt));
