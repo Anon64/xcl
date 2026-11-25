@@ -916,7 +916,13 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             }
             Err(e) => {
                 p.disabled = matches!(&e, FenceError::Removed(_));
-                crate::xlog_error!("present: frame dump copy: {e}");
+                // (a copy queued behind the title's work is no stopped GPU: not the fence's
+                // text, which a watchdog reads as one; its buffers stay on the ring slot)
+                if let FenceError::Timeout(ms) = e {
+                    crate::xlog_warn!("present: frame dump copy: not finished after {ms} ms – this dump is skipped");
+                } else {
+                    crate::xlog_error!("present: frame dump copy: {e}");
+                }
                 if p.disabled {
                     return;
                 }
@@ -1421,7 +1427,10 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
             let bright = last_frame_dump().unwrap();
             assert_eq!(bright.non_dark_samples, Some(bright.sampled_pixels));
-            write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
+            // (a format no dump decodes, at the footprint's 4 bytes a texel: shared-exponent
+            // RGB is no render target's)
+            assert_eq!(texel_rgb(DXGI_FORMAT_R9G9B9E5_SHAREDEXP, &[31, 0, 0, 255]), None);
+            write_frame(&buffer, &fp, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
         }
