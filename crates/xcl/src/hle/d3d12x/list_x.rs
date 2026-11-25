@@ -392,10 +392,12 @@ fn read_back(va: u64) -> bool {
 }
 
 /// `XCL_TRACE_FRAME`: the fixed-function state a list last set (topology, first viewport and
-/// scissor, render targets) as text.
+/// scissor, render targets) as text, and what the bound DSV names (`XCL_DUMP_TARGETS` keeps that).
 pub(super) fn state_summary(list: *mut c_void) -> String {
     let mut out = String::new();
+    let mut dsv = None;
     with_bindings(list, |b| {
+        dsv = b.render_targets.as_ref().and_then(|rt| rt.dsv);
         let vp = b.viewports.first().map(|v| (v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth));
         let sc = b.scissors.first().map(|r| (r.left, r.top, r.right, r.bottom));
         out = format!(
@@ -408,6 +410,13 @@ pub(super) fn state_summary(list: *mut c_void) -> String {
             b.render_targets.as_ref().and_then(|rt| rt.dsv).map_or(String::new(), |d| format!(", DSV {d:#x}"))
         );
     });
+    // (after the bindings' lock: the map has its own)
+    if let Some(r) = dsv.and_then(super::present::rtv_resource) {
+        // SAFETY: the map holds a reference to the resource it names
+        if let Some(d) = unsafe { ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)) }.map(|x| unsafe { x.GetDesc() }) {
+            out += &format!(" names {r:#x} {}x{} PC format {} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0);
+        }
+    }
     out
 }
 

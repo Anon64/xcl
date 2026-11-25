@@ -1342,6 +1342,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if !gfx && super::real::skip_named_cs(pso) {
         return;
     }
+    // an indirect draw gets its frame trace line as a direct one (`graphics_bound`)
+    if gfx && super::present::trace_frame() {
+        trace_ui_draw(this, raw_pso);
+    }
     // (binds a compute root signature and a pipeline: before the dispatch's or draw's own)
     let checked = super::indirect_guard::check(this, pso, sig, max, args, args_off, count_buf);
     match bind_abi(this, list, pso, gfx, None, 0) {

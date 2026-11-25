@@ -2476,6 +2476,17 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if super::targets::enabled() {
         super::present::note_rtv(cpu as usize, res);
     }
+    // `XCL_TRACE_FRAME`: the first 64 DSVs of depth buffers at least 1920 wide (flags 1: read-only
+    // depth, 2: read-only stencil)
+    if super::present::trace_frame() {
+        if let Some(d) = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc()).filter(|d| d.Width >= 1920 && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 64 {
+                let (vf, flags) = copy.as_ref().map_or((0, 0), |c| (c.Format.0, c.Flags.0));
+                crate::xlog_info!("frame trace: CreateDepthStencilView {cpu:#x} → {res:p} {}x{} PC format {}, view format {vf}, flags {flags:#x}", d.Width, d.Height, d.Format.0);
+            }
+        }
+    }
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
 }
 
