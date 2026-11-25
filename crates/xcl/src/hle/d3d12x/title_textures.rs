@@ -927,9 +927,16 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
 unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty: &mut Vec<usize>, page: &mut u32) {
     let end = base + size;
     let mut at = base;
+    // (`XCL_LOOK_STATS=2`: each call timed, for the look split)
+    let split = super::look_stats::deep();
     while at < end {
         let mut n = buf.len();
-        if GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page) != 0 {
+        let t = split.then(std::time::Instant::now);
+        let failed = GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page) != 0;
+        if let Some(t) = t {
+            super::look_stats::watch_call(t.elapsed(), end - at, if failed { 0 } else { n });
+        }
+        if failed {
             break;
         }
         dirty.extend(buf[..n].iter().map(|&p| p as usize));
@@ -1193,6 +1200,9 @@ unsafe fn walk() {
             std::thread::sleep(std::time::Duration::from_millis(5));
             continue;
         };
+        // (`XCL_LOOK_STATS=2`: how long a pass takes – how long a write to a block no look takes
+        // may wait to be found)
+        let pass = super::look_stats::deep().then(std::time::Instant::now);
         for &(base, size) in ranges.iter() {
             let end = base + size;
             let mut at = base;
@@ -1235,6 +1245,9 @@ unsafe fn walk() {
                 }
                 at = stop;
             }
+        }
+        if let Some(pass) = pass {
+            super::look_stats::walk_pass(pass.elapsed());
         }
         // a pass takes the process's memory lock some hundred times (a call each); the pause keeps
         // the thread from holding up the title's own calls
@@ -1412,6 +1425,13 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
             dirty.sort_unstable();
             dirty.dedup();
             return dirty.len();
+        }
+        if super::look_stats::deep() {
+            // (the walk made a block hot since the look before began: written up to a walk pass
+            // ago, and only this look takes it)
+            let before = LOOK_BEGAN.load(Ordering::Acquire);
+            super::look_stats::walk_stale(before != 0 && WALK_FOUND.load(Ordering::Acquire) >= before);
+            super::sparse::note_look();
         }
         LOOK_BEGAN.fetch_max(began, Ordering::AcqRel);
         WATCH_BUF.with(|wcell| {
