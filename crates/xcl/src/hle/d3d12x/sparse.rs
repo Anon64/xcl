@@ -2542,10 +2542,10 @@ fn mirror_source_tile(g: usize) -> Option<usize> {
 /// GPU view of its memory, `kernelx::mirrors`): video memory, filled from the CPU view and kept in
 /// step with it, from the next submit on. Any thread; it waits for no submit (no `STATE`) and
 /// asks Windows nothing. Tiles that are not in a sparse window or in a GPU view are left out
-/// there.
-pub fn map_mirror(va: usize, len: usize) {
+/// there. Returns how many of its tiles were queued now (the others were asked for before).
+pub fn map_mirror(va: usize, len: usize) -> usize {
     if len == 0 {
-        return;
+        return 0;
     }
     let end = va.saturating_add(len);
     let mut new: Vec<usize> = Vec::new();
@@ -2560,10 +2560,12 @@ pub fn map_mirror(va: usize, len: usize) {
         }
     }
     if new.is_empty() {
-        return;
+        return 0;
     }
+    let queued = new.len();
     MIRROR_ASKS.lock().unwrap().extend(new);
     MIRROR_ASKING.store(true, Ordering::Release);
+    queued
 }
 
 /// The title's CPU memory `[a, a + n)` is decommitted by `os` (the caller's VirtualFree, called
@@ -4996,8 +4998,9 @@ mod tests {
         // (an address nothing reserves: only the asking is looked at)
         const AT: usize = 0x7ff3_0000_0000;
         let asked = returns_while_the_state_is_held(|| {
-            map_mirror(AT + 0x10, 2 * TILE);
-            map_mirror(AT + TILE, 3 * TILE);
+            assert_eq!(map_mirror(AT + 0x10, 2 * TILE), 3, "three tiles queued");
+            assert_eq!(map_mirror(AT + TILE, 3 * TILE), 1, "the fourth alone is new");
+            assert_eq!(map_mirror(AT + 0x20, 0x100), 0, "a range in tiles asked for queues none");
             // (with the state held no submit takes them)
             let asks = MIRROR_ASKS.lock().unwrap();
             for k in 0..4 {
