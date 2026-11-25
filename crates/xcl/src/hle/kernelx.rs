@@ -191,30 +191,56 @@ pub mod mirrors {
         t & PAGES_64K == PAGES_64K && t & 0x1000 == 0 && p & GRAPHICS_NOACCESS != 0 && p & 0xFF == super::mem::PAGE_NOACCESS
     }
 
+    /// The most recent CPU view of `size` bytes without a GPU view yet.
+    fn unpaired_cpu(s: &State, size: usize) -> Option<usize> {
+        let taken: Vec<usize> = s.gpu.values().map(|&(_, c)| c).collect();
+        s.cpu.iter().rev().find(|&&(b, n)| n == size && !taken.contains(&b)).map(|&(b, _)| b)
+    }
+
+    /// Whether a GPU-view reservation of `size` bytes made now would be paired (`reserved`): a
+    /// CPU view of that size waits for its GPU view.
+    pub fn would_pair(size: usize) -> bool {
+        unpaired_cpu(&STATE.lock().unwrap(), size).is_some()
+    }
+
     /// A reservation of `size` bytes at `base` with allocation type `t` and protection `p`.
-    pub fn reserved(base: usize, size: usize, t: u32, p: u32) {
+    /// True: it is a GPU view and was paired with its CPU view.
+    pub fn reserved(base: usize, size: usize, t: u32, p: u32) -> bool {
         if t & PAGES_64K != PAGES_64K || t & 0x1000 != 0 {
-            return;
+            return false;
         }
         let mut s = STATE.lock().unwrap();
         if p & GRAPHICS_NOACCESS != 0 && p & 0xFF == super::mem::PAGE_NOACCESS {
-            // the most recent CPU view of the same size without a GPU view yet
-            let taken: Vec<usize> = s.gpu.values().map(|&(_, c)| c).collect();
-            if let Some(&(cpu, _)) = s.cpu.iter().rev().find(|&&(b, n)| n == size && !taken.contains(&b)) {
+            if let Some(cpu) = unpaired_cpu(&s, size) {
                 s.gpu.insert(base, (size, cpu));
+                drop(s);
                 crate::xlog_info!("kernelx: reservation {base:#x} ({size:#x} bytes, no CPU access) is the GPU view of {cpu:#x}");
+                // what `source` says for these addresses changed (readers of GPU views look again)
+                super::note_gpu_view_change(base, size);
+                return true;
             }
         } else if p & 0xFF != super::mem::PAGE_NOACCESS {
             s.cpu.push((base, size));
         }
+        false
     }
 
-    /// The reservation at `base` was released.
+    /// The reservation at `base` was released (before its address can be handed out again: a
+    /// new reservation there would otherwise still be paired).
     pub fn released(base: usize) {
         let mut s = STATE.lock().unwrap();
         s.cpu.retain(|&(b, _)| b != base);
-        s.gpu.remove(&base);
-        s.gpu.retain(|_, &mut (_, c)| c != base);
+        let mut gone: Vec<(usize, usize)> = s.gpu.remove(&base).map(|(n, _)| (base, n)).into_iter().collect();
+        s.gpu.retain(|&g, &mut (n, c)| {
+            if c == base {
+                gone.push((g, n));
+            }
+            c != base
+        });
+        drop(s);
+        for (g, n) in gone {
+            super::note_gpu_view_change(g, n);
+        }
     }
 
     /// The CPU-view address behind `va` when `va` lies in a GPU view.
@@ -254,6 +280,25 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         let q = commit_sparse(addr as usize, size, p);
         trace_mem("VirtualAlloc (sparse commit)", addr as usize, size, t as u64, p, q as usize);
         return q;
+    }
+    // committing in a GPU view (a view window): plain pages, as before the views had windows –
+    // never the sparse windows' commit, whose tiles would take these pages for the view's bytes
+    if !addr.is_null() && t & 0x1000 != 0 && uma.is_some_and(|u| u.is_view(addr as usize)) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_warn!("kernelx: the title commits memory in a GPU view ({addr:?}, {size:#x} bytes): plain pages there, which the GPU does not see"));
+    }
+    // a GPU view of the title's CPU memory (`mirrors`) with a CPU view waiting for it: in the view
+    // windows (16 windows), where shaders reach it; the CPU view stays where it is. Taken before
+    // the 64 KiB-page branch below: that one is for the CPU view, which is reserved first.
+    if addr.is_null() && t & 0x2000 != 0 && mirrors::is_gpu_view_reservation(t, p) && mirrors::would_pair(size) {
+        if let Some((u, q)) = uma.and_then(|u| Some((u, u.view_reserve(size)?))) {
+            if mirrors::reserved(q, size, t, p) {
+                trace_mem("VirtualAlloc (GPU view, view windows)", 0, size, t as u64, p, q);
+                return q as *mut c_void;
+            }
+            // (another thread paired that CPU view in the meantime: as before the windows)
+            u.view_release(q);
+        }
     }
     // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them.
     // Skip CPU-inaccessible GPU-view mirror reservations (`PAGE_NOACCESS | PAGE_GRAPHICS_NOACCESS`):
@@ -452,29 +497,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     // space back); their video memory goes with it
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.is_sparse(addr as usize)) {
         let a = addr as usize;
-        let release = t & mem::MEM_RELEASE != 0;
-        let decommit = t & mem::MEM_DECOMMIT != 0;
-        if release == decommit || (release && size != 0) {
-            fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
-            return 0;
-        }
-        let n = if release || size == 0 {
-            match u.sparse_reservation(a) {
-                Some((start, len)) if start == a => len,
-                _ => {
-                    fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
-                    return 0;
-                }
-            }
-        } else {
-            match u.sparse_reservation(a) {
-                Some((start, len)) if a.checked_add(size).is_some_and(|end| end <= start + len) => size,
-                _ => {
-                    fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
-                    return 0;
-                }
-            }
-        };
+        let Some((n, release)) = reservation_part(a, size, t, u.sparse_reservation(a)) else { return 0 };
         if n > 0 {
             // sparse first: under its lock, so no copy of CPU writes to video memory reads the
             // pages while they go (the submit thread's copy faulted on them)
@@ -484,13 +507,34 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             }
         }
         if release {
-            u.sparse_release(a);
+            // unpaired before the address can be handed out again
             mirrors::released(a);
+            u.sparse_release(a);
         }
+        return 1;
+    }
+    // a GPU view in the view windows: what the GPU has of it goes first (`sparse::decommitted`
+    // drops its tiles), then pages the title may have committed there; on release the pair, then
+    // the address space
+    if let Some(u) = crate::gpu::uma::get().filter(|u| u.is_view(addr as usize)) {
+        let a = addr as usize;
+        let Some((n, release)) = reservation_part(a, size, t, u.view_reservation(a)) else { return 0 };
+        if n > 0 {
+            crate::hle::d3d12x::sparse::decommitted(a, n);
+            if mem::VirtualFree(addr, n, mem::MEM_DECOMMIT) == 0 {
+                return 0;
+            }
+        }
+        if release {
+            mirrors::released(a);
+            u.view_release(a);
+        }
+        trace_mem(if release { "VirtualFree (GPU view, released)" } else { "VirtualFree (GPU view, decommitted)" }, a, n, t as u64, 0, 1);
         return 1;
     }
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.contains(addr as usize)) {
         if t & 0x8000 != 0 {
+            mirrors::released(addr as usize);
             return u.free(addr as usize) as BOOL;
         }
         if t & 0x4000 != 0 && size > 0 {
@@ -498,18 +542,43 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         return 1;
     }
+    // a graphics reservation is unpaired before Windows can hand its address out again
+    let graphics = t & 0x8000 != 0 && size == 0 && GRAPHICS_RESERVATIONS.lock().unwrap().contains_key(&(addr as usize));
+    if graphics {
+        mirrors::released(addr as usize);
+    }
     let ok = mem::VirtualFree(addr, size, t);
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
-        mirrors::released(addr as usize);
+        if !graphics {
+            mirrors::released(addr as usize);
+        }
     }
     ok
+}
+
+/// The part of the reservation `res` (start, bytes) that `VirtualFree(a, size, t)` gives back –
+/// all of it on MEM_RELEASE or a decommit of size 0 – and whether it is a release. None: the
+/// arguments do not name one (ERROR_INVALID_PARAMETER is set).
+unsafe fn reservation_part(a: usize, size: usize, t: u32, res: Option<(usize, usize)>) -> Option<(usize, bool)> {
+    let release = t & mem::MEM_RELEASE != 0;
+    let decommit = t & mem::MEM_DECOMMIT != 0;
+    let n = match res {
+        _ if release == decommit || (release && size != 0) => None,
+        Some((start, len)) if release || size == 0 => (start == a).then_some(len),
+        Some((start, len)) => a.checked_add(size).is_some_and(|end| end <= start + len).then_some(size),
+        None => None,
+    };
+    if n.is_none() {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+    }
+    n.map(|n| (n, release))
 }
 
 pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
     if proc_ == thr::GetCurrentProcess() {
         let a = addr as usize;
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a))
+        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a) || u.is_view(a))
             || (t & 0x8000 != 0 && in_graphics_reservation(a))
         {
             return VirtualFree(addr, size, t);
@@ -1021,6 +1090,12 @@ fn note_mapping_range(lo: usize, len: usize) {
     if len == 0 || (mirrors::source(lo).is_none() && mirrors::source(lo + len - 1).is_none()) {
         return;
     }
+    note_gpu_view_change(lo, len);
+}
+
+/// What `[lo, lo + len)` of a GPU view shows changed (its mappings, or the view was paired with
+/// its CPU view or went): a new generation of `gpu_view_map_gen` with the range in the log.
+fn note_gpu_view_change(lo: usize, len: usize) {
     let mut g = GPU_VIEW_MAP_LOG.lock().unwrap();
     let gen = GPU_VIEW_MAP_GEN.load(Ordering::Relaxed) + 1;
     g.1.push_back((gen, lo, lo.saturating_add(len)));
@@ -1536,6 +1611,12 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     if crate::gpu::uma::get().is_none() || n == 0 || (va.is_null() && arr.is_null()) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
+    }
+    // pages in a GPU view (a view window) are plain pages there, as before the views had windows
+    // (`contains` and `is_sparse` are false there: no sparse commit), which the GPU does not see
+    if !va.is_null() && crate::gpu::uma::get().is_some_and(|u| u.is_view(va as usize)) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_warn!("kernelx: the title maps physical pages in a GPU view ({va:?}, {n} pages): plain pages there, which the GPU does not see"));
     }
     let pages: Vec<usize> = if arr.is_null() { vec![0; n] } else { (0..n).map(|i| *arr.add(i)).collect() };
     if pages.iter().any(|&p| p != 0 && page_home(p).is_none()) {
@@ -3320,6 +3401,34 @@ mod tests {
         mirrors::released(other);
     }
 
+    /// A pair that forms or goes is a change of what the GPU view shows: readers of GPU views
+    /// (`gpu_view_map_changes`) look at its range again – once paired, a texture placed there
+    /// before reads the CPU view, and once unpaired it no longer does.
+    #[test]
+    fn a_gpu_view_pair_that_forms_or_goes_is_a_change_of_the_view() {
+        // (addresses far above anything Windows hands out: only the bookkeeping is tested)
+        let (a, b, size) = (0x7100_0000_0000usize, 0x7106_0000_0000usize, 0x6_1000_0000usize);
+        let seen = |since: u64| gpu_view_map_changes(since).unwrap_or_default().contains(&(b, b + size));
+        assert!(!mirrors::would_pair(size));
+        mirrors::reserved(a, size, 0x2040_2000, mem::PAGE_READWRITE);
+        assert!(mirrors::would_pair(size), "a CPU view waits for its GPU view");
+        let before = gpu_view_map_gen();
+        assert!(mirrors::reserved(b, size, 0x2040_2000, 0x801));
+        assert!(!mirrors::would_pair(size));
+        assert!(gpu_view_map_gen() > before && seen(before), "the pair is a change of the view");
+        let paired = gpu_view_map_gen();
+        mirrors::released(b);
+        assert_eq!(mirrors::source(b), None);
+        assert!(gpu_view_map_gen() > paired && seen(paired), "the end of the pair is a change too");
+        // the CPU view waits again; released with it, a GPU view goes too
+        assert!(mirrors::would_pair(size));
+        assert!(mirrors::reserved(b, size, 0x2040_2000, 0x801));
+        let paired = gpu_view_map_gen();
+        mirrors::released(a);
+        assert!(seen(paired), "a GPU view whose CPU view went");
+        assert!(!mirrors::would_pair(size) && !mirrors::reserved(b, size, 0x2040_2000, 0x801));
+    }
+
     /// GPU-visible title memory that reaches the plain-memory fallback (64 KiB pages, large
     /// pages, a graphics protection) is write-watched: a texture placed there sees the CPU's
     /// writes. The fallback is called directly: through `VirtualAlloc` these sizes land in a
@@ -3486,9 +3595,13 @@ mod tests {
                 Some(cpu as usize + 0x2_0000),
                 "GPU view must resolve to CPU view even when CPU view lives in sparse UMA"
             );
-            // GPU-view alias must not consume sparse UMA VA.
+            // GPU-view alias must not consume sparse UMA VA: it goes to a view window (16 windows)
+            // or stays outside unified memory.
             if let Some(u) = crate::gpu::uma::get() {
                 assert!(!u.is_sparse(gpu as usize), "CPU-inaccessible GPU view should stay outside sparse UMA");
+                let views = (0..u.shader_windows()).any(|k| u.is_view_window(k));
+                assert_eq!(u.is_view(gpu as usize), views, "the GPU view is in a view window when there are any");
+                assert!(!u.contains(gpu as usize), "the CPU cannot touch a GPU view");
             }
             assert_eq!(VirtualFree(gpu, 0, mem::MEM_RELEASE), 1);
             assert_eq!(mirrors::source(gpu as usize + 0x2_0000), None);
