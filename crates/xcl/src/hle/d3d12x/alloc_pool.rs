@@ -96,6 +96,19 @@ pub(super) fn forget_list(list: usize) {
     let Some(s) = g.as_mut() else { return };
     s.last_submit.remove(&list);
     s.recordings.remove(&list);
+    unpin(s, list);
+}
+
+/// The PC list's recording ended but the list stays (a split segment moved to the spares): its
+/// allocator is no longer held for it. Its last submit stays known, so it is not handed out
+/// again while the GPU still runs that submit (`in_flight`).
+pub(super) fn unpin_list(list: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    unpin(s, list);
+}
+
+fn unpin(s: &mut State, list: usize) {
     if let Some(backing) = s.of_list.remove(&list) {
         if let Some(b) = s.backings.get_mut(&backing) {
             b.users.remove(&list);
@@ -169,7 +182,7 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     for &l in lists {
         let l = l as usize;
         let Some(last) = s.last_submit.get(&l) else { continue };
-        if last.fence.GetCompletedValue() >= last.value {
+        if super::real::fence_completed(&last.fence) >= last.value {
             continue;
         }
         let same_recording = s.recordings.get(&l).copied().unwrap_or(0) == last.recording;
@@ -190,9 +203,10 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
 
 /// Whether the GPU has not finished the last submit of the PC list `list` (#1452: it must not be
 /// submitted again before that; `title_list` records the title's next recording elsewhere).
+/// (`fence_completed`: XCL's own fence, without the title's hook, STATE held)
 pub fn in_flight(list: usize) -> bool {
     let g = STATE.lock().unwrap();
-    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
+    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { super::real::fence_completed(&l.fence) } < l.value)
 }
 
 /// `lists` were just submitted to `queue`.
