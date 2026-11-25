@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::Interface;
@@ -36,6 +36,8 @@ pub(super) struct Item {
     pub states: Vec<D3D12_RESOURCE_STATES>,
     /// the bytes of it that changed (from, to; sorted and disjoint); None: all of it
     pub changed: Option<Vec<(usize, usize)>>,
+    /// where it is kept what its pages held
+    pub known: Option<Known>,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -104,14 +106,6 @@ pub(super) fn all_sent(known: &Known, src: usize, size: usize) {
     k.hashes.clear();
     k.hashes.resize(pages_of(src, size), 0);
     k.again = None;
-}
-
-/// What the pages of textures that go up as a whole (`all_sent`) hold: those that hold it when they
-/// are written again are nothing to send (and what the GPU wrote there meanwhile stays).
-pub(super) unsafe fn remember(whole: &[(usize, usize, Known)]) {
-    let pages: Vec<Vec<usize>> = whole.iter().map(|(src, size, _)| (src / PAGE * PAGE..src + size).step_by(PAGE).collect()).collect();
-    let written: Vec<Written> = whole.iter().zip(&pages).map(|((src, size, known), p)| Written { src: *src, size: *size, dirty: p, known }).collect();
-    changed(&written, true);
 }
 
 /// Nothing is known about what the PC texture holds: its next upload is of all of it.
@@ -467,13 +461,68 @@ fn is_linear(c: &crate::gpu::tiling::Chain, level: usize) -> bool {
     c.layout.mode == 0 && c.layout.base_xor == 0 && c.levels[level].origin == (0, 0)
 }
 
-/// The texels of `pieces` into the upload buffer mapped at `ptr`.
+/// The page hashes of an item while its bytes are read.
+struct Hashes<'a> {
+    src: usize,
+    end: usize,
+    pages: &'a [AtomicU64],
+}
+
+impl Hashes<'_> {
+    /// `b` was read at `from` and goes up: what is known of its pages is that (a page read in part
+    /// is not known: its next write goes up). Neighbours of a changed page are read with it, and a
+    /// title may write on between the comparison and here; what is kept is what the PC texture gets.
+    fn note(&self, from: usize, b: &[u8]) {
+        let first = self.src / PAGE * PAGE;
+        let mut p = from / PAGE * PAGE;
+        while p < from + b.len() {
+            let (a, z) = (p.max(self.src), (p + PAGE).min(self.end));
+            if let Some(slot) = self.pages.get((p - first) / PAGE).filter(|_| a < z) {
+                let whole = a >= from && z <= from + b.len();
+                slot.store(if whole { content_hash(&b[a - from..z - from]) } else { 0 }, Ordering::Relaxed);
+            }
+            p += PAGE;
+        }
+    }
+}
+
+/// The texels of `pieces` into the upload buffer mapped at `ptr`, with what is kept of the items'
+/// pages brought to what was read.
 unsafe fn fill(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64) {
+    // (taken out while they are worked on)
+    let taken: Vec<Option<(Vec<AtomicU64>, u64)>> = items
+        .iter()
+        .map(|it| {
+            let mut k = it.known.as_ref()?.lock().unwrap();
+            if k.hashes.len() != pages_of(it.src, it.tex.size() as usize) {
+                return None;
+            }
+            Some((std::mem::take(&mut k.hashes).into_iter().map(AtomicU64::new).collect(), k.forgotten))
+        })
+        .collect();
+    fill_hashed(items, pieces, ptr, bytes, &taken);
+    for (it, t) in items.iter().zip(taken) {
+        if let (Some(known), Some((h, forgotten))) = (&it.known, t) {
+            let mut k = known.lock().unwrap();
+            if k.forgotten == forgotten {
+                k.hashes = h.into_iter().map(AtomicU64::into_inner).collect();
+            }
+        }
+    }
+}
+
+unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64, hashes: &[Option<(Vec<AtomicU64>, u64)>]) {
     struct Mapped(*mut u8);
     // SAFETY: the workers write disjoint parts of the buffer
     unsafe impl Sync for Mapped {}
     let to = Mapped(ptr);
     let work = work_of(items, pieces);
+    let note = |item: usize, from: usize, b: &[u8]| {
+        if let Some((pages, _)) = &hashes[item] {
+            let it = &items[item];
+            Hashes { src: it.src, end: it.src + it.tex.size() as usize, pages }.note(from, b);
+        }
+    };
     let one = |k: usize| {
         let to = &to;
         // SAFETY: the pieces were placed inside the buffer; the title's memory is only read
@@ -483,15 +532,20 @@ unsafe fn fill(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64) {
                     let p = &pieces[*piece];
                     let (it, c) = (&items[p.item], &items[p.item].tex.texels().unwrap().chain);
                     let from = it.src + p.slice * c.slice_bytes + c.block_at(p.level, bx.start, *by);
-                    read(from, bx.len() * c.layout.block_bytes, |b| c.detile_blocks(b, p.level, p.slice, *by, bx.clone(), p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize));
+                    read(from, bx.len() * c.layout.block_bytes, |b| {
+                        c.detile_blocks(b, p.level, p.slice, *by, bx.clone(), p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize);
+                        note(p.item, from, b);
+                    });
                 }
                 Work::Tail { pieces: range } => {
                     let first = &pieces[range.start];
                     let (it, c) = (&items[first.item], &items[first.item].tex.texels().unwrap().chain);
-                    read(it.src + first.slice * c.slice_bytes, c.layout.block_bytes, |b| {
+                    let from = it.src + first.slice * c.slice_bytes;
+                    read(from, c.layout.block_bytes, |b| {
                         for p in &pieces[range.clone()] {
                             c.detile_blocks(b, p.level, p.slice, 0, 0..1, p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize);
                         }
+                        note(first.item, from, b);
                     });
                 }
                 Work::Rows { piece, y } => {
@@ -500,11 +554,12 @@ unsafe fn fill(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64) {
                     let (l, e) = (&c.levels[p.level], c.layout.elem_log2);
                     let (stride, row) = (l.pitch << e, (p.rect.x1 - p.rect.x0) << e);
                     let from = it.src + p.slice * c.slice_bytes + l.offset + y.start * stride + (p.rect.x0 << e);
-                    read(from, (y.len() - 1) * stride + row, |b| {
+                    read(from, y.len() * stride - (p.rect.x0 << e), |b| {
                         for (n, y) in y.clone().enumerate() {
                             let dst = to.0.add(p.at as usize + (y - p.rect.y0) * p.footprint.RowPitch as usize);
                             std::ptr::copy_nonoverlapping(b[n * stride..][..row].as_ptr(), dst, row);
                         }
+                        note(p.item, from, b);
                     });
                 }
                 Work::Volume { pieces: range } => {
@@ -519,6 +574,7 @@ unsafe fn fill(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64) {
                                 std::ptr::copy_nonoverlapping(r.as_ptr(), to.0.add(p.at as usize + n * p.footprint.RowPitch as usize), row);
                             }
                         }
+                        note(first.item, it.src, b);
                     });
                 }
             }
@@ -608,6 +664,8 @@ unsafe impl Send for Job {}
 static FREE: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 /// the smallest upload buffer made, and the most bytes of them kept
 const BUFFER_MIN: u64 = 1 << 20;
+/// buffers up to this size are powers of two (few sizes, so one fits again)
+const POWERS_TO: u64 = 64 << 20;
 const FREE_BYTES: u64 = 512 << 20;
 
 /// A job whose buffer takes `bytes` bytes.
@@ -621,7 +679,7 @@ unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
         }
     }
     let e = |x: windows::core::Error| format!("texture upload: {x}");
-    let cap = bytes.max(BUFFER_MIN).next_power_of_two();
+    let cap = if bytes <= POWERS_TO { bytes.max(BUFFER_MIN).next_power_of_two() } else { bytes.next_multiple_of(POWERS_TO / 4) };
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
     list.Close().map_err(e)?;
@@ -735,12 +793,6 @@ mod tests {
         assert_eq!(unsafe { changed(&[Written { src, size, dirty: &dirty[2..3], known: &known }], false) }.0, vec![Change::Parts(vec![(0x800, PAGE + 0x800)])]);
         forget(&known);
         assert_eq!(look(&dirty[2..3]).0, vec![Change::All]);
-        // after an upload of all of it, what it held then is nothing to send
-        all_sent(&known, src, size);
-        unsafe { remember(&[(src, size, Arc::clone(&known))]) };
-        assert_eq!(look(&dirty).0, vec![Change::None]);
-        write(src + 2 * PAGE, 9);
-        assert_eq!(look(&dirty).0, vec![Change::Parts(vec![(PAGE + 0x800, 2 * PAGE + 0x800)])]);
         // several textures at once, many pages: the same as one by one
         let big = vec![7u8; 600 * PAGE];
         let at = (big.as_ptr() as usize).next_multiple_of(PAGE);
@@ -834,7 +886,7 @@ mod tests {
                 let want = super::super::title_textures::subresources(mem.as_ptr() as usize, &m.tex);
                 for round in 0..5 {
                     let changed = (round > 0).then(|| some_ranges(size, n * 11 + round));
-                    let items = [Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed: changed.clone() }];
+                    let items = [Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed: changed.clone(), known: None }];
                     let (mut pieces, mut bytes) = (Vec::new(), 0u64);
                     plan_item(&dev, 0, &items[0], &mut bytes, &mut pieces).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
                     if round == 0 {
@@ -887,7 +939,7 @@ mod tests {
                 let s = m.tex.texels().unwrap();
                 let size = m.tex.size() as usize;
                 let first = random_bytes(size, n as u64 * 31 + 3);
-                let item = |mem: &[u8], changed| Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed };
+                let item = |mem: &[u8], changed| Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed, known: None };
                 let (_, all) = run(&[item(&first, None)]);
                 let mut want = super::super::title_textures::subresources(first.as_ptr() as usize, &m.tex);
                 assert!(read_back(&dev, &queue, &m.res, want.len()) == want.iter().map(|w| w.data.clone()).collect::<Vec<_>>(), "{kind:?}: all of it");
@@ -955,6 +1007,57 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// What is kept of a texture's pages is what went up: after an upload of all of it, or of a part
+    /// (the pages read along with the changed ones too), the same bytes written again are nothing to
+    /// send; bytes that were others, or not there, while they were read go up when they come back.
+    #[test]
+    fn what_is_kept_is_what_went_up() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let dev = test_device();
+            // 64 KiB blocks: 256x256 RGBA8 in 64KB_S, 4 of them
+            let m = make(&dev, (3, 256, 256, 1, 1, 28, 0x109));
+            let size = m.tex.size() as usize;
+            assert_eq!(size, 4 * 0x1_0000);
+            let src = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            let content = random_bytes(size, 77);
+            let put = |from: usize, to: usize| std::ptr::copy_nonoverlapping(content.as_ptr().add(from), (src + from) as *mut u8, to - from);
+            put(0, size);
+            let known: Known = Default::default();
+            let pages: Vec<usize> = (0..size / PAGE).map(|k| src + k * PAGE).collect();
+            let look = |of: &[usize]| changed(&[Written { src, size, dirty: of, known: &known }], true).0.remove(0);
+            let upload = |changed: Option<Vec<(usize, usize)>>| {
+                let it = [Item { res: m.res.clone(), src, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed, known: Some(Arc::clone(&known)) }];
+                let (mut p, mut bytes) = (Vec::new(), 0u64);
+                plan_item(&dev, 0, &it[0], &mut bytes, &mut p).unwrap();
+                let mut buf = vec![0u8; bytes as usize];
+                fill(&it, &p, buf.as_mut_ptr(), bytes);
+            };
+            all_sent(&known, src, size);
+            upload(None);
+            assert_eq!(look(&pages), Change::None, "all of it went up as it is");
+            // a page changes; while its block is read its neighbours are not there
+            *((src + 0x1_0000) as *mut u8) ^= 1;
+            assert_eq!(look(&pages), Change::Parts(vec![(0x1_0000, 0x1_1000)]));
+            assert_ne!(VirtualFree((src + 0x1_8000) as *mut c_void, 0x8000, MEM_DECOMMIT), 0);
+            upload(Some(vec![(0x1_0000, 0x1_1000)]));
+            assert!(!VirtualAlloc((src + 0x1_8000) as *const c_void, 0x8000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            put(0x1_8000, 0x2_0000);
+            assert_eq!(look(&pages[0x18..0x20]), Change::Parts(vec![(0x1_8000, 0x2_0000)]), "they went up as zeros");
+            upload(Some(vec![(0x1_8000, 0x2_0000)]));
+            assert_eq!(look(&pages), Change::None);
+            // written between the comparison and the upload, and back again
+            *((src + 5) as *mut u8) ^= 1;
+            assert_eq!(look(&pages), Change::Parts(vec![(0, PAGE)]));
+            std::ptr::write_bytes(src as *mut u8, 0, PAGE);
+            upload(Some(vec![(0, PAGE)]));
+            put(0, PAGE);
+            *((src + 5) as *mut u8) ^= 1;
+            assert_eq!(look(&pages), Change::Parts(vec![(0, PAGE)]), "the cleared page is what went up");
+            VirtualFree(src as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 
     /// An upload on another queue than an older one of the same texture that has not run yet goes

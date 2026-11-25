@@ -53,6 +53,8 @@ struct Due {
     whole: bool,
     /// what of it goes up again (`texture_upload::sent`)
     again: texture_upload::Change,
+    /// (`Entry::target`)
+    target: bool,
 }
 
 struct Entry {
@@ -83,6 +85,9 @@ struct Entry {
     seq: u64,
     /// what its pages held at its last upload
     known: texture_upload::Known,
+    /// the GPU can write it other than by copies (a render target, a UAV): XCL does not see all of
+    /// that, so when the CPU's bytes of it change it goes up as a whole
+    target: bool,
 }
 
 /// textures waiting for their first upload
@@ -485,6 +490,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         unmapped: false,
         seq: 0,
         known: Default::default(),
+        target: u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap()) & 0x7 != 0,
     };
     let (hot_src, hot_bytes) = (e.src, e.tex.size() as usize);
     let to_unmap = {
@@ -1230,6 +1236,7 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
     }
     let t_recheck = std::time::Instant::now();
     recheck_gpu_view_sources();
+    retry_failed();
     super::submit_cost::recheck(t_recheck.elapsed());
     let mut page = 0x1000u32;
     let t_ranges = std::time::Instant::now();
@@ -1345,7 +1352,7 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| Due { res: r.clone(), device: e.device, src: e.src, tex: Arc::clone(&e.tex), states: e.states.clone(), known: Arc::clone(&e.known), whole, again })
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| Due { res: r.clone(), device: e.device, src: e.src, tex: Arc::clone(&e.tex), states: e.states.clone(), known: Arc::clone(&e.known), whole, again, target: e.target })
             })
             .collect();
         AGAIN.lock().unwrap().extend(later);
@@ -1571,7 +1578,7 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
         let changed = match texture_upload::join(change, d.again.clone()) {
             texture_upload::Change::None => return None,
             texture_upload::Change::All => None,
-            texture_upload::Change::Parts(_) if !upload_parts() => None,
+            texture_upload::Change::Parts(_) if d.target || !upload_parts() => None,
             texture_upload::Change::Parts(p) => Some(p),
         };
         let bytes = changed.as_ref().map_or(d.tex.size() as usize, |p| p.iter().map(|r| r.1 - r.0).sum());
@@ -1580,27 +1587,22 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
     while todo.peek().is_some() {
         let (mut items, mut known): (Vec<texture_upload::Item>, Vec<texture_upload::Known>) = (Vec::new(), Vec::new());
         let (mut bytes, mut device) = (0usize, 0usize);
-        let mut whole = Vec::new();
         while let Some((d, changed, n)) = todo.next_if(|(d, _, n)| items.is_empty() || (bytes + n <= BATCH_BYTES && d.device == device)) {
             device = d.device;
             bytes += n;
             if changed.is_none() {
                 // (before its bytes are read: what is written from here on is compared)
                 texture_upload::all_sent(&d.known, d.src, d.tex.size() as usize);
-                whole.push((d.src, d.tex.size() as usize, Arc::clone(&d.known)));
             }
             if super::present::trace_frame() {
                 note_content(d.src, &d.res, &subresources(d.src, &d.tex));
             }
-            items.push(texture_upload::Item { res: d.res, src: d.src, tex: d.tex, states: d.states, changed });
+            items.push(texture_upload::Item { res: d.res, src: d.src, tex: d.tex, states: d.states, changed, known: Some(Arc::clone(&d.known)) });
             known.push(d.known);
         }
         let p = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&p) else { continue };
         let t_submit = std::time::Instant::now();
-        if unchanged_skip() {
-            texture_upload::remember(&whole);
-        }
         let done = own_work(|| match title_queue_for(dev, title) {
             Some(q) => {
                 // what went up on XCL's own queue first: these may be newer bytes of the same texture
@@ -1640,9 +1642,37 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
             Err(e) => {
                 warn(&e);
                 known.iter().for_each(texture_upload::forget);
+                // (no memory for a buffer, most likely: again in a moment)
+                let at = std::time::Instant::now() + RETRY_AFTER;
+                RETRY.lock().unwrap().extend(items.iter().map(|it| (at, it.res.as_raw() as usize)));
             }
         }
     }
+}
+
+/// textures of batches that could not be uploaded, and when they are tried again
+static RETRY: Mutex<Vec<(std::time::Instant, usize)>> = Mutex::new(Vec::new());
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Those whose time has come are to be uploaded as a whole, like new ones.
+fn retry_failed() {
+    let mut g = RETRY.lock().unwrap();
+    if g.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut t = TEXTURES.lock().unwrap();
+    g.retain(|&(at, res)| {
+        if at > now {
+            return true;
+        }
+        if let Some(e) = t.by_res.get_mut(&res).filter(|e| !e.pending && !e.gpu_written) {
+            e.pending = true;
+            PENDING.fetch_add(1, Ordering::Relaxed);
+            t.pending_res.insert(res);
+        }
+        false
+    });
 }
 
 /// An upload of `changed` (None: all) of `res`, a texture of the console description `desc` with its
@@ -1653,7 +1683,7 @@ pub unsafe fn upload_and_wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue, re
     if mem.len() < tex.size() as usize {
         return Err(format!("{} bytes of {}", mem.len(), tex.size()));
     }
-    let item = texture_upload::Item { res: res.clone(), src: mem.as_ptr() as usize, tex, states, changed };
+    let item = texture_upload::Item { res: res.clone(), src: mem.as_ptr() as usize, tex, states, changed, known: None };
     let (failed, job, _) = own_work(|| texture_upload::submit(dev, queue, &[item]))?;
     texture::wait(dev, queue)?;
     job.into_iter().for_each(texture_upload::give_back);
@@ -1936,7 +1966,7 @@ pub(super) mod tests {
     fn r8_item(texture: &ID3D12Resource, value: u8) -> (texture_upload::Item, Vec<u8>) {
         let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 61, 1)).unwrap());
         let mem = vec![value; tex.size() as usize];
-        (texture_upload::Item { res: texture.clone(), src: mem.as_ptr() as usize, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], changed: None }, mem)
+        (texture_upload::Item { res: texture.clone(), src: mem.as_ptr() as usize, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], changed: None, known: None }, mem)
     }
 
     unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> Vec<u8> {
@@ -2240,7 +2270,7 @@ pub(super) mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0, known: Default::default() };
+            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0, known: Default::default(), target: false };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -2367,7 +2397,7 @@ pub(super) mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0, known: Default::default() });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0, known: Default::default(), target: false });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -2474,6 +2504,7 @@ pub(super) mod tests {
             unmapped: false,
             seq: 0,
             known: Default::default(),
+            target: false,
         };
         let mut tbl = Table::new();
         // Two adjacent placed 16 KiB textures + one placed 64 KiB texture after them.
