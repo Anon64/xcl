@@ -75,19 +75,28 @@ const NO_SPAN: (u64, u64) = (u64::MAX, 0);
 
 thread_local! {
     /// The tile spans (first and last 64 KiB tile) this thread asked for last, the generation
-    /// of the GPU views they were asked in (`kernelx::gpu_view_map_gen`) and where the next one
-    /// goes. A title binds the same vertex buffers and root views for draw after draw, on the
+    /// they were asked in (`generation`: of the GPU views and of the asks forgotten since) and
+    /// where the next one goes. A title binds the same vertex buffers and root views for draw after draw, on the
     /// thread that records the list, and root views at a new offset of the same tiles (a
     /// constant allocator moving on for each draw); asking again walks every tile of the range
     /// (`sparse::map_mirror`: a shared set).
-    static ASKED: Cell<([(u64, u64); LATELY], u64, usize)> = const { Cell::new(([NO_SPAN; LATELY], 0, 0)) };
+    static ASKED: Cell<([(u64, u64); LATELY], (u64, u64), usize)> = const { Cell::new(([NO_SPAN; LATELY], (0, 0), 0)) };
+}
+
+/// What an ask is remembered under: the GPU views as they are (`kernelx::gpu_view_map_gen`) and
+/// the asks `sparse` has forgotten so far (`sparse::mirror_asks_forgotten`). A tile given back
+/// when the title decommits its source may be asked for again, and must be when the title
+/// commits and binds that memory again: a thread that still remembered asking for it left the
+/// tile unmapped, and the draw read zeros through the view (a mesh without vertices).
+fn generation() -> (u64, u64) {
+    (crate::hle::kernelx::gpu_view_map_gen(), super::sparse::mirror_asks_forgotten())
 }
 
 /// Whether every tile of `[va, va + len)` lies in one of the tile spans this thread asked for
-/// last (`LATELY` of them) while the GPU views were as they are now (`generation`); its span is
-/// remembered if not. A view that went or came since (its tiles are forgotten with it) empties
-/// the memory. A range reaching one tile past what was asked for is not in it.
-fn asked_lately(va: u64, len: u64, generation: u64) -> bool {
+/// last (`LATELY` of them) in this `generation`; its span is remembered if not. A view that went
+/// or came since, or an ask forgotten since, empties the memory. A range reaching one tile past
+/// what was asked for is not in it.
+fn asked_lately(va: u64, len: u64, generation: (u64, u64)) -> bool {
     let span = (va >> TILE_SHIFT, va.saturating_add(len.saturating_sub(1)) >> TILE_SHIFT);
     ASKED.with(|a| {
         let (mut spans, asked_in, mut next) = a.get();
@@ -115,7 +124,7 @@ pub fn want(path: Path, va: u64, len: u64) -> bool {
         return false;
     }
     CALLS[path as usize].fetch_add(1, Ordering::Relaxed);
-    if !asked_lately(va, len, crate::hle::kernelx::gpu_view_map_gen()) {
+    if !asked_lately(va, len, generation()) {
         let queued = super::sparse::map_mirror(va as usize, len as usize) as u64;
         if queued != 0 {
             BYTES[path as usize].fetch_add(queued << TILE_SHIFT, Ordering::Relaxed);
@@ -183,22 +192,27 @@ mod tests {
     fn a_range_asked_for_lately_is_not_asked_for_again() {
         std::thread::spawn(|| {
             const A: u64 = 0x14_0000_1000;
-            assert!(!asked_lately(A, 0x2000, 7), "the first time");
-            assert!(asked_lately(A, 0x2000, 7), "again: remembered");
-            assert!(asked_lately(0x14_0000_8000, 0x4000, 7), "another range in the same tile");
-            assert!(asked_lately(0x14_0000_0000, 0x1_0000, 7), "the whole tile");
-            assert!(!asked_lately(0x14_0000_8000, 0x1_0000, 7), "a range reaching the next tile");
-            assert!(asked_lately(0x14_0001_0000, 0x100, 7), "the next tile was asked for with it");
-            assert!(asked_lately(0x14_0000_0000, 0x2_0000, 7), "both tiles");
-            assert!(!asked_lately(0x14_0000_0000, 0x2_0001, 7), "and one byte of a third");
-            assert!(!asked_lately(A, 0x2000, 8), "the views changed: asked again");
+            assert!(!asked_lately(A, 0x2000, (7, 0)), "the first time");
+            assert!(asked_lately(A, 0x2000, (7, 0)), "again: remembered");
+            assert!(asked_lately(0x14_0000_8000, 0x4000, (7, 0)), "another range in the same tile");
+            assert!(asked_lately(0x14_0000_0000, 0x1_0000, (7, 0)), "the whole tile");
+            assert!(!asked_lately(0x14_0000_8000, 0x1_0000, (7, 0)), "a range reaching the next tile");
+            assert!(asked_lately(0x14_0001_0000, 0x100, (7, 0)), "the next tile was asked for with it");
+            assert!(asked_lately(0x14_0000_0000, 0x2_0000, (7, 0)), "both tiles");
+            assert!(!asked_lately(0x14_0000_0000, 0x2_0001, (7, 0)), "and one byte of a third");
+            assert!(!asked_lately(A, 0x2000, (8, 0)), "the views changed: asked again");
             for k in 0..LATELY as u64 - 1 {
-                assert!(!asked_lately(0x15_0000_0000 + (k << 16), 0x1000, 8));
+                assert!(!asked_lately(0x15_0000_0000 + (k << 16), 0x1000, (8, 0)));
             }
-            assert!(asked_lately(A, 0x2000, 8), "{LATELY} spans are remembered");
-            assert!(!asked_lately(0x16_0000_0000, 0x1000, 8));
-            assert!(!asked_lately(A, 0x2000, 8), "pushed out by {LATELY} later spans");
-            assert!(asked_lately(A, 0x2000, 8));
+            assert!(asked_lately(A, 0x2000, (8, 0)), "{LATELY} spans are remembered");
+            assert!(!asked_lately(0x16_0000_0000, 0x1000, (8, 0)));
+            assert!(!asked_lately(A, 0x2000, (8, 0)), "pushed out by {LATELY} later spans");
+            assert!(asked_lately(A, 0x2000, (8, 0)));
+            // a tile given back since (its source decommitted) may be asked for again: every
+            // remembered ask goes, also the ones whose tiles stayed
+            assert!(!asked_lately(A, 0x2000, (8, 1)), "an ask was forgotten: asked again");
+            assert!(asked_lately(A, 0x2000, (8, 1)));
+            assert!(!asked_lately(A, 0x2000, (8, 2)));
         })
         .join()
         .unwrap();

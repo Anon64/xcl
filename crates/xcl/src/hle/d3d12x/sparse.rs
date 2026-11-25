@@ -2531,6 +2531,22 @@ impl State {
 /// Window tiles asked for by `map_mirror`: each is queued once, until it is forgotten
 /// (`forget_mirrors`) or left out (`State::map_mirrors`).
 static MIRROR_ASKED: super::sharded::Sharded<()> = super::sharded::Sharded::new();
+/// How often a tile left `MIRROR_ASKED` (a view that went, a tile given back with its source, an
+/// ask that found no source): whoever remembers having asked (`view_want`'s threads) asks again.
+static MIRROR_FORGOTTEN: AtomicU64 = AtomicU64::new(0);
+
+/// Counts up whenever a tile that was asked for may be asked for again (`map_mirror` would
+/// queue it): a caller that keeps what it asked for forgets it when this changes.
+pub fn mirror_asks_forgotten() -> u64 {
+    MIRROR_FORGOTTEN.load(Ordering::Acquire)
+}
+
+/// Tile `t` is asked for no more.
+fn forget_ask(t: usize) {
+    if MIRROR_ASKED.remove(t).is_some() {
+        MIRROR_FORGOTTEN.fetch_add(1, Ordering::Release);
+    }
+}
 /// The tiles asked for that no submit has taken yet. A lock of its own: `map_mirror` is called
 /// while recording, on any thread, and never waits for `STATE`.
 static MIRROR_ASKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
@@ -2692,7 +2708,7 @@ pub fn forget_mirrors(a: usize, n: usize) {
         }
     });
     for t in asked {
-        MIRROR_ASKED.remove(t);
+        forget_ask(t);
     }
     MIRROR_ASKS.lock().unwrap().retain(|&t| !(t < end && t + TILE > a));
     if lock_sources(&SOURCES).runs.is_empty() {
@@ -2740,7 +2756,7 @@ impl State {
             }
         }
         self.refused.remove(&w);
-        MIRROR_ASKED.remove(w);
+        forget_ask(w);
         true
     }
 
@@ -2908,9 +2924,7 @@ impl State {
             }
             match Some(g).filter(|g| !self.mapped.contains_key(g) && self.window_index(*g).is_some()).and_then(mirror_source_tile) {
                 Some(c) => want.push((g, c)),
-                None => {
-                    MIRROR_ASKED.remove(g);
-                }
+                None => forget_ask(g),
             }
         }
         if want.is_empty() {
@@ -5103,8 +5117,11 @@ mod tests {
             }
         });
         assert!(asked, "map_mirror waited for the sparse state's lock");
+        // (other tests forget tiles too: the count only goes up)
+        let before = mirror_asks_forgotten();
         forget_mirrors(AT, 4 * TILE);
         assert!(!MIRROR_ASKED.contains(AT) && !MIRROR_ASKS.lock().unwrap().contains(&AT), "forgotten tiles may be asked for again");
+        assert!(mirror_asks_forgotten() >= before + 4, "whoever remembers having asked for them is told");
     }
 
     /// Past `mirror_cap` tiles over CPU views get no video memory (counted once each); room
