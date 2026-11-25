@@ -70,6 +70,24 @@ pub(super) struct Pages {
     hashes: Vec<u64>,
     /// counts the times that was forgotten: a comparison going on then is not kept
     forgotten: u64,
+    /// the last upload on each queue that may not have run yet
+    last: Vec<Sent>,
+    /// what goes up again, and the uploads it has to come behind (`sent`)
+    again: Option<(Change, Vec<Sent>)>,
+}
+
+/// Where an upload went: the queue, the fence of that queue's uploads and the value behind it.
+#[derive(Clone)]
+pub(super) struct Sent {
+    pub queue: usize,
+    pub fence: ID3D12Fence,
+    pub value: u64,
+}
+
+impl Sent {
+    fn done(&self) -> bool {
+        unsafe { super::real::fence_completed(&self.fence) >= self.value }
+    }
 }
 
 pub(super) type Known = Arc<Mutex<Pages>>;
@@ -85,6 +103,15 @@ pub(super) fn all_sent(known: &Known, src: usize, size: usize) {
     let mut k = known.lock().unwrap();
     k.hashes.clear();
     k.hashes.resize(pages_of(src, size), 0);
+    k.again = None;
+}
+
+/// What the pages of textures that go up as a whole (`all_sent`) hold: those that hold it when they
+/// are written again are nothing to send (and what the GPU wrote there meanwhile stays).
+pub(super) unsafe fn remember(whole: &[(usize, usize, Known)]) {
+    let pages: Vec<Vec<usize>> = whole.iter().map(|(src, size, _)| (src / PAGE * PAGE..src + size).step_by(PAGE).collect()).collect();
+    let written: Vec<Written> = whole.iter().zip(&pages).map(|((src, size, known), p)| Written { src: *src, size: *size, dirty: p, known }).collect();
+    changed(&written, true);
 }
 
 /// Nothing is known about what the PC texture holds: its next upload is of all of it.
@@ -92,6 +119,71 @@ pub(super) fn forget(known: &Known) {
     let mut k = known.lock().unwrap();
     k.hashes.clear();
     k.forgotten += 1;
+    k.again = None;
+}
+
+/// `changed` of a texture (None: all of it) went up on `to`. An older upload of the texture on
+/// another queue that has not run yet (and that `to`'s queue has not waited for: `waited`) can land
+/// over it: it goes up again, behind that one (`take_again`). True when there is such a thing.
+pub(super) fn sent(known: &Known, changed: Option<&[(usize, usize)]>, to: &Sent, waited: usize) -> bool {
+    let mut k = known.lock().unwrap();
+    k.last.retain(|s| !s.done());
+    let behind: Vec<Sent> = k.last.iter().filter(|s| s.queue != to.queue && s.queue != waited).cloned().collect();
+    k.last.retain(|s| s.queue != to.queue);
+    k.last.push(to.clone());
+    if !behind.is_empty() {
+        let mut change = changed.map_or(Change::All, |c| Change::Parts(c.to_vec()));
+        let mut all = behind;
+        if let Some((c, b)) = k.again.take() {
+            change = join(c, change);
+            // (the newest of each queue)
+            all.extend(b.into_iter().filter(|o| !all.iter().any(|s| s.queue == o.queue)).collect::<Vec<_>>());
+        }
+        k.again = Some((change, all));
+    }
+    k.again.is_some()
+}
+
+/// What a texture has to send again.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Again {
+    Nothing,
+    /// an upload it has to come behind has not run yet, and is on another queue
+    NotYet,
+    Now(Change),
+}
+
+/// What of a texture goes up again with an upload on `queue`, which has waited for `waited`'s.
+pub(super) fn take_again(known: &Known, queue: usize, waited: usize) -> Again {
+    let mut k = known.lock().unwrap();
+    match k.again.take() {
+        None => Again::Nothing,
+        Some((c, behind)) if behind.iter().all(|s| s.queue == queue || s.queue == waited || s.done()) => Again::Now(c),
+        later => {
+            k.again = later;
+            Again::NotYet
+        }
+    }
+}
+
+/// Both of two changes.
+pub(super) fn join(a: Change, b: Change) -> Change {
+    match (a, b) {
+        (Change::All, _) | (_, Change::All) => Change::All,
+        (Change::None, c) | (c, Change::None) => c,
+        (Change::Parts(mut a), Change::Parts(b)) => {
+            a.extend(b);
+            a.sort_unstable();
+            let mut out: Vec<(usize, usize)> = Vec::with_capacity(a.len());
+            for (from, to) in a {
+                match out.last_mut() {
+                    Some(l) if l.1 >= from => l.1 = l.1.max(to),
+                    _ => out.push((from, to)),
+                }
+            }
+            Change::Parts(out)
+        }
+    }
 }
 
 /// A texture with written pages, to be compared.
@@ -643,6 +735,12 @@ mod tests {
         assert_eq!(unsafe { changed(&[Written { src, size, dirty: &dirty[2..3], known: &known }], false) }.0, vec![Change::Parts(vec![(0x800, PAGE + 0x800)])]);
         forget(&known);
         assert_eq!(look(&dirty[2..3]).0, vec![Change::All]);
+        // after an upload of all of it, what it held then is nothing to send
+        all_sent(&known, src, size);
+        unsafe { remember(&[(src, size, Arc::clone(&known))]) };
+        assert_eq!(look(&dirty).0, vec![Change::None]);
+        write(src + 2 * PAGE, 9);
+        assert_eq!(look(&dirty).0, vec![Change::Parts(vec![(PAGE + 0x800, 2 * PAGE + 0x800)])]);
         // several textures at once, many pages: the same as one by one
         let big = vec![7u8; 600 * PAGE];
         let at = (big.as_ptr() as usize).next_multiple_of(PAGE);
@@ -857,6 +955,49 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// An upload on another queue than an older one of the same texture that has not run yet goes
+    /// up again behind it: on that queue, or anywhere once it has run. A queue that waited for the
+    /// other one's uploads needs none.
+    #[test]
+    fn an_upload_that_may_be_overtaken_goes_up_again() {
+        unsafe {
+            let dev = test_device();
+            let (direct, own, other) = (0x1000usize, 0x2000usize, 0x3000usize);
+            let fence = || -> ID3D12Fence { dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
+            let (fd, fo, fx) = (fence(), fence(), fence());
+            let at = |queue: usize, f: &ID3D12Fence, value: u64| Sent { queue, fence: f.clone(), value };
+            let known: Known = Default::default();
+            // all of it on the direct queue (which waits for XCL's own), then parts on XCL's own
+            assert!(!sent(&known, None, &at(direct, &fd, 1), own));
+            assert!(sent(&known, Some(&[(0, 64), (4096, 8192)]), &at(own, &fo, 1), 0), "the direct queue's is older and may run later");
+            assert_eq!(take_again(&known, own, 0), Again::NotYet);
+            assert_eq!(take_again(&known, other, own), Again::NotYet, "another queue has no order with it");
+            assert!(sent(&known, Some(&[(100, 5000)]), &at(own, &fo, 2), 0));
+            assert_eq!(take_again(&known, direct, own), Again::Now(Change::Parts(vec![(0, 64), (100, 8192)])), "both, behind it on its queue");
+            assert_eq!(take_again(&known, direct, own), Again::Nothing);
+            // sent again there: the direct queue waited for the own one, nothing is overtaken
+            assert!(!sent(&known, Some(&[(0, 64), (100, 8192)]), &at(direct, &fd, 2), own));
+            // once the older one has run, it goes up wherever
+            assert!(sent(&known, None, &at(own, &fo, 3), 0));
+            assert!(sent(&known, None, &at(other, &fx, 1), own), "two of the title's queues");
+            assert_eq!(take_again(&known, own, 0), Again::NotYet);
+            fd.Signal(2).unwrap();
+            assert_eq!(take_again(&known, own, 0), Again::Now(Change::All));
+            // an upload of all of it, or nothing known of it: what was to go up again is moot
+            assert!(sent(&known, Some(&[(0, 64)]), &at(own, &fo, 4), 0), "(the other queue's is still to run)");
+            all_sent(&known, 0x10_0000, 4096);
+            assert_eq!(take_again(&known, other, own), Again::Nothing);
+            assert!(sent(&known, Some(&[(0, 64)]), &at(own, &fo, 5), 0));
+            forget(&known);
+            assert_eq!(take_again(&known, other, own), Again::Nothing);
+            // nothing pending: nothing overtaken
+            for (f, v) in [(&fd, 9), (&fo, 9), (&fx, 9)] {
+                f.Signal(v).unwrap();
+            }
+            assert!(!sent(&known, None, &at(own, &fo, 10), 0));
+        }
     }
 
     /// A page the title decommits while it is read (or that never was committed) reads as zeros.

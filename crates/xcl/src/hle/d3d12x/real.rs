@@ -2853,10 +2853,10 @@ macro_rules! creator {
     };
 }
 
-/// XCL's own lists, allocators and buffers (made in `title_textures::own_work`) stay the PC's: the
-/// title never sees them, and what a hook does for a title's object is paid on its submit.
+/// XCL's own lists, allocators, buffers and fences (made in `title_textures::own_work`) stay the
+/// PC's: the title never sees them, and what a hook does for a title's object is paid on its submit.
 fn is_own_object(kind: Kind) -> bool {
-    matches!(kind, Kind::CommandList | Kind::CommandAllocator | Kind::Resource) && super::title_textures::is_own_work()
+    matches!(kind, Kind::CommandList | Kind::CommandAllocator | Kind::Resource | Kind::Fence) && super::title_textures::is_own_work()
 }
 
 creator!(dev_create_command_queue, "CreateCommandQueue", Kind::CommandQueue, [a1]);
@@ -4764,7 +4764,9 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     // a console shader the recompiler could not take must not reach the driver: AMD's shader
     // compiler crashes on the stripped DXIL (NOBC bitcode) instead of rejecting it
     let hr = if console.is_some() { E_INVALIDARG } else { finish_pso(this, f, desc, riid, ppv) };
-    if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+    // (a program of XCL's own that the driver refuses is not one that does nothing: its user has
+    // another way)
+    if hr >= 0 || super::title_textures::is_own_work() || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return hr;
     }
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
@@ -5399,7 +5401,7 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
         let iid = pc_iid(Kind::RootSignature);
         hr = f(this, mask, blob, len, &iid, ppv);
     }
-    if hr < 0 {
+    if hr < 0 && !super::title_textures::is_own_work() {
         // console root signature rejected → empty one so the title keeps going
         let desc = D3D12_ROOT_SIGNATURE_DESC { Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, ..Default::default() };
         let mut ser = None;

@@ -196,7 +196,7 @@ unsafe fn guard_of(list: &ID3D12GraphicsCommandList) -> Option<Arc<Guard>> {
     if let Some(g) = g.as_ref().filter(|g| g.dev == dev.as_raw() as usize) {
         return Some(g.clone());
     }
-    match make(&dev) {
+    match super::title_textures::own_work(|| make(&dev)) {
         Ok(n) => {
             let n = Arc::new(n);
             *g = Some(n.clone());

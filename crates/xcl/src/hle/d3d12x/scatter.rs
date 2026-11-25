@@ -66,7 +66,8 @@ pub(super) unsafe fn of(dev: &ID3D12Device) -> Option<Arc<Scatter>> {
         let _ = d;
         return s.clone();
     }
-    let made = match Scatter::new(dev) {
+    // (its own work: the driver's answers as they are, see `dev_create_compute_pso`)
+    let made = match super::title_textures::own_work(|| Scatter::new(dev)) {
         Ok(s) => Some(Arc::new(s)),
         Err(e) => {
             crate::xlog_warn!("sparse windows: small uploads go up with a copy each ({e})");

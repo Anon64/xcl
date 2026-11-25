@@ -51,6 +51,8 @@ struct Due {
     known: texture_upload::Known,
     /// all of it goes up, whatever was written
     whole: bool,
+    /// what of it goes up again (`texture_upload::sent`)
+    again: texture_upload::Change,
 }
 
 struct Entry {
@@ -1303,9 +1305,10 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
             super::vram::before_execute(q);
         });
     }
-    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
+    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 && AGAIN.lock().unwrap().is_empty() {
         return;
     }
+    let target = upload_target(ID3D12CommandQueue::from_raw_borrowed(&queue));
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
     let todo: Vec<Due> = DIRTY_BUF.with(|dcell| {
@@ -1313,11 +1316,23 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
         let mut t = TEXTURES.lock().unwrap();
         let mut names = t.touched_by(&dirty);
         names.extend(std::mem::take(&mut t.pending_res));
-        names
+        let waiting = std::mem::take(&mut *AGAIN.lock().unwrap());
+        names.extend(waiting.iter().copied());
+        let mut later = std::collections::BTreeSet::new();
+        let todo = names
             .into_iter()
             .filter_map(|res| {
                 let e = t.by_res.get_mut(&res)?;
-                let wanted = e.pending || (!e.gpu_written && {
+                let mut again = texture_upload::Change::None;
+                if waiting.contains(&res) && !e.gpu_written {
+                    let (queue, waited) = target.on(e.device);
+                    match texture_upload::take_again(&e.known, queue, waited) {
+                        texture_upload::Again::Now(c) => again = c,
+                        texture_upload::Again::NotYet => drop(later.insert(res)),
+                        texture_upload::Again::Nothing => {}
+                    }
+                }
+                let wanted = e.pending || again != texture_upload::Change::None || (!e.gpu_written && {
                     let i = dirty.partition_point(|&p| p + page as usize <= e.src);
                     dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
                 });
@@ -1330,9 +1345,11 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| Due { res: r.clone(), device: e.device, src: e.src, tex: Arc::clone(&e.tex), states: e.states.clone(), known: Arc::clone(&e.known), whole })
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| Due { res: r.clone(), device: e.device, src: e.src, tex: Arc::clone(&e.tex), states: e.states.clone(), known: Arc::clone(&e.known), whole, again })
             })
-            .collect()
+            .collect();
+        AGAIN.lock().unwrap().extend(later);
+        todo
     });
     let t_tex = std::time::Instant::now();
     DIRTY_BUF.with(|dcell| upload_all(todo, &dcell.borrow(), page as usize, ID3D12CommandQueue::from_raw_borrowed(&queue)));
@@ -1382,51 +1399,83 @@ unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>
     (qd?.as_raw() == dev.as_raw()).then(|| q.clone())
 }
 
-unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) {
-    let done = super::real::fence_completed(&q.fence);
-    while let Some((v, job)) = q.in_flight.pop_front() {
-        if v > done && (q.bytes <= cap || crate::gpu::fence::wait(&q.fence, v, dev, None, wait_ms).is_err()) {
-            q.in_flight.push_front((v, job));
-            break;
+unsafe fn reclaim(q: &mut QueueUploads, cap: u64, wait_ms: u64) {
+    let start = std::time::Instant::now();
+    while let Some(&(v, _)) = q.in_flight.front() {
+        if super::real::fence_completed(&q.fence) < v {
+            if q.bytes <= cap || start.elapsed().as_millis() as u64 >= wait_ms {
+                break;
+            }
+            // (no event: a wait that gives up would leave its registration behind)
+            std::thread::sleep(std::time::Duration::from_micros(500));
+            continue;
         }
+        let Some((_, job)) = q.in_flight.pop_front() else { break };
         q.bytes -= job.bytes;
         texture_upload::give_back(job);
     }
 }
 
-/// Upload `items` on `queue`, a DIRECT one: the ones that could not be, the bytes of the others and
-/// the value the queue signals its uploads' fence with behind them (0: there were none).
-unsafe fn submit_on(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[texture_upload::Item]) -> Result<(Vec<(usize, String)>, u64, u64), String> {
-    let (failed, f, bytes) = texture_upload::submit(dev, queue, items)?;
-    let Some(f) = f else { return Ok((failed, 0, 0)) };
-    let mut g = ON_QUEUE.lock().unwrap();
-    let key = queue.as_raw() as usize;
-    if !g.contains_key(&key) {
-        match dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
-            Ok(fence) => {
-                g.insert(key, QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
-            }
-            Err(e) => {
-                texture::wait(dev, queue)?;
-                drop(f);
-                return Err(e.to_string());
-            }
+/// The queue a submit's uploads go to, by device, and the one it waits for first.
+struct Target {
+    /// the title's queue, when they go to it
+    title: Option<(usize, usize)>,
+}
+
+impl Target {
+    /// (the queue, the one it has waited for) of uploads for `device`; 0: none.
+    fn on(&self, device: usize) -> (usize, usize) {
+        let own = QUEUES.lock().unwrap().get(&device).map_or(0, |q| q.as_raw() as usize);
+        match self.title {
+            Some((q, d)) if d == device => (q, own),
+            _ => (own, 0),
         }
     }
-    let q = g.get_mut(&key).unwrap();
-    q.value += 1;
-    if let Err(e) = queue.Signal(&q.fence, q.value) {
-        q.value -= 1;
-        texture::wait(dev, queue)?;
-        drop(f);
+}
+
+unsafe fn upload_target(title: Option<&ID3D12CommandQueue>) -> Target {
+    let of = |q: &ID3D12CommandQueue| {
+        if q.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
+            return None;
+        }
+        let mut dev: Option<ID3D12Device> = None;
+        q.GetDevice(&mut dev).ok()?;
+        Some((q.as_raw() as usize, dev?.as_raw() as usize))
+    };
+    Target { title: title.and_then(of) }
+}
+
+/// textures with something to send again (`texture_upload::sent`)
+static AGAIN: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Upload `items` on `queue`, a DIRECT one: the ones that could not be, the bytes of the others and
+/// where they went (None: there were none).
+unsafe fn submit_on(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[texture_upload::Item]) -> Result<(Vec<(usize, String)>, u64, Option<texture_upload::Sent>), String> {
+    let mut g = ON_QUEUE.lock().unwrap();
+    let key = queue.as_raw() as usize;
+    if let std::collections::btree_map::Entry::Vacant(e) = g.entry(key) {
+        // (before anything runs that it would have to follow)
+        let fence = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).map_err(|e| e.to_string())?;
+        e.insert(QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
+    }
+    let Some(q) = g.get_mut(&key) else { return Err("no fence for the queue".into()) };
+    let (failed, f, bytes) = texture_upload::submit(dev, queue, items)?;
+    let Some(f) = f else { return Ok((failed, 0, None)) };
+    if let Err(e) = queue.Signal(&q.fence, q.value + 1) {
+        // the GPU may still run the list and read the buffer: they stay when it does not get there
+        match texture::wait(dev, queue) {
+            Ok(()) => drop(f),
+            Err(_) => std::mem::forget(f),
+        }
         return Err(e.to_string());
     }
+    q.value += 1;
     q.bytes += f.bytes;
-    let v = q.value;
-    q.in_flight.push_back((v, f));
-    reclaim(dev, q, IN_FLIGHT_BYTES, 20);
-    reclaim(dev, q, IN_FLIGHT_MAX, 10_000);
-    Ok((failed, bytes, v))
+    let sent = texture_upload::Sent { queue: key, fence: q.fence.clone(), value: q.value };
+    q.in_flight.push_back((sent.value, f));
+    reclaim(q, IN_FLIGHT_BYTES, 20);
+    reclaim(q, IN_FLIGHT_MAX, 10_000);
+    Ok((failed, bytes, Some(sent)))
 }
 
 /// The uploads on XCL's own queue (its fence, the last value): each of the title's queues waits for
@@ -1448,6 +1497,27 @@ unsafe fn wait_for_own_uploads(queue: &ID3D12CommandQueue) {
     g.insert(key, v);
 }
 
+/// The pages `[src, src + size)` lies on that were written since the look that took them last; they
+/// stay reported. None for memory that is not watched.
+unsafe fn written_pages(src: usize, size: usize) -> Vec<usize> {
+    const PAGE: usize = 0x1000;
+    let (mut at, end) = (src / PAGE * PAGE, (src + size).next_multiple_of(PAGE));
+    let mut out = Vec::new();
+    let mut buf = [std::ptr::null_mut::<c_void>(); 512];
+    while at < end {
+        let (mut n, mut page) = (buf.len(), PAGE as u32);
+        if GetWriteWatch(0, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, &mut page) != 0 {
+            break;
+        }
+        out.extend(buf[..n].iter().map(|&p| p as usize));
+        if n < buf.len() {
+            break;
+        }
+        at = buf[n - 1] as usize + PAGE;
+    }
+    out
+}
+
 /// What changed of the textures `todo` (written pages: `dirty`, sorted) goes up, in batches of up to
 /// `BATCH_BYTES` (one list each).
 unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option<&ID3D12CommandQueue>) {
@@ -1462,14 +1532,30 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
     // wrote).
     let t = std::time::Instant::now();
     let mut changes: std::collections::VecDeque<texture_upload::Change> = {
-        let written: Vec<texture_upload::Written> = todo
+        let pages: Vec<std::borrow::Cow<[usize]>> = todo
             .iter()
             .filter(|d| !d.whole)
             .map(|d| {
                 let size = d.tex.size() as usize;
                 let (from, to) = (dirty.partition_point(|&p| p + page <= d.src), dirty.partition_point(|&p| p < d.src + size));
-                texture_upload::Written { src: d.src, size, dirty: &dirty[from..to.max(from)], known: &d.known }
+                let mine = &dirty[from..to.max(from)];
+                // (a look takes the blocks written lately: the others' pages of this texture too, or
+                // it would go up in part as it was and in part as it is)
+                let also = if mine.is_empty() { Vec::new() } else { written_pages(d.src, size) };
+                if also.iter().all(|p| mine.binary_search(p).is_ok()) {
+                    return mine.into();
+                }
+                let mut all = [mine, &also].concat();
+                all.sort_unstable();
+                all.dedup();
+                all.into()
             })
+            .collect();
+        let written: Vec<texture_upload::Written> = todo
+            .iter()
+            .filter(|d| !d.whole)
+            .zip(&pages)
+            .map(|(d, pages)| texture_upload::Written { src: d.src, size: d.tex.size() as usize, dirty: pages, known: &d.known })
             .collect();
         let (changes, compared) = texture_upload::changed(&written, unchanged_skip());
         let same = changes.iter().filter(|c| **c == texture_upload::Change::None).count() as u64;
@@ -1481,7 +1567,8 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
         changes.into()
     };
     let mut todo = todo.into_iter().filter_map(|d| {
-        let changed = match if d.whole { texture_upload::Change::All } else { changes.pop_front()? } {
+        let change = if d.whole { texture_upload::Change::All } else { changes.pop_front()? };
+        let changed = match texture_upload::join(change, d.again.clone()) {
             texture_upload::Change::None => return None,
             texture_upload::Change::All => None,
             texture_upload::Change::Parts(_) if !upload_parts() => None,
@@ -1491,14 +1578,16 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
         Some((d, changed, bytes))
     }).peekable();
     while todo.peek().is_some() {
-        let (mut items, mut known) = (Vec::new(), Vec::new());
+        let (mut items, mut known): (Vec<texture_upload::Item>, Vec<texture_upload::Known>) = (Vec::new(), Vec::new());
         let (mut bytes, mut device) = (0usize, 0usize);
+        let mut whole = Vec::new();
         while let Some((d, changed, n)) = todo.next_if(|(d, _, n)| items.is_empty() || (bytes + n <= BATCH_BYTES && d.device == device)) {
             device = d.device;
             bytes += n;
             if changed.is_none() {
                 // (before its bytes are read: what is written from here on is compared)
                 texture_upload::all_sent(&d.known, d.src, d.tex.size() as usize);
+                whole.push((d.src, d.tex.size() as usize, Arc::clone(&d.known)));
             }
             if super::present::trace_frame() {
                 note_content(d.src, &d.res, &subresources(d.src, &d.tex));
@@ -1509,29 +1598,44 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
         let p = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&p) else { continue };
         let t_submit = std::time::Instant::now();
+        if unchanged_skip() {
+            texture_upload::remember(&whole);
+        }
         let done = own_work(|| match title_queue_for(dev, title) {
-            Some(q) => submit_on(dev, &q, &items),
+            Some(q) => {
+                // what went up on XCL's own queue first: these may be newer bytes of the same texture
+                wait_for_own_uploads(&q);
+                submit_on(dev, &q, &items)
+            }
             // not from a compute or copy queue: on XCL's own, which the title's queues wait for
             None => {
                 let queue = upload_queue(dev, device)?;
                 super::vram::before_execute(&queue);
                 let r = submit_on(dev, &queue, &items)?;
-                if r.2 > 0 {
-                    let fence = ON_QUEUE.lock().unwrap().get(&(queue.as_raw() as usize)).map(|q| q.fence.clone());
-                    *OWN_UPLOADS.lock().unwrap() = fence.map(|f| (f, r.2));
+                if let Some(s) = &r.2 {
+                    *OWN_UPLOADS.lock().unwrap() = Some((s.fence.clone(), s.value));
                 }
                 Ok(r)
             }
         });
         // (what did not go up is not what the PC texture holds: as a whole at its next write)
         match done {
-            Ok((failed, sent, _)) => {
+            Ok((failed, bytes, to)) => {
                 for (k, e) in &failed {
                     warn(e);
                     texture_upload::forget(&known[*k]);
                 }
+                if let Some(to) = to {
+                    let waited = QUEUES.lock().unwrap().get(&device).map_or(0, |q| q.as_raw() as usize);
+                    for (k, it) in items.iter().enumerate().filter(|(k, _)| !failed.iter().any(|f| f.0 == *k)) {
+                        // (XCL's own queue waits for none of the title's)
+                        if texture_upload::sent(&known[k], it.changed.as_deref(), &to, if to.queue == waited { 0 } else { waited }) {
+                            AGAIN.lock().unwrap().insert(it.res.as_raw() as usize);
+                        }
+                    }
+                }
                 UPLOADS.fetch_add((items.len() - failed.len()) as u64, Ordering::Relaxed);
-                super::submit_cost::textures_uploaded(items.len() - failed.len(), sent as usize, t_submit.elapsed());
+                super::submit_cost::textures_uploaded(items.len() - failed.len(), bytes as usize, t_submit.elapsed());
             }
             Err(e) => {
                 warn(&e);
@@ -1539,6 +1643,21 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
             }
         }
     }
+}
+
+/// An upload of `changed` (None: all) of `res`, a texture of the console description `desc` with its
+/// bytes in `mem`, on `queue`, waited for: for the test of its barriers under the debug layer.
+#[doc(hidden)]
+pub unsafe fn upload_and_wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D12Resource, desc: &[u8; 0x38], mem: &[u8], states: Vec<D3D12_RESOURCE_STATES>, changed: Option<Vec<(usize, usize)>>) -> Result<(), String> {
+    let tex = Arc::new(xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?);
+    if mem.len() < tex.size() as usize {
+        return Err(format!("{} bytes of {}", mem.len(), tex.size()));
+    }
+    let item = texture_upload::Item { res: res.clone(), src: mem.as_ptr() as usize, tex, states, changed };
+    let (failed, job, _) = own_work(|| texture_upload::submit(dev, queue, &[item]))?;
+    texture::wait(dev, queue)?;
+    job.into_iter().for_each(texture_upload::give_back);
+    failed.into_iter().next().map_or(Ok(()), |(_, e)| Err(e))
 }
 
 /// `XCL_TRACE_FRAME`: how much of a title texture's top level is not zero, each time it is
@@ -1899,7 +2018,7 @@ pub(super) mod tests {
                 let mut g = ON_QUEUE.lock().unwrap();
                 let q = g.get_mut(&key).unwrap();
                 assert_eq!(q.value, 3);
-                reclaim(dev, q, 0, 10_000);
+                reclaim(q, 0, 10_000);
                 assert!(q.in_flight.is_empty() && q.bytes == 0, "over the cap the oldest uploads are waited for and released");
                 assert!(q.fence.GetCompletedValue() >= 3);
             }
@@ -1978,7 +2097,7 @@ pub(super) mod tests {
             {
                 let mut g = ON_QUEUE.lock().unwrap();
                 let q = g.get_mut(&key).unwrap();
-                reclaim(dev, q, 0, 50);
+                reclaim(q, 0, 50);
                 assert_eq!(q.in_flight.len(), 1, "a batch the GPU has not run stays in flight when its wait times out");
                 assert!(q.bytes > 0);
             }
@@ -1986,7 +2105,7 @@ pub(super) mod tests {
             {
                 let mut g = ON_QUEUE.lock().unwrap();
                 let q = g.get_mut(&key).unwrap();
-                reclaim(dev, q, 0, 10_000);
+                reclaim(q, 0, 10_000);
                 assert!(q.in_flight.is_empty() && q.bytes == 0);
             }
             assert_eq!(read_r8(dev, &queue, &texture), vec![0x77; 64 * 64]);
@@ -2141,6 +2260,35 @@ pub(super) mod tests {
             VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
             assert_eq!(after, at);
             assert_eq!(before, at, "a page mapped at the address but not used yet is its source too");
+        }
+    }
+
+    /// `written_pages` reports what was written and not taken, at any number, and leaves it reported.
+    #[test]
+    fn written_pages_are_reported_without_being_taken() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 1500;
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), N << 12, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            assert!(written_pages(p, N << 12).is_empty());
+            for k in 0..N {
+                *((p + (k << 12) + 5) as *mut u8) = 1;
+            }
+            let all: Vec<usize> = (0..N).map(|k| p + (k << 12)).collect();
+            assert_eq!(written_pages(p, N << 12), all);
+            assert_eq!(written_pages(p + 0x1800, 0x1000), vec![p + 0x1000, p + 0x2000], "the pages a range lies on");
+            // (they are still there for a look)
+            let (mut buf, mut dirty, mut page) = (vec![std::ptr::null_mut(); 4096], Vec::new(), 0x1000);
+            take_written(p, N << 12, &mut buf, &mut dirty, &mut page);
+            assert_eq!(dirty, all);
+            assert!(written_pages(p, N << 12).is_empty());
+            VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
+            let plain = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            *(plain as *mut u8) = 1;
+            assert!(written_pages(plain, 0x1000).is_empty(), "memory that is not watched");
+            VirtualFree(plain as *mut c_void, 0, MEM_RELEASE);
         }
     }
 
