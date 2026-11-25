@@ -44,6 +44,9 @@ struct Chain {
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
+        // (a driver compile on the title's thread, of the largest programs: the title is held
+        // while it lasts, as in any other long PC call)
+        let _call = super::super::pso_async::pc_call();
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
