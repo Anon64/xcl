@@ -103,8 +103,9 @@ pub(super) fn note_huge() {
     JOB_HUGE.with(|h| h.set(true));
 }
 
-/// This thread is a worker and one of the title's threads waits for what it is building: the
-/// build must not stand back for the title's sake (`real::big_compile_turn`).
+/// This thread is a worker and one of the title's threads waits for what it is building: its
+/// huge driver compile does not wait for free commit and may take one of the slots kept for
+/// wanted builds, up to their cap (`real::big_compile_turn`).
 pub(super) fn build_is_wanted() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted()))
 }
@@ -175,8 +176,9 @@ impl Pending {
 
     /// A bind that waited for it ran out of its budget and goes on without it: when nobody else
     /// waits, the build is no longer wanted – back at the lowest priority on a preload worker and
-    /// behind the huge-pipeline gate (`real::big_compile_turn`); a wanted build skips the gate, and
-    /// many of them at once ran the process out of commit.
+    /// behind the huge-pipeline gate as an unwanted one (`real::big_compile_turn`): it waits for
+    /// free commit and for the unwanted slots, where a wanted build skips the commit wait and has
+    /// more slots, and many of those at once ran the process out of commit.
     fn unwant(&self) {
         let mut d = self.demand.lock().unwrap();
         d.waiters = d.waiters.saturating_sub(1);
@@ -685,7 +687,7 @@ struct Preload {
 /// with every worker on them the known graphics pipelines would wait for all of them and be
 /// built at their first draws instead. A pipeline a bind wants is
 /// not taken from here (`unclaimed`): the workers build it at once, and a huge driver compile
-/// ahead of its use gives its turn to any other (`real::big_compile_turn`).
+/// ahead of its use gives its turn to any other and takes no giant slot (`real::big_compile_turn`).
 #[derive(Default)]
 struct Backlog {
     known_compute: std::collections::VecDeque<Arc<Pending>>,
@@ -1819,8 +1821,8 @@ fn gfx_wait_budget() -> Option<std::time::Duration> {
 
 /// How long a bind waits for a compute pipeline still being built (`XCL_CS_PSO_WAIT_MS`; unset
 /// or 0: as `wait_budget`). With it the bind's thread never builds the pipeline itself: the build
-/// goes to the workers (`resolve_within`; a huge driver compile behind the gate once nobody
-/// waits), and past the budget the pipeline's dispatches are skipped until it is built – what
+/// goes to the workers (`resolve_within`; a huge driver compile also waits for free commit at the
+/// gate once nobody waits), and past the budget the pipeline's dispatches are skipped until it is built – what
 /// they compute is missing or old meanwhile, the counts of later ExecuteIndirects among it
 /// (`indirect_guard` zeroes only counts out of range). A retail title's thread spent 57 s in the
 /// driver's compiler on one program no earlier run had used, and another of its threads waited

@@ -4347,8 +4347,9 @@ fn compile_slots(bytes: usize) -> &'static Slots {
 }
 
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
-/// waits for its slot first (`big_compile_turn`; not a title thread's, nor one the title waits
-/// for). Logs its time, size and whether it was gated. (Every pipeline path passes its record
+/// waits for its slot first (`big_compile_turn`; not a title thread's; one the title waits for
+/// does not wait for free commit and may take one of `Slots::wanted_most`). Logs its time, size
+/// and whether it was gated. (Every pipeline path passes its record
 /// to `driver_compile_identified` now; the gate's tests use this form.)
 #[cfg(test)]
 fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() -> R) -> R {
