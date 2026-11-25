@@ -1354,6 +1354,13 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
 }
 
+/// `pso` is a stand-in whose real pipeline is being built or was built: a bind whose
+/// `resolve_wait` gave `pso` itself has the stand-in, also when the build finished since (a
+/// failed build's stand-in is what draws for good).
+pub fn stands_in(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| !*p.done.lock().unwrap() || p.real.load(Ordering::Acquire) != 0)
+}
+
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
     let mut pending = 0;

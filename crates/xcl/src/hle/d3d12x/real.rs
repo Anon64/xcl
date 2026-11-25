@@ -1827,6 +1827,11 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         f(this)
     };
     if n == 0 {
+        // (gone already when not held: its views are made null views as soon as can be; a held
+        // one's when `late_release` lets it go)
+        if !held {
+            resource_ending(this as usize);
+        }
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
@@ -1863,6 +1868,24 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::late_release::hold(this as usize, pinned);
     }
     n
+}
+
+/// The PC resource `res` is destroyed next (its last reference goes now): its views in the shared
+/// view heap become null views first (`console_heap::resource_gone`), so that a T# the title
+/// kept of it reads zeros instead of an unmapped address. Logged at the first 16 releases that
+/// had any and at powers of two.
+pub(super) fn resource_ending(res: usize) {
+    let n = super::console_heap::resource_gone(res);
+    if n == 0 {
+        return;
+    }
+    static RELEASES: AtomicU64 = AtomicU64::new(0);
+    static NULLED: AtomicU64 = AtomicU64::new(0);
+    let total = NULLED.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+    let k = RELEASES.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= 16 || k.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: {total} descriptors of destroyed resources set to null views so far ({k} resources)");
+    }
 }
 
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
@@ -2115,10 +2138,12 @@ unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: 
         return false;
     }
     let ty = pc_heap_type(ty);
+    // what the source views name, for the copies in the shared heap (`console_heap::resource_gone`)
+    let names: Vec<(usize, usize)> = if d0.sampler { Vec::new() } else { (0..n as u64).map(|k| slot(src + k * SLOT as u64).map_or((0, 0), |s| super::console_heap::names_of(&s))).collect() };
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, if d0.sampler { n } else { 2 * n }, d0.pc_srv, s0.pc_srv, ty);
     if !d0.sampler {
-        super::console_heap::publish_range(&d0, n);
+        super::console_heap::publish_range(&d0, n, &names);
     }
     let step = if d0.sampler { SAMPLER_SLOT } else { SLOT } as u64;
     for k in 0..n as u64 {
@@ -2339,7 +2364,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     let cube = desc.as_ref().and_then(cube_as_cube_array);
     let desc = cube.as_ref().map_or(desc, |v| v as *const _);
     f(this, res, desc, slot.pc_srv);
-    super::console_heap::publish(&slot, false);
+    super::console_heap::publish(&slot, false, res as usize);
     super::console_heap::note_resource(&slot, res as usize);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -2531,7 +2556,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     };
     let Some(slot) = super::console_heap::slot(cpu) else { return pc_uav(cpu) };
     pc_uav(slot.pc_uav);
-    super::console_heap::publish(&slot, true);
+    super::console_heap::publish(&slot, true, if no_uav { 0 } else { res as usize });
     super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         return super::console_heap::write(&slot, &[0; 8]);
@@ -2575,7 +2600,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         }
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
         g(this, res, &srv, slot.pc_srv);
-        super::console_heap::publish(&slot, false);
+        super::console_heap::publish(&slot, false, res as usize);
     }
     let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
     super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, 1));
@@ -5820,8 +5845,20 @@ static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mut
 
 /// The compute pass of a pipeline state XCL built from console MS / GS code.
 pub fn two_pass_of(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
-    let pso = super::pso_async::resolve(pso);
+    two_pass_entry(super::pso_async::resolve(pso))
+}
+
+/// `two_pass_of` of exactly `pso`, not resolved again: a draw that resolved its pipeline once
+/// (`pso_async::resolve_wait`) records its passes with what that gave. (Resolved again, a build
+/// that finished in between gave the two-pass entry while the draw held the stand-in.)
+pub fn two_pass_entry(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
     TWO_PASS.lock().unwrap().as_ref()?.get(&pso).cloned()
+}
+
+#[cfg(test)]
+pub(super) fn register_two_pass_for_test(pso: usize) {
+    let tp = TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" };
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, std::sync::Arc::new(tp));
 }
 
 pub fn two_pass_count() -> usize {

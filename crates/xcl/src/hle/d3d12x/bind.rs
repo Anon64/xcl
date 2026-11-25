@@ -737,12 +737,67 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     Ok((dst, dst_off))
 }
 
+/// What a DispatchMesh or ExecuteIndirect draws with, decided once from `resolved`, what
+/// `pso_async::resolve_wait` gave for the bound `raw` pipeline.
+enum DrawPipeline {
+    /// a pipeline XCL built from console MS / GS code: its two passes, with `resolved` as the
+    /// mesh pass's pipeline
+    TwoPass(Arc<super::real::TwoPassPso>),
+    /// the stand-in of a pipeline being built (or built since the resolve: the draw still has
+    /// the stand-in, which was made with the title's root signature, not the two passes')
+    StandIn,
+    /// anything else: a PC pipeline, a translated one, a failed build's stand-in
+    Other,
+}
+
+fn draw_pipeline(raw: usize, resolved: usize) -> DrawPipeline {
+    if let Some(tp) = super::real::two_pass_entry(resolved) {
+        return DrawPipeline::TwoPass(tp);
+    }
+    if resolved == raw && super::pso_async::stands_in(raw) {
+        return DrawPipeline::StandIn;
+    }
+    DrawPipeline::Other
+}
+
+/// Before a draw with a PC pipeline (also a stand-in or fallback, made with the title's root
+/// signature): the title's graphics root signature, which nothing else binds on the PC list – a
+/// draw without one is invalid (the debug layer reports it on every GPU; WARP faults on it).
+/// False: the list has none (the draw is skipped – it would run under whatever root signature a
+/// translated draw left, XCL's ABI or a two-pass one), except on a bundle, which takes its
+/// caller's.
+unsafe fn bind_title_root_signature(this: *mut c_void, list: &ID3D12GraphicsCommandList) -> bool {
+    let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+    if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
+        list.SetGraphicsRootSignature(r);
+        return true;
+    }
+    super::list_x::tracked_list_type(this) == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
+}
+
+/// A draw skipped by `bind_title_root_signature` (logged the first 4 times).
+fn note_no_root_signature() {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::xlog_warn!("D3D12.X: a draw with a PC pipeline on a list with no graphics root signature set skipped");
+    }
+}
+
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
     type PcDm = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
     let pc_dm: PcDm = std::mem::transmute(super::real::orig_fn(this, 79));
     let raw_pso = with(this, |s| s.pso);
     let pso = super::pso_async::resolve_wait(raw_pso);
-    if let Some(tp) = super::real::two_pass_of(pso) {
+    let tp = match draw_pipeline(raw_pso, pso) {
+        DrawPipeline::TwoPass(tp) => Some(tp),
+        DrawPipeline::StandIn => {
+            mesh_work(this, super::targets::STANDIN);
+            count(DRAWS_SKIPPED);
+            return;
+        }
+        DrawPipeline::Other => None,
+    };
+    if let Some(tp) = tp {
         let groups = x.saturating_mul(y).saturating_mul(z);
         if groups == 0 {
             return;
@@ -791,14 +846,12 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         }
         return;
     }
-    if super::pso_async::is_pending(raw_pso) {
-        mesh_work(this, super::targets::STANDIN);
+    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    if !bind_title_root_signature(this, list) {
+        note_no_root_signature();
+        mesh_work(this, super::targets::SKIPPED);
         count(DRAWS_SKIPPED);
         return;
-    }
-    let rs = with(this, |s| s.rs_gfx) as *mut c_void;
-    if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
-        list.SetGraphicsRootSignature(r);
     }
     mesh_work(this, super::targets::PC);
     count(DRAWS_PC);
@@ -825,8 +878,41 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let commands_at = super::real::console_buffer(args).map(|(p, n)| (p + args_off as usize, n.saturating_sub(args_off as usize)));
     let count_at = super::real::console_buffer(count_buf).filter(|&(_, n)| count_off as usize + 4 <= n).map(|(p, _)| p + count_off as usize);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
-    if let Some(tp) = super::real::two_pass_of(pso) {
-        if let Some(msig) = dispatch_mesh_sig_of(sig) {
+    let tp = match draw_pipeline(raw_pso, pso) {
+        DrawPipeline::TwoPass(tp) => Some(tp),
+        // A pipeline still being built (or whose build finished after the resolve): its
+        // stand-in draws nothing, and the list may hold XCL's ABI root signature from a
+        // translated draw before it – the PC call with that pair is invalid (debug layer 953,
+        // "the currently set Root Signature doesn't match the currently set Pipeline State
+        // Object"; a retail title's world then hung the GPU, 0x887a0006). Skipped, like a draw or
+        // dispatch of such a pipeline.
+        DrawPipeline::StandIn => {
+            ei_work(this, sig, super::targets::STANDIN);
+            count(DRAWS_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
+            }
+            return;
+        }
+        DrawPipeline::Other => None,
+    };
+    if let Some(tp) = tp {
+        // Only a noted DispatchMesh signature runs the two passes. Any other (one that changes
+        // root arguments, or whose companion Dispatch signature could not be made) would reach
+        // the PC call under the title's root signature with the pass-through mesh pipeline on
+        // the list, whose shaders read their memory through root views the title's root
+        // signature does not have.
+        let Some(msig) = dispatch_mesh_sig_of(sig) else {
+            ei_work(this, sig, super::targets::SKIPPED);
+            count(DRAWS_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a two-pass pipeline and a signature that is not a plain DispatchMesh one (root arguments, or no companion Dispatch) skipped");
+            }
+            return;
+        };
+        {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
             let run = (|| -> Result<(), String> {
                 if max == 0 || args == 0 {
@@ -887,20 +973,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     if !gfx && !compute {
-        // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
-        // the list may hold XCL's ABI root signature from a translated draw before it – the PC
-        // call with that pair is invalid (debug layer 953, "the currently set Root Signature
-        // doesn't match the currently set Pipeline State Object"; a retail title's world then
-        // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(with(this, |s| s.pso)) {
-            ei_work(this, sig, super::targets::STANDIN);
-            count(DRAWS_SKIPPED);
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
-            }
-            return;
-        }
+        // (a pipeline still being built: skipped above, `DrawPipeline::StandIn`)
         // a console compute program without a translation (its build failed): nothing to run,
         // as for Dispatch. The PC call would run it with the list's compute root signature, which
         // can still be XCL's ABI one from a translated dispatch before it (debug layer 953).
@@ -915,9 +988,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             return;
         }
         // a PC pipeline: the title's root signature, as for a draw (`graphics_bound`)
-        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
-        if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
-            list.SetGraphicsRootSignature(r);
+        // (a dispatch does not use it: it goes on without one)
+        let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+        if !bind_title_root_signature(this, list) && !signature_dispatches(sig) {
+            note_no_root_signature();
+            ei_work(this, sig, super::targets::SKIPPED);
+            count(DRAWS_SKIPPED);
+            return;
         }
         ei_work(this, sig, super::targets::PC);
         let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::PcIndirect, [max, 0, 0]);
@@ -1166,7 +1243,20 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    let real = super::pso_async::resolve_wait(pso);
+    if !super::real::is_translated_graphics(real) {
+        // A two-pass pipeline (console MS, or VS+GS) draws only through DispatchMesh: a Draw with
+        // it would be a Draw on a mesh pipeline under the title's root signature, whose
+        // pass-through shaders read their memory through root views that signature does not have.
+        if super::real::two_pass_entry(real).is_some() {
+            super::targets::note_draw(this, super::targets::SKIPPED);
+            count(DRAWS_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::xlog_warn!("D3D12.X: a Draw with a two-pass (mesh) pipeline skipped: it draws only through DispatchMesh");
+            }
+            return None;
+        }
         if super::targets::enabled() {
             super::targets::note_draw(this, if super::pso_async::is_pending(pso) { super::targets::STANDIN } else { super::targets::PC });
         }
@@ -1177,7 +1267,6 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             let mut g = SEEN.lock().unwrap();
             if !g.contains(&pso) && g.len() < 12 {
                 g.push(pso);
-                let real = super::pso_async::resolve_wait(pso);
                 crate::xlog_info!(
                     "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),
@@ -1186,12 +1275,10 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
                 );
             }
         }
-        // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
-        // the title's root signature, which nothing else binds on the PC list – a draw without
-        // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
-        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
-        if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
-            list.SetGraphicsRootSignature(r);
+        // a PC pipeline (also a stand-in or fallback): the title's root signature
+        if !bind_title_root_signature(this, &list) {
+            note_no_root_signature();
+            return None;
         }
         return Some(list);
     }
@@ -2036,8 +2123,11 @@ void main(uint t : SV_GroupIndex) {
         orig_vt[14] = fake_dispatch as usize;
         orig_vt[25] = fake_set_pso as usize;
         orig_vt[29] = fake_set_compute_rs as usize;
+        orig_vt[30] = fake_noop_ptr as usize; // SetGraphicsRootSignature
         orig_vt[41] = fake_set_compute_uav as usize;
         orig_vt[59] = fake_execute_indirect as usize;
+        // (a draw signature with a PC pipeline needs the title's graphics root signature)
+        let title_rs = 0x7200_0200usize;
 
         // Extended vtable layout expected by `real::orig_fn`: entry -1 holds `orig_vt` pointer,
         // and entries 0..64 hold the COM method pointers used via `ID3D12GraphicsCommandList`.
@@ -2097,6 +2187,7 @@ void main(uint t : SV_GroupIndex) {
         assert!(!real::is_translated_compute(standin_fail));
 
         reset(list_ptr, 0x7200_0100, standin_fail);
+        unsafe { set_graphics_root_signature(list_ptr, title_rs as *mut c_void) };
         let before = counts_snapshot();
         unsafe {
             dispatch(list_ptr, 1, 1, 1);
@@ -2148,6 +2239,7 @@ void main(uint t : SV_GroupIndex) {
         reset(list_ptr, 0x7200_0100, standin_fail);
         note_signature_dispatches(sig_dispatch, false);
         unsafe {
+            set_graphics_root_signature(list_ptr, title_rs as *mut c_void);
             execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
         }
         assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 3);
@@ -2158,6 +2250,98 @@ void main(uint t : SV_GroupIndex) {
         real::forget_pso_for_test(real_ok);
         real::forget_pso_for_test(standin_fail);
         assert!(!real::is_console_compute(standin_fail), "a released pipeline's address does not stay a console one");
+    }
+
+    /// A draw decides once what its pipeline is, from what `resolve_wait` gave: the stand-in of a
+    /// two-pass pipeline whose build finished after that is still the stand-in (skipped), never
+    /// the two passes with the stand-in as their mesh pipeline; the built one runs the two passes.
+    #[test]
+    fn a_draw_with_the_stand_in_of_a_two_pass_pipeline_is_not_recorded_as_its_passes() {
+        let (standin, real_mesh, failed, native) = (0x7E57_7001usize, 0x7E57_7002usize, 0x7E57_7003usize, 0x7E57_7004usize);
+        real::register_two_pass_for_test(real_mesh);
+        // lazy submits: no worker starts them, so the states stay under the test's control
+        pso_async::submit_lazy(standin, false, Box::new(move || real_mesh), 0);
+        pso_async::submit_lazy(failed, false, Box::new(|| 0), 0);
+        assert!(matches!(draw_pipeline(standin, standin), DrawPipeline::StandIn), "being built");
+        // built now: a bind that resolved before has the stand-in (the second resolve that
+        // `two_pass_of` makes finds the two passes – what recorded them with the stand-in)
+        assert_eq!(pso_async::resolve_wait(standin), real_mesh);
+        assert!(real::two_pass_of(standin).is_some());
+        assert!(matches!(draw_pipeline(standin, standin), DrawPipeline::StandIn), "resolved before the build finished");
+        assert!(matches!(draw_pipeline(standin, real_mesh), DrawPipeline::TwoPass(_)));
+        assert_eq!(pso_async::resolve_wait(failed), failed);
+        assert!(matches!(draw_pipeline(failed, failed), DrawPipeline::Other), "a failed build's stand-in draws as before");
+        assert!(matches!(draw_pipeline(native, native), DrawPipeline::Other));
+        pso_async::released(standin);
+        pso_async::released(failed);
+        real::forget_pso_for_test(real_mesh);
+        assert!(matches!(draw_pipeline(real_mesh, real_mesh), DrawPipeline::Other));
+    }
+
+    static FAKE_DRAWS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "system" fn fake_draw_instanced(_this: *mut c_void, _v: u32, _i: u32, _sv: u32, _si: u32) {
+        FAKE_DRAWS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    unsafe extern "system" fn fake_noop_ptr(_this: *mut c_void, _p: *mut c_void) {}
+
+    /// A two-pass pipeline never reaches a PC call under the title's root signature: not an
+    /// ExecuteIndirect whose signature is not a noted DispatchMesh one, not a Draw. A draw with a
+    /// PC pipeline and no graphics root signature on the list is skipped too.
+    #[test]
+    fn a_two_pass_pipeline_or_a_list_without_a_root_signature_does_not_reach_the_pc_call() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[12] = fake_draw_instanced as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        orig_vt[30] = fake_noop_ptr as usize; // SetGraphicsRootSignature
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            // SAFETY: `ext_vt` has 65 elements so `.add(1)` points to slot 0 with `orig_vt` at `-1`.
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        let (mesh, native, rs, sig) = (0x7E57_8001usize, 0x7E57_8002usize, 0x7E57_8003usize, 0x7E57_80F0usize);
+        real::register_two_pass_for_test(mesh);
+        reset(list, 0x7E57_8100, mesh);
+        unsafe {
+            set_graphics_root_signature(list, rs as *mut c_void);
+            let before = counts_snapshot();
+            execute_indirect(list, sig, 1, 0, 0, 0, 0);
+            assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0, "a signature that is not a noted DispatchMesh one");
+            draw_instanced(list, 3, 1, 0, 0);
+            assert_eq!(FAKE_DRAWS.load(Ordering::Relaxed), 0, "a Draw with a mesh pipeline");
+            assert!(counts_snapshot()[DRAWS_SKIPPED] >= before[DRAWS_SKIPPED] + 2);
+            // a PC pipeline draws, with the title's root signature
+            reset(list, 0x7E57_8100, native);
+            set_graphics_root_signature(list, rs as *mut c_void);
+            draw_instanced(list, 3, 1, 0, 0);
+            execute_indirect(list, sig, 1, 0, 0, 0, 0);
+            assert_eq!((FAKE_DRAWS.load(Ordering::Relaxed), fake.execute_indirect_calls.load(Ordering::Relaxed)), (1, 1));
+            // … and without one (a reset clears it), not: it would run under what the list holds
+            reset(list, 0x7E57_8100, native);
+            draw_instanced(list, 3, 1, 0, 0);
+            execute_indirect(list, sig, 1, 0, 0, 0, 0);
+            assert_eq!((FAKE_DRAWS.load(Ordering::Relaxed), fake.execute_indirect_calls.load(Ordering::Relaxed)), (1, 1));
+            // a dispatch signature does not need it
+            note_signature_dispatches(sig, true);
+            execute_indirect(list, sig, 1, 0, 0, 0, 0);
+            assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 2);
+            note_signature_dispatches(sig, false);
+        }
+        forget(list);
+        real::forget_pso_for_test(mesh);
     }
 
     #[test]

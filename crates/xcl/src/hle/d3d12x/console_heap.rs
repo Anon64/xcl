@@ -25,6 +25,7 @@
 //! Without the shared heap (it could not be made) a heap keeps its own PC heap: SRV at 2k,
 //! UAV at 2k + 1.
 
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 
 use windows::core::Interface;
@@ -85,6 +86,9 @@ struct Global {
     next: u32,
     /// released ranges (first, count)
     free: Vec<(u32, u32)>,
+    /// a CPU-only heap of `NULL_BLOCK` null views (even SRV, odd UAV) and its start: copied over
+    /// every range of the shared heap that is not handed out (`fill_nulls`)
+    nulls: Option<(ID3D12DescriptorHeap, u64)>,
 }
 
 // D3D12 descriptor heaps and devices are free-threaded
@@ -95,6 +99,153 @@ static GLOBAL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 /// descriptors of the shared heap at most (the GPU may take more: OPTIONS19)
 const GLOBAL_MAX: u32 = 1 << 21;
+
+/// What the shared heap is made with, in the order tried: all `GLOBAL_MAX` descriptors first,
+/// then what the device says it takes (`queried`: OPTIONS19's MaxViewDescriptorHeapSize; none:
+/// 1 000 000, resource binding tier 3's minimum).
+///
+/// Translated shaders take a texture's index in this heap from a T# they read from memory and
+/// use it when it is below 2^21 - 1 (the translators' `VIEW_HEAP_MAX_SRV`): the heap of an RTX 5090
+/// made at the 1 000 000 the query gave let an index between that and 2^21 read a descriptor
+/// past the heap's end, memory the GPU has not mapped. Tier 3 hardware takes more than the
+/// query says, so the size the shaders' guard knows is tried first.
+fn heap_capacities(queried: Option<u32>) -> Vec<u32> {
+    let fallback = queried.filter(|&n| n > 0).unwrap_or(1_000_000).min(GLOBAL_MAX);
+    let mut v = vec![GLOBAL_MAX];
+    if fallback != GLOBAL_MAX {
+        v.push(fallback);
+    }
+    v
+}
+
+/// null views in the CPU-only heap the shared heap's free ranges are filled from
+const NULL_BLOCK: u32 = 4096;
+
+/// Copy null views (`nulls`, a CPU-only heap of `NULL_BLOCK` of them, even SRV, odd UAV) over
+/// descriptors `from..to` of the heap at `cpu`, a block at a time; an odd `from` starts from
+/// the block's first UAV, so every even descriptor stays an SRV and every odd one a UAV, as the
+/// SRV / UAV pair of a console slot.
+unsafe fn fill_nulls(dev: &ID3D12Device, cpu: u64, inc: u32, from: u32, to: u32, nulls: u64) {
+    let mut at = from;
+    while at < to {
+        let skew = at % 2;
+        let n = (NULL_BLOCK - skew).min(to - at);
+        copy_views(dev, n, cpu + at as u64 * inc as u64, nulls + skew as u64 * inc as u64);
+        at += n;
+    }
+}
+
+/// CopyDescriptorsSimple of `n` view descriptors, past XCL's hook of an adopted device (which
+/// looks up the console heaps for each call: `HEAPS`, then `GLOBAL`), so that it can be made
+/// with `SLOT_WRITES` held.
+unsafe fn copy_views(dev: &ID3D12Device, n: u32, dst: u64, src: u64) {
+    let raw = dev.as_raw();
+    if super::real::is_adopted(raw) {
+        let f: unsafe extern "system" fn(*mut std::ffi::c_void, u32, u64, u64, u32) = std::mem::transmute(super::real::orig_fn(raw, 24));
+        return f(raw, n, dst, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32);
+    }
+    dev.CopyDescriptorsSimple(n, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+}
+
+/// Which PC resource the descriptor at each index of the shared heap names, and the other way
+/// round – so that the views of a resource that is destroyed can be made null views.
+///
+/// A title keeps T#s (each with an index in the shared heap) in its own memory, and its shaders
+/// read them from there. On the console a T# of a released texture still names memory (leftover
+/// bytes, nothing faults), and a title can sample a texture it has released (a material table
+/// not updated yet, a sample of weight zero). On the PC the slot would keep a descriptor of a
+/// destroyed resource: a shader that samples it touches an unmapped address.
+struct Names {
+    /// index → the resource its descriptor names (0: none, a null view, or not known); the truth
+    slots: Vec<AtomicUsize>,
+    /// resource → indexes that named it (some may name another since: `slots` says)
+    by: super::sharded::Sharded<Vec<u32>>,
+}
+
+impl Names {
+    fn new(n: usize) -> Names {
+        Names { slots: (0..n).map(|_| AtomicUsize::new(0)).collect(), by: super::sharded::Sharded::new() }
+    }
+
+    fn name(&self, i: u32) -> usize {
+        self.slots.get(i as usize).map_or(0, |s| s.load(Relaxed))
+    }
+
+    /// The descriptor at `i` names `res` now (0: none). With `SLOT_WRITES` held, along with the
+    /// write of the descriptor.
+    fn note(&self, i: u32, res: usize) {
+        let Some(s) = self.slots.get(i as usize) else { return };
+        if s.swap(res, Relaxed) == res || res == 0 {
+            return;
+        }
+        self.by.with(res, |v| {
+            v.push(i);
+            // a resource whose views are made again and again: only the indexes that still name it
+            if v.len() >= 64 && v.len().is_power_of_two() {
+                v.retain(|&j| self.name(j) == res);
+                v.sort_unstable();
+                v.dedup();
+            }
+        });
+    }
+
+    fn clear(&self, from: u32, to: u32) {
+        for i in from..to {
+            if let Some(s) = self.slots.get(i as usize) {
+                s.store(0, Relaxed);
+            }
+        }
+    }
+
+    /// The indexes whose descriptor may name `res` (None: none ever did – the common case, one
+    /// lookup), forgotten here.
+    fn candidates(&self, res: usize) -> Option<Vec<u32>> {
+        self.by.remove(res)
+    }
+
+    /// Whether the descriptor at `i` still names `res`: then it names nothing from now on (the
+    /// caller writes a null view there, with `SLOT_WRITES` held). One overwritten since names
+    /// another resource and stays.
+    fn claim(&self, i: u32, res: usize) -> bool {
+        self.slots.get(i as usize).is_some_and(|s| s.compare_exchange(res, 0, Relaxed, Relaxed).is_ok())
+    }
+}
+
+/// (made with the first view written to the shared heap: 8 bytes an index)
+static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
+
+/// Writes of descriptors into the shared heap and of what they name (`NAMES`), one at a time:
+/// a null view for a destroyed resource must not come over a view another thread just wrote.
+/// Taken before `GLOBAL` or `HEAPS`, never with them held.
+static SLOT_WRITES: Mutex<()> = Mutex::new(());
+
+fn names() -> &'static Names {
+    NAMES.get_or_init(|| Names::new(GLOBAL_MAX as usize))
+}
+
+/// What null views are copied from: the device, the shared heap's start and increment, the
+/// null views' start (None: no shared heap, or no null views).
+fn null_source() -> Option<(ID3D12Device, u64, u32, u64)> {
+    GLOBAL.lock().unwrap().as_ref().and_then(|s| s.nulls.as_ref().map(|n| (s.dev.clone(), s.cpu, s.inc, n.1)))
+}
+
+/// The PC resource `res` is destroyed next: every descriptor of the shared heap that still names
+/// it becomes the null view of its kind (SRV at even indexes, UAV at odd). The number of them.
+/// A resource that never had a view in the shared heap costs one lookup.
+pub fn resource_gone(res: usize) -> usize {
+    let Some(n) = NAMES.get() else { return 0 };
+    let Some(candidates) = n.candidates(res) else { return 0 };
+    let Some((dev, cpu, inc, nulls)) = null_source() else { return 0 };
+    let _w = SLOT_WRITES.lock().unwrap();
+    let mut nulled = 0;
+    for i in candidates {
+        if n.claim(i, res) {
+            unsafe { fill_nulls(&dev, cpu, inc, i, i + 1, nulls) };
+            nulled += 1;
+        }
+    }
+    nulled
+}
 
 /// view slots per page of a heap's place in the shared heap (2 PC descriptors each)
 pub const PAGE_SLOTS: u32 = 256;
@@ -136,40 +287,75 @@ fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) 
 /// The shared shader-visible heap, made on first use. False: there is none (it could not be
 /// made) – view heaps then keep their own.
 pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut g = GLOBAL.lock().unwrap();
-    if g.is_none() {
+    {
+        let g = GLOBAL.lock().unwrap();
+        if g.is_some() {
+            return true;
+        }
         if GLOBAL_FAILED.load(Relaxed) {
             return false;
         }
-        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        let max = if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &mut o as *mut _ as *mut std::ffi::c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.MaxViewDescriptorHeapSize > 0 {
-            o.MaxViewDescriptorHeapSize
-        } else {
-            1_000_000
-        };
-        let cap = max.min(GLOBAL_MAX);
+    }
+    // Made and filled without `GLOBAL` held: the device may be adopted, and its descriptor hooks
+    // look up the console heaps (`HEAPS`, then `GLOBAL`). Two threads that get here at once both
+    // make one; the first to store it wins.
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    let queried = (dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &mut o as *mut _ as *mut std::ffi::c_void, std::mem::size_of_val(&o) as u32).is_ok()).then_some(o.MaxViewDescriptorHeapSize);
+    let mut made = None;
+    let mut failed = Vec::new();
+    for cap in heap_capacities(queried) {
         let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: cap, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
-        let heap: ID3D12DescriptorHeap = match dev.CreateDescriptorHeap(&d) {
-            Ok(h) => h,
-            Err(e) => {
-                GLOBAL_FAILED.store(true, Relaxed);
-                crate::xlog_warn!("console descriptor heaps: no shared shader-visible heap of {cap} ({e}) – each keeps its own");
-                return false;
+        match dev.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&d) {
+            Ok(h) => {
+                made = Some((h, cap));
+                break;
             }
-        };
-        crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
-        null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+            Err(e) => failed.push(format!("{cap}: {e}")),
+        }
+    }
+    let Some((heap, cap)) = made else {
+        GLOBAL_FAILED.store(true, Relaxed);
+        crate::xlog_warn!("console descriptor heaps: no shared shader-visible heap ({}) – each keeps its own", failed.join("; "));
+        return false;
+    };
+    let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+    let start = std::time::Instant::now();
+    null_views(dev, cpu, inc);
+    // D3D12 leaves a new heap's descriptors undefined: every one XCL has not handed out holds a
+    // null view, so an index a shader takes from a stale or garbage T# reads zeros, never a
+    // descriptor of whatever the memory held (the memory windows' views come over theirs next)
+    let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: NULL_BLOCK, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0 };
+    let nulls = dev.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&d).ok().map(|h| {
+        let at = h.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+        null_views_in(dev, at, inc, NULL_BLOCK as u64);
+        fill_nulls(dev, cpu, inc, crate::gpu::recomp::MEM_HEAP_BASE, cap, at);
+        (h, at)
+    });
+    crate::xlog_info!(
+        "console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them ({}){}",
+        if nulls.is_some() { format!("null views in the rest, {} ms", start.elapsed().as_millis()) } else { "no null views past the first: no CPU-only heap for them".into() },
+        if failed.is_empty() { String::new() } else { format!(" – not made at {}", failed.join("; ")) }
+    );
+    if cap < GLOBAL_MAX {
+        crate::xlog_warn!(
+            "console descriptor heaps: the shared view heap has {cap} descriptors, fewer than the {GLOBAL_MAX} translated shaders allow for: a texture whose T# index is from {cap} to {} reads past the heap's end (their guard does not cover that)",
+            GLOBAL_MAX - 1
+        );
+    }
+    let mut g = GLOBAL.lock().unwrap();
+    if g.is_none() {
         *g = Some(Global {
             dev: dev.clone(),
-            cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
+            cpu,
             gpu: heap.GetGPUDescriptorHandleForHeapStart().ptr,
-            inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+            inc,
             heap,
             cap,
             // the memory windows' raw UAVs (`set_window_views`) come first
             next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
             free: Vec::new(),
+            nulls,
         });
     }
     true
@@ -179,7 +365,12 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
 /// console slot: even SRV, odd UAV), where shaders land for a T# of zeros (word 0, the PC index,
 /// is 0): they read zeros there rather than whatever an unwritten descriptor holds.
 unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
-    for k in 0..crate::gpu::recomp::MEM_HEAP_BASE as u64 {
+    null_views_in(dev, cpu, inc, crate::gpu::recomp::MEM_HEAP_BASE as u64)
+}
+
+/// `n` null views from `cpu`: even SRV, odd UAV (`null_views`).
+unsafe fn null_views_in(dev: &ID3D12Device, cpu: u64, inc: u32, n: u64) {
+    for k in 0..n {
         let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize };
         if k % 2 == 0 {
             let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -277,10 +468,20 @@ fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
     Some((first, p as u32 * PAGE_SLOTS))
 }
 
-/// The shared range starting at `first` (`count` descriptors) is free again.
+/// The shared range starting at `first` (`count` descriptors) is free again. Its views (of the
+/// released heap's resources, which may be gone) are made null views first, before another
+/// heap can be given the range: no shader that still has an index there reads them.
 pub fn release_global(first: u32, count: u32) {
     if count == 0 {
         return;
+    }
+    if let Some((dev, cpu, inc, nulls)) = null_source() {
+        // (the range is still the released heap's)
+        let _w = SLOT_WRITES.lock().unwrap();
+        unsafe { fill_nulls(&dev, cpu, inc, first, first + count, nulls) };
+        if let Some(n) = NAMES.get() {
+            n.clear(first, first + count);
+        }
     }
     if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
         merge_release(&mut s.free, first, count);
@@ -445,28 +646,46 @@ pub fn slot(cpu: u64) -> Option<Slot> {
     Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
 }
 
-/// The view just made in slot `s` (its SRV, or with `uav` its UAV) goes to the shared heap.
-pub unsafe fn publish(s: &Slot, uav: bool) {
+/// The view just made in slot `s` (its SRV, or with `uav` its UAV) of the PC resource `res` (0:
+/// a null view) goes to the shared heap.
+pub unsafe fn publish(s: &Slot, uav: bool, res: usize) {
     if s.shared_srv == 0 {
         return;
     }
-    if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
-        let (dst, src) = if uav { (s.shared_srv + g.inc as u64, s.pc_uav) } else { (s.shared_srv, s.pc_srv) };
-        g.dev.CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    let Some((dev, inc)) = GLOBAL.lock().unwrap().as_ref().map(|g| (g.dev.clone(), g.inc)) else { return };
+    let (dst, src) = if uav { (s.shared_srv + inc as u64, s.pc_uav) } else { (s.shared_srv, s.pc_srv) };
+    let _w = SLOT_WRITES.lock().unwrap();
+    copy_views(&dev, 1, dst, src);
+    names().note(s.index + uav as u32, res);
+}
+
+/// The PC resources the SRV and the UAV of view slot `s` name in the shared heap (0: not known,
+/// or the slot has no place there): what `publish_range` takes for a copy of it.
+pub fn names_of(s: &Slot) -> (usize, usize) {
+    match (s.shared_srv, NAMES.get()) {
+        (0, _) | (_, None) => (0, 0),
+        (_, Some(n)) => (n.name(s.index), n.name(s.index + 1)),
     }
 }
 
 /// `n` view slots from `first` were copied (in the title's heap): they go to the shared heap,
-/// a run per page (a heap's pages lie apart there).
-pub unsafe fn publish_range(first: &Slot, n: u32) {
+/// a run per page (a heap's pages lie apart there). `names`: what the source slots' SRV and UAV
+/// name (`names_of`), one pair a slot.
+pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
+    let Some(dev) = GLOBAL.lock().unwrap().as_ref().map(|g| g.dev.clone()) else { return };
     let mut done = 0;
     while done < n {
         let s = if done == 0 { Some(*first) } else { slot((first.at + (done * SLOT) as usize) as u64) };
         let Some(s) = s else { return };
         let run = (PAGE_SLOTS - s.k % PAGE_SLOTS).min(n - done);
         if s.shared_srv != 0 {
-            if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
-                g.dev.CopyDescriptorsSimple(2 * run, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let _w = SLOT_WRITES.lock().unwrap();
+            copy_views(&dev, 2 * run, s.shared_srv, s.pc_srv);
+            let m = self::names();
+            for j in 0..run {
+                let (srv, uav) = names.get((done + j) as usize).copied().unwrap_or((0, 0));
+                m.note(s.index + 2 * j, srv);
+                m.note(s.index + 2 * j + 1, uav);
             }
         }
         done += run;
@@ -674,7 +893,7 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(),
+                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(), nulls: None,
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
             // the root-UAV slots past the windows there are: null views, not window 0 again
@@ -731,6 +950,97 @@ mod tests {
         for (k, &(is_uav, r, at)) in seen.iter().enumerate() {
             assert_eq!((is_uav, r, at), (k % 2 == 1, 0, 0x1000 + 32 * k), "descriptor {k}");
         }
+    }
+
+    /// The shared heap is tried with every index translated shaders accept (2^21) first, and with
+    /// what the device says it takes only when that fails; never more than 2^21.
+    #[test]
+    fn the_shared_heap_is_tried_at_the_size_the_shader_guard_knows_first() {
+        assert_eq!(heap_capacities(Some(1_000_000)), vec![1 << 21, 1_000_000], "an RTX 5090's query");
+        assert_eq!(heap_capacities(None), vec![1 << 21, 1_000_000], "no OPTIONS19");
+        assert_eq!(heap_capacities(Some(0)), vec![1 << 21, 1_000_000]);
+        assert_eq!(heap_capacities(Some(1 << 21)), vec![1 << 21]);
+        assert_eq!(heap_capacities(Some(u32::MAX)), vec![1 << 21], "never past the shaders' guard");
+    }
+
+    /// Every descriptor of a range that is not handed out gets a null view, an SRV at even and a
+    /// UAV at odd indices (a range starting at an odd one too), a block at a time.
+    #[test]
+    fn free_ranges_of_the_shared_heap_get_null_views() {
+        use std::ffi::c_void;
+        use std::sync::Mutex as M;
+        static COPIES: M<Vec<(u32, usize, usize)>> = M::new(Vec::new());
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn copy(_this: *mut c_void, n: u32, dst: D3D12_CPU_DESCRIPTOR_HANDLE, src: D3D12_CPU_DESCRIPTOR_HANDLE, ty: D3D12_DESCRIPTOR_HEAP_TYPE) {
+            assert_eq!(ty, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            COPIES.lock().unwrap().push((n, dst.ptr, src.ptr));
+        }
+        let mut vt = [0usize; 25];
+        vt[24] = copy as usize;
+        let mut device = Object { vt: vt.as_ptr() };
+        let (heap, nulls, inc) = (0x10_0000u64, 0x90_0000u64, 32u32);
+        for (from, to) in [(16u32, 3 * NULL_BLOCK + 5), (7, 9), (2 * NULL_BLOCK - 1, 2 * NULL_BLOCK + 1)] {
+            COPIES.lock().unwrap().clear();
+            unsafe {
+                let dev = std::mem::ManuallyDrop::new(ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void));
+                fill_nulls(&dev, heap, inc, from, to, nulls);
+            }
+            let mut at = from;
+            for &(n, dst, src) in COPIES.lock().unwrap().iter() {
+                assert_eq!(dst as u64, heap + at as u64 * inc as u64, "{from}..{to}: contiguous");
+                let k = (src as u64 - nulls) / inc as u64;
+                assert_eq!(k % 2, at as u64 % 2, "{from}..{to}: an SRV over an SRV, a UAV over a UAV");
+                assert!(k + n as u64 <= NULL_BLOCK as u64, "{from}..{to}: within the null block");
+                at += n;
+            }
+            assert_eq!(at, to, "{from}..{to}: all of it");
+        }
+    }
+
+    /// What each index of the shared heap names: a destroyed resource's views (also copies of
+    /// them) are claimed for null views, an index overwritten since by another resource's view
+    /// is not, and a resource that never had a view costs one lookup and claims nothing.
+    #[test]
+    fn a_destroyed_resources_views_are_claimed_and_no_other() {
+        let (a, b, c) = (0xA000usize, 0xB000usize, 0xC000usize);
+        let n = Names::new(64);
+        n.note(4, a); // SRV of slot 2
+        n.note(5, a); // its UAV
+        n.note(8, a);
+        n.note(8, b); // overwritten by a view of b
+        // a copy of slot 2 to slot 6 (`names_of` of the source, then `publish_range`)
+        let (srv, uav) = (n.name(4), n.name(5));
+        n.note(12, srv);
+        n.note(13, uav);
+        n.note(20, a);
+        n.clear(20, 22); // a released range: null views there already
+        assert!(n.candidates(c).is_none(), "a resource without views");
+        let mut claimed: Vec<u32> = n.candidates(a).unwrap().into_iter().filter(|&i| n.claim(i, a)).collect();
+        claimed.sort_unstable();
+        assert_eq!(claimed, vec![4, 5, 12, 13], "a's views and their copies; not 8 (b's now), not 20 (nulled)");
+        assert_eq!((n.name(4), n.name(8), n.name(12)), (0, b, 0));
+        assert!(n.candidates(a).is_none(), "forgotten");
+        // b goes: its one view
+        let claimed: Vec<u32> = n.candidates(b).unwrap().into_iter().filter(|&i| n.claim(i, b)).collect();
+        assert_eq!(claimed, vec![8]);
+    }
+
+    /// A resource whose views are made again and again into the same few slots keeps a list of
+    /// those slots, not one entry for each view.
+    #[test]
+    fn views_made_again_do_not_grow_a_resources_list() {
+        let (a, b) = (0xA000usize, 0xB000usize);
+        let n = Names::new(64);
+        for k in 0..10_000u32 {
+            n.note(k % 4, a);
+            n.note(k % 4, b);
+        }
+        n.note(1, a);
+        let v = n.candidates(a).unwrap();
+        assert!(v.len() < 128, "{} entries", v.len());
+        assert_eq!(v.iter().filter(|&&i| n.claim(i, a)).count(), 1, "only slot 1 is a's now");
+        assert!(n.candidates(b).unwrap().len() < 128);
     }
 
     #[test]
