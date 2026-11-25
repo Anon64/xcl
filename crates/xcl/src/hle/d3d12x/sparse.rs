@@ -2648,24 +2648,28 @@ impl State {
     }
 
     /// Video memory for window tile `w` over CPU tile `src` (`holes`: its pages not committed
-    /// there): taken back from `parked` / `kept` (cleared), or a tile of a pool (cleared when it
-    /// was used before), mapped with the next flush; all of it goes up at the next submit (`fill`).
-    /// False: past `mirror_cap` (counted, and logged at powers of two) or no video memory.
-    unsafe fn new_mirror(&mut self, w: usize, src: usize, holes: u16) -> bool {
-        if self.mirrored >= self.mirror_cap {
-            if self.refused.insert(w) {
-                self.counts.refused += 1;
-                let n = self.counts.refused;
-                if n.is_power_of_two() {
-                    crate::xlog_warn!("sparse: {n} GPU-view tiles left without video memory (XCL_MIRROR_MB) – the GPU reads zeros there");
-                }
-            }
-            return false;
-        }
+    /// there): taken back from `parked` / `kept` (cleared; it is held already, so past
+    /// `mirror_cap` too: a kept tile refused stayed mapped there with old bytes), or a tile of a
+    /// pool (cleared when it was used before), mapped with the next flush; all of it goes up at
+    /// the next submit (`fill`). `force`: past `mirror_cap` too (it counts all the same), for a
+    /// placed buffer's tile: the buffer maps its tiles once, and video memory the window tile got
+    /// later would not be the buffer's. False: past `mirror_cap` (counted, and logged at powers of
+    /// two) or no video memory.
+    unsafe fn new_mirror(&mut self, w: usize, src: usize, holes: u16, force: bool) -> bool {
         if let Some(tile) = self.parked.remove(&w).or_else(|| self.kept.remove(&w)) {
             self.mapped.insert(w, TileEntry { src, gen: next_gen(), ..TileEntry::with_holes(tile, holes) });
             self.to_zero.insert((w, TILE));
         } else {
+            if !force && self.mirrored >= self.mirror_cap {
+                if self.refused.insert(w) {
+                    self.counts.refused += 1;
+                    let n = self.counts.refused;
+                    if n.is_power_of_two() {
+                        crate::xlog_warn!("sparse: {n} GPU-view tiles left without video memory (XCL_MIRROR_MB) – the GPU reads zeros there");
+                    }
+                }
+                return false;
+            }
             let Some((tile, reused)) = self.take_tile() else { return false };
             self.mapped.insert(w, TileEntry { src, gen: next_gen(), ..TileEntry::with_holes(tile, holes) });
             if reused {
@@ -2721,7 +2725,7 @@ impl State {
         let holes = self.holes_now(&want.iter().map(|w| w.1).collect::<Vec<_>>());
         for (&(g, c), h) in want.iter().zip(holes) {
             if h != 0xFFFF {
-                self.new_mirror(g, c, h);
+                self.new_mirror(g, c, h, false);
             }
         }
     }
@@ -2805,7 +2809,7 @@ impl State {
                     }
                 }
                 None if h != 0xFFFF && !self.mapped.contains_key(&w) => {
-                    self.new_mirror(w, t, h);
+                    self.new_mirror(w, t, h, false);
                 }
                 None => {}
             }
@@ -2864,7 +2868,8 @@ impl State {
 
     /// The tiles of a buffer placed at `[start, start + len)` (`place_buffer`, `start` a tile's),
     /// with video memory where they can have it: a tile of a GPU view shows its CPU view
-    /// (`new_mirror`, with no committed page too: the buffer needs the tile), the others are the
+    /// (`new_mirror`, with no committed page and past `mirror_cap` too: the buffer needs the tile,
+    /// and maps it once), the others are the
     /// window's own, with the pages committed there.
     unsafe fn buffer_tiles(&mut self, start: usize, len: usize) -> Vec<(usize, (u32, u32))> {
         let end = start + len;
@@ -2889,7 +2894,7 @@ impl State {
             });
             let holes = self.holes_now(&over.iter().map(|o| o.1).collect::<Vec<_>>());
             for (&(t, c), h) in over.iter().zip(holes) {
-                self.new_mirror(t, c, h);
+                self.new_mirror(t, c, h, true);
             }
         }
         self.ensure_mapped(start, len, |t| query_tile_holes(t));
@@ -4568,7 +4573,7 @@ mod tests {
             let before = gen(&v.s, w + TILE);
             v.s.drop_mirror(w + TILE);
             v.s.link_mirror(w + TILE, c + 4 * TILE);
-            assert!(v.s.new_mirror(w + TILE, c + 4 * TILE, 0));
+            assert!(v.s.new_mirror(w + TILE, c + 4 * TILE, 0, false));
             let tile = v.cpu_tile(4);
             v.s.copy_back(back.as_ptr() as *mut u8, w + TILE, 0, 256, before);
             assert_eq!(v.cpu_tile(4), tile, "a copy back of what the tile showed before is left out");
@@ -5050,7 +5055,7 @@ mod tests {
             // the second tile shown over the first CPU tile: an immediate of before lands nowhere …
             v.s.drop_mirror(w + TILE);
             v.s.link_mirror(w + TILE, c);
-            assert!(v.s.new_mirror(w + TILE, c, 0));
+            assert!(v.s.new_mirror(w + TILE, c, 0, false));
             v.s.store_imm(w + TILE + 0x80, 0x1234_5678, 8, g1);
             assert_eq!(*((c + 0x80) as *const u64), 0);
             // … one of now does
@@ -5069,6 +5074,59 @@ mod tests {
                 }
                 assert_eq!(*((c + 0x100) as *const u64), 0x77);
             }
+        }
+    }
+
+    /// A buffer placed over a tile of a GPU view at `mirror_cap` gets the tile all the same: it
+    /// maps its tiles once, and the window tile could get video memory later that the buffer
+    /// would not have. Before, it was left out of the buffer for good.
+    #[test]
+    fn a_buffer_placed_at_the_cap_gets_its_tiles() {
+        unsafe {
+            let Some(mut v) = Views::new(97) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let (w, c) = (v.w, v.c);
+            v.commit(0, 2);
+            v.write(0, 2, 31);
+            v.s.mirror_cap = 1;
+            v.s.asks.push(w);
+            v.s.map_mirrors();
+            assert_eq!(v.s.mirrored, 1);
+            let tiles = v.s.buffer_tiles(w + TILE, TILE);
+            assert_eq!(tiles.iter().map(|t| t.0).collect::<Vec<_>>(), vec![w + TILE], "the buffer has its tile");
+            assert_eq!(v.s.mapped[&(w + TILE)].src, c + TILE);
+            assert_eq!((v.s.mirrored, v.s.counts.refused), (2, 0), "it counts");
+            v.submit(&[]);
+        }
+    }
+
+    /// A tile kept mapped for a placed buffer while its CPU tile was decommitted whole takes its
+    /// video memory back once the CPU tile is committed and written again, at `mirror_cap` too:
+    /// the memory is held already. Before, it was refused, and stayed mapped in the window and the
+    /// buffer with the old bytes while the new ones never went up.
+    #[test]
+    fn a_kept_tile_is_taken_back_at_the_cap() {
+        unsafe {
+            let Some(mut v) = Views::new(101) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let (w, c) = (v.w, v.c);
+            v.commit(0, 2);
+            v.write(0, 2, 37);
+            v.s.asks.extend([w, w + TILE]);
+            v.submit(&[]);
+            let pool = v.s.mapped[&w].pool;
+            // (a placed buffer uses it)
+            *v.s.pinned.entry(pool).or_default() += 1;
+            v.s.source_decommitted_in(c, TILE);
+            assert_ne!(VirtualFree(c as *mut c_void, TILE, MEM_DECOMMIT), 0);
+            v.s.flush_parked();
+            assert_eq!((v.s.kept.get(&w), v.s.mirrored), (Some(&pool), 1));
+            v.s.mirror_cap = 1;
+            v.commit(0, 1);
+            v.write(0, 1, 41);
+            v.s.mirror_writes(&[c + PAGE], PAGE);
+            assert_eq!(v.s.mapped.get(&w).map(|e| e.pool), Some(pool), "taken back");
+            assert_eq!((v.s.mirrored, v.s.counts.refused), (2, 0));
+            assert!(v.s.fill.contains(&w));
+            v.submit(&[c + PAGE]);
         }
     }
 
