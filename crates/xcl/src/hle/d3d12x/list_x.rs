@@ -2251,6 +2251,15 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
     super::cpu_writes::after(queue, writes);
 }
 
+/// After a wait on the CPU inside a submit: what the title committed meanwhile (the thread that
+/// writes the value may have) is mapped, and cleared, before the lists that go out now – the
+/// submit's own `before_execute` came before the wait.
+unsafe fn mapped_after_wait(queue: *mut c_void) {
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+        super::sparse::before_execute(q, &[], 0x1000);
+    }
+}
+
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
 /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
 /// When `queue` is non-null, monotonic 64-bit waits backed by a recorded `Write64BitValue*` are
@@ -2297,6 +2306,7 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
             submit(&lists[start..i]);
         }
         wait_all_on(queue, waits, list_writes);
+        mapped_after_wait(queue);
         start = i;
     }
     if start < lists.len() {
@@ -3382,6 +3392,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     if !waits.is_empty() {
         wait_all_on(q_raw, &waits, &write64_signals);
+        mapped_after_wait(q_raw);
     }
 
     let one = [this];
