@@ -26,8 +26,18 @@ impl PipelineBuilder {
     unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Option<ID3D12PipelineState> {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
-        let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
+        let (hr, in_driver, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
             dxil, self.record, iid, &mut raw, true);
+        // (as `translated_compute_pso_once` logs a huge whole program the driver refuses)
+        if hr < 0 && dxil.len() >= huge_pso_bytes() {
+            crate::xlog_warn!(
+                "D3D12.X: the driver refused a dispatch chain's compute PSO of record {:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver",
+                self.record,
+                dxil.len(),
+                driver_cache::name(dxil, self.flags.0),
+                in_driver.as_millis()
+            );
+        }
         (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw))
     }
 }
