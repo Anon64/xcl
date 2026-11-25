@@ -14,8 +14,11 @@
 //! the inner one is a real query (Fortnite nests its per-object queries in a dummy outer one).
 //!
 //! Console GPU addresses in unified memory are the title's own addresses; memory operations
-//! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
+//! go to that window's buffer (`real::uma_window_buffer_gpu`), which is in COMMON between them.
 //! An index buffer at such an address is given to the PC as the window buffer's GPU address.
+//! An address in a GPU view of the title's memory (a view window) has its tiles asked for first
+//! (`view_want`); what the lists write there is read back to its CPU view, and the CPU reads its
+//! values there (`cpu_at`): the CPU cannot touch the GPU view.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -201,6 +204,7 @@ impl Occlusion {
 /// matching AMD PM4 `WAIT_REG_MEM` semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingWait {
+    /// where the CPU has the value (`cpu_at`: the CPU view of an address in a GPU view)
     va: u64,
     width: u8, // 4 or 8
     comparison: u32,
@@ -315,8 +319,32 @@ pub(super) fn rect_list_state(list: *mut c_void) -> Option<Vec<(u32, (u64, u32, 
 }
 
 /// `pc_va` for other modules.
-pub(super) fn pc_va_of(va: u64) -> u64 {
+pub fn pc_va_of(va: u64) -> u64 {
     pc_va(va)
+}
+
+/// Where the CPU has the value at GPU address `va`: the CPU view of an address in a GPU view (the
+/// title's CPU writes and reads it there; the CPU cannot touch the GPU view), else `va`. Waits
+/// read their value there, and a write and a wait meet in one `SyncCell` whichever view each
+/// names. One compare for an address outside the view windows.
+pub fn cpu_at(va: u64) -> u64 {
+    cpu_at_in(super::bind::view_span(), va)
+}
+
+/// `cpu_at` with the view windows `span` (`bind::view_span`).
+fn cpu_at_in(span: (u64, u64), va: u64) -> u64 {
+    if super::bind::in_span(span, va) {
+        super::view_want::cpu(va)
+    } else {
+        va
+    }
+}
+
+/// A GPU write at `va` reaches the CPU's view only when read back after the submit (`note_write`):
+/// a window the GPU has a copy of (`Uma::is_gpu_copy`), or a GPU view, whose tiles are read
+/// back to its CPU view (`sparse::readback_after_execute`).
+fn read_back(va: u64) -> bool {
+    crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(va as usize) || u.is_view(va as usize))
 }
 
 /// `XCL_TRACE_FRAME`: the fixed-function state a list last set (topology, first viewport and
@@ -659,7 +687,7 @@ impl ListState {
             last.0 = last.0.min(va);
             last.1 = last.1.max(end);
         }
-        if crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(va as usize)) {
+        if read_back(va) {
             if !self.has_sparse() {
                 SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
             }
@@ -1047,13 +1075,17 @@ fn note_write(list: usize, va: u64, size: u64) {
 
 /// A PC copy into `[offset, offset + n)` of console buffer `dst` whose memory the GPU only has
 /// a copy of in a committed window (`Uma::shadowed`: readback buffers live there, and titles
-/// read them through a pointer they keep mapped, without another Map): the bytes come back to
-/// the CPU's view after the submit, like the lists' own memory writes.
+/// read them through a pointer they keep mapped, without another Map), or placed in a GPU view
+/// (what the GPU writes there is its tiles', and the title reads it at the CPU view): the bytes
+/// come back to the CPU's view after the submit, like the lists' own memory writes.
 fn note_copy_into(list: usize, dst: usize, offset: u64, n: u64) {
-    let Some(u) = crate::gpu::uma::get().filter(|u| u.shadowed()) else { return };
-    let Some((p, bytes)) = real::console_buffer(dst).filter(|&(p, _)| u.is_committed(p)) else { return };
+    let Some(u) = crate::gpu::uma::get().filter(|u| u.shadowed() || super::bind::view_span().1 != 0) else { return };
+    let Some((p, bytes)) = real::console_buffer(dst).filter(|&(p, _)| (u.shadowed() && u.is_committed(p)) || u.is_view(p)) else { return };
     let offset = offset.min(bytes as u64);
-    note_write(list, p as u64 + offset, n.min(bytes as u64 - offset));
+    let (at, n) = (p as u64 + offset, n.min(bytes as u64 - offset));
+    // (a buffer placed in a GPU view is over its tiles already: this counts the path)
+    super::bind::want_view(super::view_want::Path::CopyInto, at, n);
+    note_write(list, at, n);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1840,6 +1872,8 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
     if value == 0 || !va.is_multiple_of(8) {
         return;
     }
+    // (the cell is the CPU's: a wait on the other view of the same memory meets it)
+    let va = cpu_at(va);
     let (lty, last_q) = {
         let mut g = recording(list as usize).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
@@ -2360,7 +2394,11 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if size == 0 || !size.is_multiple_of(4) {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
-    let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
+    // In a GPU view: its tiles, asked for here, are filled from the CPU view before the list runs,
+    // and what the copy writes is read back to the CPU view (`note_write`)
+    super::bind::want_view(super::view_want::Path::MemoryOp, src, size);
+    super::bind::want_view(super::view_want::Path::MemoryOp, dst, size);
+    let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer_gpu(dst as usize, size as usize), real::uma_window_buffer_gpu(src as usize, size as usize)) else {
         note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
     };
@@ -2619,7 +2657,9 @@ unsafe fn fill(list: *mut c_void, va: u64, size: u64, pat: [u8; 16], unit: u64, 
     if size == 0 || !size.is_multiple_of(unit) || size > MAX_FILL {
         return warn(&N, what, format_args!("size {size:#x} (a non-zero multiple of {unit} up to {MAX_FILL:#x} is filled)"));
     }
-    let Some((d, off)) = real::uma_window_buffer(va as usize, size as usize) else {
+    // (in a GPU view: on its tiles, read back to the CPU view after the submit)
+    super::bind::want_view(super::view_want::Path::MemoryOp, va, size);
+    let Some((d, off)) = real::uma_window_buffer_gpu(va as usize, size as usize) else {
         return warn(&N, what, format_args!("{va:#x} ({size:#x} bytes) is not in unified memory"));
     };
     let Some(src) = pattern_buffer(list, pat, size) else {
@@ -2672,8 +2712,10 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
     if !va.is_multiple_of(n) {
         return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
     }
-    let (Some((d, _)), Some(at)) = (real::uma_window_buffer(va as usize, n as usize), real::uma_va_of(va as usize)) else {
-        // the title's own memory: written by the CPU once the GPU is there
+    // (in a GPU view: on its tiles, and the CPU view gets the value after the submit)
+    super::bind::want_view(super::view_want::Path::MemoryOp, va, n);
+    let (Some((d, _)), Some(at)) = (real::uma_window_buffer_gpu(va as usize, n as usize), real::uma_va_of(va as usize)) else {
+        // the title's own memory: written by the CPU once the GPU is there (never a GPU view)
         if super::cpu_writes::writable(va as usize, n as usize) {
             if let Some(s) = recording(list as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
                 s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
@@ -2683,11 +2725,11 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
     // into a window the GPU only has a copy of: the CPU's view gets the value from XCL
-    if words.len() <= 2 && imm_by_cpu() && crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(va as usize)) {
+    if words.len() <= 2 && imm_by_cpu() && read_back(va) {
         let value = words.iter().enumerate().fold(0u64, |v, (i, &w)| v | (w as u64) << (32 * i));
         // a counter the title's queues write in turn (a `SyncCell` whose values only rose): a list
         // that runs late does not take the CPU's view of it back (`sparse::IMM_KEEP_MAX`)
-        let counter = words.len() == 2 && SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&va)).is_some_and(|c| !c.non_monotonic && c.recorded_max != 0);
+        let counter = words.len() == 2 && SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&cpu_at(va))).is_some_and(|c| !c.non_monotonic && c.recorded_max != 0);
         let bytes = n as u8 | if counter { super::sparse::IMM_KEEP_MAX } else { 0 };
         recording(list as usize).lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().note_imm(va, value, bytes);
     } else {
@@ -2753,7 +2795,9 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     if !va.is_multiple_of(8) {
         return warn(&N, what, format_args!("{va:#x} is not 8-byte aligned"));
     }
-    let uma_dst = real::uma_window_buffer(va as usize, 8);
+    // (in a GPU view: resolved into its tile, read back to the CPU view after the submit)
+    super::bind::want_view(super::view_want::Path::MemoryOp, va, 8);
+    let uma_dst = real::uma_window_buffer_gpu(va as usize, 8);
     if uma_dst.is_none() && !super::cpu_writes::writable(va as usize, 8) {
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     }
@@ -3037,8 +3081,11 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if !va.is_multiple_of(n) {
         return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
     }
-    // (the wait reads the memory on the CPU: the title's own memory too, which `cpu_writes` fills)
-    if real::uma_window_buffer(va as usize, width as usize).is_none() && !crate::gpu::shader::readable(va as usize, width as usize) {
+    // (the wait reads the memory on the CPU: the title's own memory too, which `cpu_writes` fills;
+    // in a GPU view at its CPU view, where what the lists write into its tiles is read back)
+    let at = cpu_at(va);
+    super::bind::want_view(super::view_want::Path::Wait, va, n);
+    if real::uma_window_buffer_gpu(va as usize, width as usize).is_none() && !crate::gpu::shader::readable(at as usize, width as usize) {
         return warn(&N, what, format_args!("{va:#x} is not readable memory"));
     }
     if compare_u64(comparison, 0, 0).is_none() {
@@ -3057,7 +3104,7 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
             return;
         }
         if s.write64_signals.is_empty() {
-            s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64: false });
+            s.push_wait(PendingWait { va: at, width, comparison, value, mask, after_write64: false });
             return;
         }
         true
@@ -3066,7 +3113,7 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     let mut g = recording(target as usize).lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
     let after_write64 = !s.write64_signals.is_empty();
-    s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64 });
+    s.push_wait(PendingWait { va: at, width, comparison, value, mask, after_write64 });
 }
 
 /// command list #71 Wait32BitValueX(address, comparison, value, mask, flags)
@@ -3311,7 +3358,9 @@ pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: 
     if op_raw > 1 {
         return warn(&N, "SetPredicationBufferX", format_args!("unknown predication op {op_raw}"));
     }
-    let Some((uma_buf, off)) = real::uma_window_buffer(va as usize, 8).filter(|&(b, _)| b != 0 && va.is_multiple_of(8)) else {
+    // (the GPU alone reads the predicate: in a GPU view, from its tile)
+    super::bind::want_view(super::view_want::Path::MemoryOp, va, 8);
+    let Some((uma_buf, off)) = real::uma_window_buffer_gpu(va as usize, 8).filter(|&(b, _)| b != 0 && va.is_multiple_of(8)) else {
         return warn(&N, "SetPredicationBufferX", format_args!("{va:#x} is not 8-byte aligned in unified memory"));
     };
     let Some(pb) = predication_buffer(this) else {
@@ -3687,10 +3736,23 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
 /// A GPU address the title gave: its memory's PC address when it is the title's memory, else
 /// as it is (a PC resource's GPU address – it may lie in a window's range by number).
 fn pc_va(va: u64) -> u64 {
-    if !crate::gpu::uma::get().is_some_and(|u| u.is_title_address(va as usize)) {
-        return va;
+    match crate::gpu::uma::get() {
+        Some(u) => pc_va_in(u, va, real::uma_window_va),
+        None => va,
     }
-    real::uma_va_of(va as usize).unwrap_or(va)
+}
+
+/// `pc_va` in `u`, whose windows have the PC addresses `window_va` (`real::uma_window_va`). A
+/// GPU view of the title's memory without a PC address of its window gets none (0, read as
+/// nothing): as it is, the console address is no PC address and hangs the device.
+fn pc_va_in(u: &crate::gpu::uma::Uma, va: u64, window_va: impl Fn(usize) -> Option<u64>) -> u64 {
+    let p = va as usize;
+    let Some(k) = u.window_of(p).filter(|_| u.is_title_address(p)) else { return va };
+    match window_va(k) {
+        Some(w) => w + (p - u.window(k).0) as u64,
+        None if u.is_view_window(k) => 0,
+        None => va,
+    }
 }
 
 /// `pc_va` for an index or vertex buffer of `bytes` bytes bound on `list`. A retail title also
@@ -3706,12 +3768,15 @@ fn pc_va(va: u64) -> u64 {
 /// whole buffer at every bind filled unified memory within two minutes of a retail title's
 /// menus, and missed what the title wrote after the bind.)
 unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: bool) -> u64 {
+    // in a GPU view: its window's PC address, over tiles asked for here
+    super::bind::want_view(super::view_want::Path::VertexIndex, va, bytes as u64);
     let t = pc_va(va);
     if t != va || va == 0 || bytes == 0 {
         return t;
     }
-    // in a window by number: a PC resource's GPU address
-    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) {
+    // in a window by number: a PC resource's GPU address (never mirrored: a view window is no
+    // memory the CPU reads)
+    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize) || u.is_view(va as usize)) {
         return t;
     }
     // a buffer bound before has its mirror: no `readable` (a `VirtualQuery` walk of the title's
@@ -6926,5 +6991,67 @@ mod tests {
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
         }
+    }
+
+    /// Unified memory with the 16-window layout of its own (the process's is chosen once, from
+    /// the environment): its view windows hold GPU views.
+    fn sixteen_windows() -> crate::gpu::uma::Uma {
+        crate::gpu::uma::Uma::for_runtime_windows(16 << 20, 16 << 20, crate::gpu::uma::MAX_HEAP_WINDOWS).expect("16-window aperture")
+    }
+
+    /// An index or vertex buffer in a GPU view goes to the PC as its view window's address; without
+    /// one it goes as none, never as the console address (no PC address: the device hangs).
+    #[test]
+    fn a_gpu_view_buffer_reaches_the_pc_at_its_windows_address() {
+        let u = sixteen_windows();
+        let g = u.view_reserve(1 << 20).expect("a GPU view");
+        let k = u.window_of(g).unwrap();
+        assert!(u.is_view_window(k));
+        let window_va = |w: usize| Some(0x7A00_0000_0000 + w as u64 * crate::gpu::uma::WINDOW as u64);
+        let at = g as u64 + 0x40;
+        assert_eq!(pc_va_in(&u, at, window_va), window_va(k).unwrap() + (g - u.window(k).0) as u64 + 0x40);
+        assert_eq!(pc_va_in(&u, at, |_| None), 0, "a view window that is not open on the GPU");
+        // in a view window but no GPU view of the title's: an address by number, as it is
+        let other = g as u64 + (2 << 20);
+        assert_eq!(pc_va_in(&u, other, window_va), other);
+        assert_eq!(pc_va_in(&u, 0x1234_0000, window_va), 0x1234_0000);
+        assert_eq!(u.view_release(g), Some(1 << 20));
+    }
+
+    /// A wait on an address in a GPU view reads the value at its CPU view, where the title writes
+    /// it and what the lists write into the view's tiles is read back; a write and a wait naming
+    /// either view are kept in one sync cell. Without view windows nothing changes.
+    #[test]
+    fn a_wait_on_a_gpu_view_reads_its_cpu_view() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        // a size no other test pairs views of (the newest CPU view of a size takes its GPU view)
+        const SIZE: usize = 0x2D_0000;
+        let u = sixteen_windows();
+        let span = super::super::bind::view_span_of(&u);
+        let g = u.view_reserve(SIZE).expect("a GPU view");
+        unsafe {
+            let c = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(c, 0);
+            crate::hle::kernelx::mirrors::reserved(c, SIZE, 0x2040_2000, PAGE_READWRITE);
+            crate::hle::kernelx::mirrors::reserved(g, SIZE, 0x2040_2000, 0x801);
+            let x = 0x1_0008u64;
+            let at = cpu_at_in(span, g as u64 + x);
+            assert_eq!(at, c as u64 + x, "the CPU view");
+            assert_eq!(cpu_at_in(span, c as u64 + x), at, "a write at the CPU view and a wait at the GPU view share their cell");
+            ((c as u64 + x) as *mut u64).write(0x5843_4C00_0000_0042);
+            let w = PendingWait { va: at, width: 8, comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, value: 0x5843_4C00_0000_0042, mask: u64::MAX, after_write64: false };
+            assert_eq!(w.read_value(), Some(0x5843_4C00_0000_0042));
+            assert!(w.is_satisfied());
+            assert!(!PendingWait { value: 0x5843_4C00_0000_0043, ..w }.is_satisfied());
+            // the GPU view is no memory the CPU reads: a wait kept there would read nothing (and pass)
+            assert_eq!(PendingWait { va: g as u64 + x, ..w }.read_value(), None);
+            // layouts without view windows: every address is its own
+            assert_eq!(cpu_at_in((0, 0), g as u64 + x), g as u64 + x);
+            crate::hle::kernelx::mirrors::released(g);
+            crate::hle::kernelx::mirrors::released(c);
+            assert_eq!(cpu_at_in(span, g as u64 + x), g as u64 + x, "unpaired");
+            VirtualFree(c as *mut c_void, 0, MEM_RELEASE);
+        }
+        assert_eq!(u.view_release(g), Some(SIZE));
     }
 }
