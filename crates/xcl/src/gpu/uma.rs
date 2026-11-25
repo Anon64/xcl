@@ -1008,10 +1008,21 @@ static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::n
 /// `coherent_file` is read and written under it
 static COHERENT_FILE: Mutex<()> = Mutex::new(());
 /// A run this long has made its GPU heaps (a retail title made all of them in its first 7 s):
-/// what it put in the coherent window by then stands for the next run, also when it is less
-/// (`settle_coherent_need`). A run that ends sooner only ever grows the stored size: one cut
-/// short before its heaps would leave the next run's window too small for them.
+/// what it put in the coherent window by then may lower the stored size (`settled_need`). A run
+/// that ends sooner only ever grows it: one cut short before its heaps would leave the next
+/// run's window too small for them.
 const SETTLED: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The size to store for `route` when `before` is stored and the run put `run` in the coherent
+/// window by `SETTLED` (None: `before` stays). Only a setting that sends heaps to the sparse
+/// windows lowers it, where a size measured with more in the window cost video memory for
+/// nothing, and by half at most per run. With every heap in the window it only grows: a run that
+/// stays in the menu has asked for a part of the heaps a level makes by then, and from a size
+/// lowered to it the heaps of the next run that loads one would not fit and go to plain memory
+/// (no image).
+fn settled_need(route: &str, before: usize, run: usize) -> Option<usize> {
+    (route.starts_with("sparse") && run < before).then(|| run.max(before / 2))
+}
 
 /// The title has asked for `bytes` of graphics memory XCL places in the coherent window so far
 /// in this run (0: its GPU heaps all went to the sparse windows): the next run makes the window
@@ -1041,21 +1052,21 @@ pub fn note_coherent_need(bytes: usize) {
     }
 }
 
-/// `SETTLED` into the run: the size stored for this run's `XCL_COHERENT_HEAPS` becomes what the
-/// run put in the coherent window, when that is less.
+/// `SETTLED` into the run: the size stored for this run's `XCL_COHERENT_HEAPS` comes down
+/// towards what the run put in the coherent window (`settled_need`).
 fn settle_coherent_need() {
     let _g = COHERENT_FILE.lock().unwrap();
     let run = NOTED.load(std::sync::atomic::Ordering::Relaxed);
     let route = crate::hle::kernelx::coherent_heaps_route();
     let f = coherent_file(&route);
     let before = std::fs::read_to_string(&f).map_or(0, |s| stored_need(&s));
-    if run < before {
-        let _ = std::fs::write(&f, run.to_string());
+    if let Some(next) = settled_need(&route, before, run) {
+        let _ = std::fs::write(&f, next.to_string());
         crate::xlog_info!(
             "UMA: this run put {} MB of the title's graphics memory in the coherent window, {} MB were stored for '{route}' (XCL_COHERENT_HEAPS): the next run makes it {} MB",
             run >> 20,
             before >> 20,
-            (run + RUNTIME_COMMITTED_CAP).min(max_coherent_bytes(configured_runtime_windows())) >> 20
+            (next + RUNTIME_COMMITTED_CAP).min(max_coherent_bytes(configured_runtime_windows())) >> 20
         );
     }
 }
@@ -1518,5 +1529,22 @@ mod tests {
         // a text that is no number reads as none, as builds before read it: it is written over
         // with a number at the run's first GPU heap
         assert_eq!(stored_need("4804575232 all\n105000000 sparse:16\n"), 0);
+    }
+
+    /// A run lowers the stored coherent size only with a setting that sends GPU heaps to the
+    /// sparse windows, and by half at most: with every heap in the window, a run that stayed in
+    /// the menu (1 GB asked of a full run's 4582 MB) leaves it as it is.
+    #[test]
+    fn only_the_sparse_heaps_settings_lower_the_stored_coherent_need() {
+        let full = 4582usize << 20;
+        assert_eq!(settled_need(ALL_HEAPS, full, 1 << 30), None, "the next run that loads a level needs all of it");
+        assert_eq!(settled_need(ALL_HEAPS, full, 0), None);
+        assert_eq!(settled_need("off", full, 0), None);
+        assert_eq!(settled_need("sparse:16", full, 105 << 20), Some(full / 2), "half at most per run");
+        assert_eq!(settled_need("sparse:16", full / 2, 105 << 20), Some(full / 4));
+        assert_eq!(settled_need("sparse:16", 200 << 20, 105 << 20), Some(105 << 20));
+        assert_eq!(settled_need("sparse", 64 << 20, 0), Some(32 << 20));
+        assert_eq!(settled_need("sparse:16", 105 << 20, 105 << 20), None, "nothing to lower");
+        assert_eq!(settled_need("sparse:16", 105 << 20, 200 << 20), None, "growing is note_coherent_need's");
     }
 }
