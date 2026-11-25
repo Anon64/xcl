@@ -543,6 +543,14 @@ pub(super) fn note_dsv(handle: usize, res: usize, flags: u32) {
     }
 }
 
+/// The D3D12_DSV_FLAGS of the DSV at `handle` when it names a kept buffer (`XCL_TRACE_FRAME`).
+pub(super) fn dsv_flags(handle: usize) -> Option<u32> {
+    if DSV_ENTRIES.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    DSVS.get(handle).map(|d| d.flags)
+}
+
 fn forget_dsv(handle: usize) {
     if DSV_ENTRIES.load(Ordering::Relaxed) != 0 && DSVS.remove(handle).is_some() {
         DSV_ENTRIES.fetch_sub(1, Ordering::Relaxed);

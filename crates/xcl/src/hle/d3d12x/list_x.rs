@@ -410,11 +410,14 @@ pub(super) fn state_summary(list: *mut c_void) -> String {
             b.render_targets.as_ref().and_then(|rt| rt.dsv).map_or(String::new(), |d| format!(", DSV {d:#x}"))
         );
     });
-    // (after the bindings' lock: the map has its own)
-    if let Some(r) = dsv.and_then(super::present::rtv_resource) {
-        // SAFETY: the map holds a reference to the resource it names
-        if let Some(d) = unsafe { ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)) }.map(|x| unsafe { x.GetDesc() }) {
-            out += &format!(" names {r:#x} {}x{} PC format {} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0);
+    // (after the bindings' lock: the map has its own; the resource is taken with a reference of
+    // its own there, since another CreateDepthStencilView at the handle releases the map's)
+    if let Some(x) = dsv.and_then(super::present::rtv_resource).and_then(|r| unsafe { super::present::view_resource(r) }) {
+        let d = unsafe { x.GetDesc() };
+        // flags: the resource's; the view's (1 read-only depth, 2 read-only stencil) when `depth_uav` keeps the DSV
+        out += &format!(" names {:#x} {}x{} PC format {} flags {:#x}", x.as_raw() as usize, d.Width, d.Height, d.Format.0, d.Flags.0);
+        if let Some(f) = dsv.and_then(super::depth_uav::dsv_flags) {
+            out += &format!(", view flags {f:#x}");
         }
     }
     out
