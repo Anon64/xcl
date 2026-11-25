@@ -514,6 +514,8 @@ struct State {
     fill: Vec<usize>,
     /// window tiles asked for (`map_mirror`) and not handled yet
     asks: Vec<usize>,
+    /// window tiles whose GPU-view page changed (`remapped`), linked again at the next submit
+    remaps: Vec<usize>,
     /// window tiles linked over their CPU tiles (`mirror_src`) that wait for their video memory
     /// and fill, oldest first (`fill_later`)
     later: VecDeque<(usize, usize)>,
@@ -920,6 +922,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         sources: &SOURCES,
         fill: Vec::new(),
         asks: Vec::new(),
+        remaps: Vec::new(),
         later: VecDeque::new(),
         fill_pages: fill_pages(),
         mirrored: 0,
@@ -2599,10 +2602,85 @@ fn freeing_ends(m: &Mutex<Sources>, span: (usize, usize)) {
     }
 }
 
-/// The 64 KiB-aligned CPU tile behind window tile `g` of a GPU view (`kernelx::mirrors`; a lock
-/// of its own, which takes no other: it may be asked with `STATE` held).
+/// What window tile `g` shows (`tile_shows`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Under {
+    /// not in a GPU view
+    NoView,
+    /// nothing (zeros): unmapped by the queue's page mappings, no page behind it, or a page kept
+    /// where kernelx does not see the memory go (no tile may show it there)
+    Nothing,
+    /// the 64 KiB-aligned CPU tile: the CPU view's at the same offset, or where the page mapped
+    /// there is kept
+    Cpu(usize),
+}
+
+/// What window tile `g` of a GPU view shows (`kernelx::mirrors::shows`; locks of its own, which
+/// take no other: it may be asked with `STATE` held). While nothing is mapped, the CPU view's tile
+/// as before.
+fn tile_shows(g: usize) -> Under {
+    use crate::hle::kernelx::mirrors::{shows, Shows};
+    match shows(g) {
+        Shows::NoView => Under::NoView,
+        Shows::Same(c) => Under::Cpu(c & !(TILE - 1)),
+        Shows::Page { at, tile: true } => Under::Cpu(at & !(TILE - 1)),
+        Shows::Page { .. } | Shows::Nothing => Under::Nothing,
+    }
+}
+
+/// The 64 KiB-aligned CPU tile behind window tile `g` of a GPU view (`tile_shows`).
 fn mirror_source_tile(g: usize) -> Option<usize> {
-    crate::hle::kernelx::mirrors::source(g).map(|c| c & !(TILE - 1))
+    match tile_shows(g) {
+        Under::Cpu(c) => Some(c),
+        _ => None,
+    }
+}
+
+/// 64 KiB of XCL's own, reserved and never committed: the source of a tile that shows nothing but
+/// keeps its video memory, as a placed buffer maps its tiles once (`buffer_tiles`,
+/// `remap_mirrors`). Its pages are always holes: nothing scans it, and no copy back lands there.
+fn no_source() -> usize {
+    static AT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        use windows_sys::Win32::System::Memory::MEM_RESERVE;
+        unsafe { VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE, PAGE_NOACCESS) as usize }
+    })
+}
+
+/// Window tiles whose page the queue's page mappings changed (`remapped`), for the next submit to
+/// link again (`State::remap_mirrors`). A lock of its own, as `MIRROR_ASKS`.
+static REMAPS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static REMAPPING: AtomicBool = AtomicBool::new(false);
+
+/// What the GPU-view tiles `tiles` show changed (`kernelx::mirrors`: a mapping, an unmap, a freed
+/// page, a page that got or lost its place): those asked for (`map_mirror`) are linked again at
+/// the next submit. Any thread; no state's lock.
+pub fn remapped(tiles: &[usize]) {
+    let asked: Vec<usize> = tiles.iter().copied().filter(|&t| MIRROR_ASKED.contains(t)).collect();
+    if asked.is_empty() {
+        return;
+    }
+    REMAPS.lock().unwrap().extend(asked);
+    REMAPPING.store(true, Ordering::Release);
+}
+
+/// The GPU-view tiles linked again so far: [to show what the page mappings put there (or nothing),
+/// that followed their page].
+static VIEW_TILES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `VIEW_TILES` so far.
+pub fn page_tiles() -> [u64; 2] {
+    std::array::from_fn(|k| VIEW_TILES[k].load(Ordering::Relaxed))
+}
+
+/// The CPU tile a placed buffer's tile is linked over for what it shows: a tile that shows nothing
+/// keeps its video memory over `no_source` (the buffer maps its tiles once). None: no view.
+fn buffer_source(under: Under) -> Option<usize> {
+    match under {
+        Under::Cpu(c) => Some(c),
+        Under::Nothing => Some(no_source()).filter(|&n| n != 0),
+        Under::NoView => None,
+    }
 }
 
 /// The window tiles of `[va, va + len)` are to show the title's CPU view behind them (`va` in a
@@ -2731,10 +2809,15 @@ pub fn forget_mirrors(a: usize, n: usize) {
 
 /// The CPU address behind window address `va`, for what reads or writes the title's memory
 /// there: `va` itself, unless it lies in a GPU view of the title's CPU memory, whose tiles show
-/// their CPU view (`State::map_mirrors` takes them by the same rule). No `STATE`.
+/// their CPU view (`State::map_mirrors` takes them by the same rule), or where the page the
+/// queue's page mappings put there is kept (wherever that is: the CPU reads and writes any). No
+/// `STATE`.
 pub fn cpu_of(va: usize) -> usize {
-    let t = va & !(TILE - 1);
-    mirror_source_tile(t).map_or(va, |c| c + (va - t))
+    use crate::hle::kernelx::mirrors::{shows, Shows};
+    match shows(va) {
+        Shows::Same(c) | Shows::Page { at: c, .. } => c,
+        Shows::NoView | Shows::Nothing => va,
+    }
 }
 
 impl State {
@@ -2751,9 +2834,20 @@ impl State {
         }
     }
 
-    /// Window tile `w` shows no CPU tile any more (its entry in `mapped`, if any, is the caller's).
-    /// False: it showed none.
+    /// Window tile `w` shows no CPU tile any more (its entry in `mapped`, if any, is the caller's),
+    /// and may be asked for again. False: it showed none.
     fn unlink_mirror(&mut self, w: usize) -> bool {
+        let linked = self.unlink_kept(w);
+        if linked {
+            forget_ask(w);
+        }
+        linked
+    }
+
+    /// `unlink_mirror`, the ask kept: `w` is linked again (`remap_mirrors`), or waits asked for
+    /// until its GPU-view page shows something. (Forgotten, every recording thread's memory of its
+    /// asks would empty at each such change, `view_want`.)
+    fn unlink_kept(&mut self, w: usize) -> bool {
         let Some(c) = self.mirror_src.remove(&w) else { return false };
         if let Some(over) = self.mirrors.get_mut(&c) {
             over.retain(|&x| x != w);
@@ -2765,7 +2859,6 @@ impl State {
             }
         }
         self.refused.remove(&w);
-        forget_ask(w);
         true
     }
 
@@ -2773,6 +2866,12 @@ impl State {
     /// next submit), and it may be asked for again.
     fn drop_mirror(&mut self, w: usize) {
         self.unlink_mirror(w);
+        self.park(w);
+    }
+
+    /// The video memory of window tile `w` over a CPU view is parked (unmapped before the next
+    /// submit, unless a placed buffer uses it, or it is taken back first: `new_mirror`).
+    fn park(&mut self, w: usize) {
         if self.mapped.get(&w).is_some_and(|e| e.src != 0) {
             let e = self.mapped.remove(&w).expect("a tile over a CPU view");
             while let Some(&piece) = self.to_zero.range((w, 0)..(w + TILE, 0)).next() {
@@ -2931,11 +3030,14 @@ impl State {
             if self.mirror_src.contains_key(&g) {
                 continue;
             }
-            match Some(g).filter(|g| !self.mapped.contains_key(g) && self.window_index(*g).is_some()).and_then(mirror_source_tile) {
-                Some(c) => want.push((g, c)),
+            let under = if !self.mapped.contains_key(&g) && self.window_index(g).is_some() { tile_shows(g) } else { Under::NoView };
+            match under {
+                Under::Cpu(c) => want.push((g, c)),
+                // (it stays asked for: a page mapped there later links it, `remapped`)
+                Under::Nothing => {}
                 // (not counted: an address left out at every submit would empty every thread's
                 // memory of its asks at every submit; a pair made later changes the views)
-                None => {
+                Under::NoView => {
                     MIRROR_ASKED.remove(g);
                 }
             }
@@ -2952,9 +3054,75 @@ impl State {
             self.link_mirror(g, c);
         }
         // (a pair dropped since it was looked up: its `forget_mirrors` may have found nothing
-        // linked, and the CPU tile may be given out anew)
-        want.retain(|&(g, c)| mirror_source_tile(g) == Some(c) || !self.unlink_mirror(g));
+        // linked, and the CPU tile may be given out anew; a page mapped or unmapped there since:
+        // linked again, the ask kept)
+        want.retain_mut(|(g, c)| match tile_shows(*g) {
+            Under::Cpu(now) if now == *c => true,
+            Under::Cpu(now) => {
+                self.unlink_kept(*g);
+                self.link_mirror(*g, now);
+                *c = now;
+                true
+            }
+            Under::Nothing => {
+                self.unlink_kept(*g);
+                false
+            }
+            Under::NoView => !self.unlink_mirror(*g),
+        });
         self.later.extend(want);
+    }
+
+    /// The tiles whose GPU-view page the queue's page mappings changed (`remaps`, from `remapped`;
+    /// `MIRROR_ASKS_MAX` at most a submit) are linked to what they show now: video memory over a
+    /// place is cleared and filled from its committed pages (`fill_later`, before the asks), one
+    /// that shows nothing is given back – but a placed buffer's, which keeps its video memory
+    /// cleared over `no_source` – and stays asked for. Called after the finished copies back land
+    /// (a copy back recorded for the old link finds a new gen) and before `map_mirrors`.
+    unsafe fn remap_mirrors(&mut self) {
+        if self.remaps.is_empty() {
+            return;
+        }
+        let n = self.remaps.len().min(MIRROR_ASKS_MAX);
+        let mut tiles: Vec<usize> = self.remaps.drain(..n).collect();
+        tiles.sort_unstable();
+        tiles.dedup();
+        for g in tiles {
+            // (a tile of the window's own is not a view's)
+            if self.mapped.get(&g).is_some_and(|e| e.src == 0) {
+                continue;
+            }
+            let now = tile_shows(g);
+            let linked = self.mirror_src.get(&g).copied();
+            match now {
+                Under::Cpu(c) if linked == Some(c) => continue,
+                Under::Nothing if linked.is_none_or(|l| l == no_source()) => continue,
+                _ => {}
+            }
+            let pinned = self.mapped.get(&g).is_some_and(|e| self.pinned.contains_key(&e.pool));
+            self.unlink_kept(g);
+            self.park(g);
+            if pinned {
+                // (a kept tile must not keep the bytes it showed)
+                self.to_zero.insert((g, TILE));
+            }
+            match now {
+                Under::Cpu(c) if self.window_index(g).is_some() => {
+                    self.link_mirror(g, c);
+                    // (it was shown: before the older asks)
+                    self.later.push_front((g, c));
+                    VIEW_TILES[0].fetch_add(1, Ordering::Relaxed);
+                }
+                Under::Nothing => {
+                    if pinned && no_source() != 0 {
+                        self.link_mirror(g, no_source());
+                        self.new_mirror(g, no_source(), 0xFFFF, true);
+                    }
+                    VIEW_TILES[0].fetch_add(1, Ordering::Relaxed);
+                }
+                _ => forget_ask(g),
+            }
+        }
     }
 
     /// The hole masks of CPU tiles `tiles` (`source_holes`), with the pages of decommits under way
@@ -3115,19 +3283,29 @@ impl State {
             if self.mapped.contains_key(&t) || self.window_index(t).is_none() {
                 continue;
             }
-            if let Some(c) = self.mirror_src.get(&t).copied().or_else(|| mirror_source_tile(t)) {
+            if let Some(c) = self.mirror_src.get(&t).copied().or_else(|| buffer_source(tile_shows(t))) {
                 over.push((t, c));
             }
         }
         if !over.is_empty() {
             // linked before their CPU tiles' pages are asked about (`holes_now`), and given up
-            // when their pair went meanwhile (as in `take_asks`)
-            over.retain(|&(t, c)| {
-                if self.mirror_src.contains_key(&t) {
+            // when their pair went meanwhile, linked again when their page changed (as in
+            // `take_asks`)
+            over.retain_mut(|(t, c)| {
+                if self.mirror_src.contains_key(t) {
                     return true;
                 }
-                self.link_mirror(t, c);
-                mirror_source_tile(t) == Some(c) || !self.unlink_mirror(t)
+                self.link_mirror(*t, *c);
+                match buffer_source(tile_shows(*t)) {
+                    Some(now) if now == *c => true,
+                    Some(now) => {
+                        self.unlink_kept(*t);
+                        self.link_mirror(*t, now);
+                        *c = now;
+                        true
+                    }
+                    None => !self.unlink_mirror(*t),
+                }
             });
             let holes = self.holes_now(&over.iter().map(|o| o.1).collect::<Vec<_>>());
             for (&(t, c), h) in over.iter().zip(holes) {
@@ -3291,6 +3469,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     if MIRROR_ASKING.swap(false, Ordering::AcqRel) {
         s.asks.append(&mut MIRROR_ASKS.lock().unwrap());
     }
+    if REMAPPING.swap(false, Ordering::AcqRel) {
+        s.remaps.append(&mut REMAPS.lock().unwrap());
+    }
     let waited = t0.elapsed().as_micros() as u64;
     PHASES[0].fetch_add(waited, Ordering::Relaxed);
     SUBMIT_US.fetch_add(waited, Ordering::Relaxed);
@@ -3403,9 +3584,11 @@ impl State {
         // would take what the GPU had in it)
         s.drain_readbacks(Drain::Finished);
         let t_back = stamp();
-        // tiles asked to show CPU views, and the CPU writes that change them: before the flushes
-        // below, so their mappings reach the title's work (a tile taken back from `parked` needs
-        // none)
+        // tiles whose page the queue's page mappings changed (after the copies back: one for the
+        // old link lands nowhere), tiles asked to show CPU views, and the CPU writes that change
+        // them: before the flushes below, so their mappings reach the title's work (a tile taken
+        // back from `parked` needs none)
+        s.remap_mirrors();
         s.map_mirrors();
         s.mirror_writes(dirty, page);
         let t_views = stamp();
@@ -3936,6 +4119,7 @@ mod tests {
                 sources: &SOURCES,
                 fill: Vec::new(),
                 asks: Vec::new(),
+                remaps: Vec::new(),
                 later: VecDeque::new(),
                 fill_pages: fill_pages(),
                 mirrored: 0,
@@ -4222,6 +4406,7 @@ mod tests {
                 sources: &SOURCES,
                 fill: Vec::new(),
                 asks: Vec::new(),
+                remaps: Vec::new(),
                 later: VecDeque::new(),
                 fill_pages: fill_pages(),
                 mirrored: 0,
@@ -4453,6 +4638,7 @@ mod tests {
                 sources: &SOURCES,
                 fill: Vec::new(),
                 asks: Vec::new(),
+                remaps: Vec::new(),
                 later: VecDeque::new(),
                 fill_pages: fill_pages(),
                 mirrored: 0,
@@ -4573,6 +4759,7 @@ mod tests {
                 sources: &SOURCES,
                 fill: Vec::new(),
                 asks: Vec::new(),
+                remaps: Vec::new(),
                 later: VecDeque::new(),
                 fill_pages: fill_pages(),
                 mirrored: 0,
@@ -4941,6 +5128,24 @@ mod tests {
         /// The bytes of tile `k` of the CPU view.
         unsafe fn cpu_tile(&self, k: usize) -> Vec<u8> {
             std::slice::from_raw_parts((self.c + k * TILE) as *const u8, TILE).to_vec()
+        }
+
+        /// Tiles `0..n` of the GPU view asked for (`map_mirror`), taken by the test's state as a
+        /// submit takes them (other tests' asks stay queued).
+        fn ask(&mut self, n: usize) {
+            let (lo, hi) = (self.w, self.w + n * TILE);
+            map_mirror(lo, hi - lo);
+            MIRROR_ASKS.lock().unwrap().retain(|&t| t < lo || t >= hi);
+            self.s.asks.extend((lo..hi).step_by(TILE));
+        }
+
+        /// The tiles of `0..n` queued by `remapped`, taken by the test's state as a submit takes
+        /// them (other tests' stay queued).
+        fn take_remaps(&mut self, n: usize) {
+            let (lo, hi) = (self.w, self.w + n * TILE);
+            let mut q = REMAPS.lock().unwrap();
+            self.s.remaps.extend(q.iter().copied().filter(|&t| t >= lo && t < hi));
+            q.retain(|&t| t < lo || t >= hi);
         }
 
         /// A submit of the title, with the CPU pages `dirty` written since the last.
@@ -5400,6 +5605,150 @@ mod tests {
             let dirty: Vec<usize> = (0..PAGES_PER_TILE).map(|i| c + TILE + i * PAGE).collect();
             v.submit(&dirty);
             assert!(v.gpu_bytes(&res, TILE, TILE) == v.cpu_tile(1), "and the CPU's writes to it");
+        }
+    }
+
+    /// `n` physical pages of the title mapped at their home, one after the other (a pool for the
+    /// queue's page mappings whose pages a tile may show): (the pages, the home). None: no unified
+    /// memory.
+    unsafe fn home_pages(n: usize) -> Option<(Vec<usize>, usize)> {
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, MapTitlePhysicalPages};
+        crate::gpu::uma::get()?;
+        let (mut k, mut pages) = (n, vec![0usize; n]);
+        assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut k, pages.as_mut_ptr()), 1);
+        let home = MapTitlePhysicalPages(std::ptr::null_mut(), n, 0, 4, pages.as_mut_ptr()) as usize;
+        assert!(home != 0 && home % TILE == 0);
+        Some((pages, home))
+    }
+
+    /// The 64 KiB at `at` written with bytes made from `seed`; returns them.
+    unsafe fn fill_tile(at: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        for i in 0..TILE / 8 {
+            *(at as *mut u64).add(i) = next(&mut x);
+        }
+        std::slice::from_raw_parts(at as *const u8, TILE).to_vec()
+    }
+
+    /// One call of the queue's page-mapping method: `ranges` (kind, start, count) from GPU-view
+    /// address `dest` on, in the pool of `pages` pages at `pool`.
+    unsafe fn map_pages_at(dest: usize, ranges: &[[u32; 3]], pool: usize, pages: u32) {
+        // (a batch: the first destination, the number of ranges, a pointer to them)
+        let batch = [dest as u64, ranges.len() as u64, ranges.as_ptr() as u64];
+        assert!(crate::hle::kernelx::mirrors::apply_batches(1, batch.as_ptr() as usize, pool, pages).is_some());
+    }
+
+    /// A tile of a GPU view shows the page the queue's page mappings put there, from the submit
+    /// after the call: a mapped page, nothing for an unmapped one (no video memory, still asked
+    /// for), the CPU view for one never named; the page's later writes, a remap, a page mapped
+    /// where nothing was (with no new ask) and an unmap. No ask is forgotten on the way, and a
+    /// range over two pages kept apart is not one piece on the CPU.
+    #[test]
+    fn a_tile_of_a_gpu_view_shows_the_page_mapped_there() {
+        unsafe {
+            let Some(mut v) = Views::new(163) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let Some((mut pages, h)) = home_pages(3) else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
+            let (w, buf) = (v.w, v.buf.clone());
+            let mut pool: Vec<Vec<u8>> = (0..3).map(|k| fill_tile(h + k * TILE, 40 + k as u64)).collect();
+            // three tiles over their CPU view, asked for and filled
+            v.commit(0, 3);
+            v.write(0, 3, 44);
+            v.ask(3);
+            v.submit(&[]);
+            assert!(v.s.mapped.contains_key(&(w + TILE)));
+            let forgotten = ASKS_FORGOTTEN.with(|n| n.get());
+            let shown = page_tiles()[0];
+
+            // pool page 0 at view page 0, view page 1 unmapped, view page 2 left as it is
+            map_pages_at(w, &[[0, 0, 1], [2, 0, 1]], h, 3);
+            v.take_remaps(3);
+            assert_eq!(v.s.remaps, vec![w, w + TILE], "the asked tiles of the changed pages");
+            v.submit(&[]);
+            assert!(v.gpu_bytes(&buf, 0, TILE) == pool[0], "the pool page");
+            assert!(!v.s.mapped.contains_key(&(w + TILE)) && !v.s.mirror_src.contains_key(&(w + TILE)), "unmapped: no video memory");
+            assert!(MIRROR_ASKED.contains(w + TILE), "and still asked for");
+            assert!(v.gpu_bytes(&buf, 2 * TILE, TILE) == v.cpu_tile(2), "never named: its CPU tile");
+            assert!(page_tiles()[0] >= shown + 2);
+            // a write to the pool page goes up
+            pool[0] = fill_tile(h, 50);
+            v.submit(&(0..PAGES_PER_TILE).map(|i| h + i * PAGE).collect::<Vec<_>>());
+            assert!(v.gpu_bytes(&buf, 0, TILE) == pool[0], "the pool page's write");
+
+            // view page 0 remapped to pool page 2, pool page 1 mapped at view page 1 (asked for
+            // while unmapped: no new ask)
+            assert_eq!(map_mirror(w + TILE, 0x100), 0, "still asked for");
+            map_pages_at(w, &[[0, 2, 1], [0, 1, 1]], h, 3);
+            assert_eq!(super::super::view_want::cpu_run((w + TILE - 8) as u64, 16), None, "two pages kept apart");
+            v.take_remaps(3);
+            v.submit(&[]);
+            assert!(v.gpu_bytes(&buf, 0, TILE) == pool[2], "the new page");
+            assert!(v.gpu_bytes(&buf, TILE, TILE) == pool[1], "the page mapped where nothing was");
+            // an unmap takes the video memory
+            map_pages_at(w, &[[2, 0, 1]], h, 3);
+            v.take_remaps(3);
+            v.submit(&[]);
+            assert!(!v.s.mapped.contains_key(&w) && MIRROR_ASKED.contains(w));
+            assert_eq!(ASKS_FORGOTTEN.with(|n| n.get()), forgotten, "no ask forgotten on the way");
+
+            // freed: the tile over a freed page shows nothing
+            assert_eq!(crate::hle::kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
+            v.take_remaps(3);
+            v.submit(&[]);
+            assert!(!v.s.mapped.contains_key(&(w + TILE)));
+        }
+    }
+
+    /// A buffer placed over GPU-view tiles keeps its video memory while the pages under it
+    /// change: a remap shows the new page on the same pool tile, an unmap zeros, and a buffer
+    /// placed over an unmapped page shows the page once it is mapped there.
+    #[test]
+    fn a_buffer_over_a_remapped_tile_reads_the_new_page() {
+        unsafe {
+            let Some(mut v) = Views::new(167) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let Some((mut pages, h)) = home_pages(2) else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
+            let w = v.w;
+            let pool: Vec<Vec<u8>> = (0..2).map(|k| fill_tile(h + k * TILE, 60 + k as u64)).collect();
+            // pool page 0 at view page 0, view page 1 unmapped; the buffer's tiles are asked for
+            // (as a placed buffer's are, `view_want`)
+            map_pages_at(w, &[[0, 0, 1], [2, 0, 1]], h, 2);
+            v.ask(2);
+            let mut res: Option<ID3D12Resource> = None;
+            v.dev.CreateReservedResource(&buffer_desc(2 * TILE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut res).expect("CreateReservedResource");
+            let res = res.expect("reserved buffer");
+            let tiles = v.s.buffer_tiles(w, 2 * TILE);
+            assert_eq!(tiles.len(), 2);
+            assert_eq!((v.s.mapped[&w].src, v.s.mapped[&(w + TILE)].src), (h, no_source()), "the unmapped one over nothing");
+            v.s.map_tiles(&res, w, &tiles);
+            for &(_, tile) in &tiles {
+                *v.s.pinned.entry(tile).or_default() += 1;
+            }
+            v.submit(&[]);
+            assert!(v.gpu_bytes(&res, 0, TILE) == pool[0], "the buffer shows the pool page");
+            assert!(v.gpu_bytes(&res, TILE, TILE) == vec![0u8; TILE]);
+            let (p0, p1) = (v.s.mapped[&w].pool, v.s.mapped[&(w + TILE)].pool);
+
+            // remapped: the new page on the same pool tile
+            map_pages_at(w, &[[0, 1, 1]], h, 2);
+            v.take_remaps(2);
+            v.submit(&[]);
+            assert!(v.gpu_bytes(&res, 0, TILE) == pool[1], "the buffer reads the new page");
+            assert_eq!(v.s.mapped[&w].pool, p0, "on the same pool tile");
+            // unmapped: zeros, the pool tile kept
+            map_pages_at(w, &[[2, 0, 1]], h, 2);
+            v.take_remaps(2);
+            v.submit(&[]);
+            assert!(v.gpu_bytes(&res, 0, TILE) == vec![0u8; TILE], "unmapped: zeros");
+            assert_eq!((v.s.mapped[&w].src, v.s.mapped[&w].pool), (no_source(), p0));
+            // the page mapped under the buffer's second tile, placed while it was unmapped
+            map_pages_at(w + TILE, &[[0, 0, 1]], h, 2);
+            v.take_remaps(2);
+            v.submit(&[]);
+            assert!(v.gpu_bytes(&res, TILE, TILE) == pool[0], "shown once mapped");
+            assert_eq!((v.s.mapped[&(w + TILE)].src, v.s.mapped[&(w + TILE)].pool), (h, p1));
+
+            assert_eq!(crate::hle::kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            v.take_remaps(2);
+            v.submit(&[]);
         }
     }
 

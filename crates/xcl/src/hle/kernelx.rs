@@ -536,28 +536,35 @@ pub mod mirrors {
         let in_view = |va: usize| s.gpu.range(..=va).next_back().is_some_and(|(&g, &(size, _))| va < g + size);
         let mut pages = write_pages();
         let mut out = Mapped::default();
+        // (the GPU-view pages that show something else now)
+        let mut changed: Vec<usize> = Vec::new();
         for (g, to) in changes {
             if !in_view(g) {
                 out.elsewhere += 1;
                 continue;
             }
-            match to {
+            let set = match to {
                 None => {
-                    pages.set(g, 0, 0, false, call);
                     out.unmapped += 1;
+                    pages.set(g, 0, 0, false, call)
                 }
                 Some((page, at, _)) if page == 0 || at == 0 => {
-                    pages.set(g, 0, 0, false, call);
                     out.empty += 1;
+                    pages.set(g, 0, 0, false, call)
                 }
                 Some((page, at, tile)) => {
-                    pages.set(g, page, at, tile, call);
                     out.mapped += 1;
+                    pages.set(g, page, at, tile, call)
                 }
+            };
+            if set {
+                changed.push(g);
             }
         }
         drop(pages);
         drop(s);
+        // (the tiles over them are linked again at the next submit)
+        crate::hle::d3d12x::sparse::remapped(&changed);
         drop(away);
         Some(out)
     }
@@ -821,7 +828,11 @@ unsafe fn page_placed(page: usize, at: usize, home: bool, whole: bool) {
         return;
     }
     let tile = at != 0 && (home || freeing_is_seen(at));
-    let Some((_from, _shown)) = mirrors::page_at(page, at, tile) else { return };
+    let Some((from, shown)) = mirrors::page_at(page, at, tile) else { return };
+    // (its bytes appear or go: a change of what the tiles over it show)
+    if from == 0 || at == 0 {
+        crate::hle::d3d12x::sparse::remapped(&shown);
+    }
     if whole {
         crate::hle::d3d12x::title_textures::note_known_write(at, PHYS_PAGE);
     }
@@ -1158,7 +1169,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             // (tiles may show pages kept here; the pages kept here show nothing from now on)
             if mirrors::any_mapped() {
                 crate::hle::d3d12x::sparse::forget_mirrors(a, n);
-                mirrors::place_gone(a, n);
+                crate::hle::d3d12x::sparse::remapped(&mirrors::place_gone(a, n));
             }
         }
         return 1;
@@ -1216,7 +1227,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
                 mirrors::released(addr as usize);
             }
             forget_title_mappings(addr as usize, len);
-            mirrors::place_gone(addr as usize, len);
+            crate::hle::d3d12x::sparse::remapped(&mirrors::place_gone(addr as usize, len));
         }
     }
     ok
@@ -2286,7 +2297,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
                 pagelog::note("page freed while mapped (the address keeps its bytes)", at, 0, *arr.add(i));
             }
             // (those at home too: their home goes with the block)
-            mirrors::page_freed(*arr.add(i));
+            crate::hle::d3d12x::sparse::remapped(&mirrors::page_freed(*arr.add(i)));
         }
         // (page numbers are never handed out again: their entries go)
         if !away.title.is_empty() {
