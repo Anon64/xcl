@@ -72,16 +72,23 @@ struct TwoPassBuf {
 
 impl TwoPassBuf {
     /// A new buffer of `bytes`, if the two-pass buffers alive stay within `two_pass_cap` with it
-    /// (the free ones in `FREE_RES` go first to make room). Past it: an error, and the draw that
-    /// asked is skipped.
+    /// (the free ones in `FREE_RES` go first to make room, when they are enough). Past it: an
+    /// error, and the draw that asked is skipped.
     unsafe fn make(dev: &ID3D12Device, bytes: u64, what: &str) -> Result<Self, String> {
         let cap = two_pass_cap();
         if !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
+            // (counted with `FREE_RES` locked, so its bytes are in the load; none go when they
+            // cannot make the room: the draw is skipped either way, and the recordings after it
+            // can still take them)
+            let gone = {
+                let mut free = FREE_RES.lock().unwrap();
+                let over = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed).saturating_add(bytes).saturating_sub(cap);
+                free.take_room(over)
+            };
             // (the GPU is done with those: let go outside the lock)
-            let over = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed).saturating_add(bytes).saturating_sub(cap);
-            let gone = FREE_RES.lock().unwrap().take_room(over);
+            let made_room = gone.is_some();
             drop(gone);
-            if !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
+            if !made_room || !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
                 note_two_pass(TP_REFUSED);
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -314,8 +321,12 @@ impl<T> FreePool<T> {
         Some(t)
     }
 
-    /// The oldest kept, of any size and device, until they come to `bytes` or none is left.
-    fn take_room(&mut self, bytes: u64) -> Vec<T> {
+    /// The oldest kept, of any size and device, until they come to `bytes`. None when all of
+    /// them come to less: then all stay.
+    fn take_room(&mut self, bytes: u64) -> Option<Vec<T>> {
+        if self.bytes < bytes {
+            return None;
+        }
         let mut freed = 0;
         let n = self
             .free
@@ -326,13 +337,15 @@ impl<T> FreePool<T> {
                 more
             })
             .count();
-        self.free
-            .drain(..n)
-            .map(|(_, b, _, t)| {
-                self.bytes -= b;
-                t
-            })
-            .collect()
+        Some(
+            self.free
+                .drain(..n)
+                .map(|(_, b, _, t)| {
+                    self.bytes -= b;
+                    t
+                })
+                .collect(),
+        )
     }
 
     /// What was kept `age` or longer at `now`, no recording having taken it.
@@ -3001,7 +3014,9 @@ void main(uint t : SV_GroupIndex) {
     }
 
     /// Two-pass buffers alive stay within the cap: one that would pass it is not counted (and not
-    /// made), and freed ones go first to make room for it, oldest first, as many as it takes.
+    /// made), and freed ones go first to make room for it, oldest first, as many as it takes –
+    /// none when all of them cannot make it (the draw is skipped anyway, and the next recordings
+    /// can still take them).
     #[test]
     fn two_pass_buffers_alive_stay_within_the_cap() {
         use std::time::Instant;
@@ -3018,10 +3033,12 @@ void main(uint t : SV_GroupIndex) {
         p.put(t, 4 * mib, 1, "4");
         p.put(t, 32 * mib, 2, "32");
         p.put(t, mib, 1, "1");
-        assert!(p.take_room(0).is_empty());
-        assert_eq!(p.take_room(5 * mib), vec!["4", "32"]);
+        assert_eq!(p.take_room(0), Some(vec![]));
+        assert_eq!(p.take_room(5 * mib), Some(vec!["4", "32"]));
         assert_eq!(p.bytes, mib);
-        assert_eq!(p.take_room(64 * mib), vec!["1"], "all there are");
+        assert_eq!(p.take_room(64 * mib), None, "they cannot make the room: none go");
+        assert_eq!((p.bytes, p.free.len()), (mib, 1));
+        assert_eq!(p.take_room(mib), Some(vec!["1"]), "all there are, when they make it");
         assert_eq!((p.bytes, p.free.len()), (0, 0));
         assert!(two_pass_cap() > 0);
     }
