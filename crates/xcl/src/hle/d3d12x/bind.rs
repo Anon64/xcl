@@ -687,6 +687,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         })();
         match run {
             Ok(()) => {
+                mesh_work(this, super::targets::RAN);
                 count(DRAWS);
                 static LOGGED: AtomicU64 = AtomicU64::new(0);
                 let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -695,6 +696,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                 }
             }
             Err(e) => {
+                mesh_work(this, super::targets::SKIPPED);
                 count(DRAWS_SKIPPED);
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -705,6 +707,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         return;
     }
     if super::pso_async::is_pending(raw_pso) {
+        mesh_work(this, super::targets::STANDIN);
         count(DRAWS_SKIPPED);
         return;
     }
@@ -712,8 +715,17 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
         list.SetGraphicsRootSignature(r);
     }
+    mesh_work(this, super::targets::PC);
     count(DRAWS_PC);
     pc_dm(this, x, y, z);
+}
+
+/// `XCL_DUMP_TARGETS`: a DispatchMesh (the two passes of a translated mesh pipeline count as the
+/// one draw they stand for) with `outcome`
+unsafe fn mesh_work(this: *mut c_void, outcome: usize) {
+    if super::targets::enabled() {
+        super::targets::note_draw(this, outcome);
+    }
 }
 
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
@@ -768,6 +780,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             })();
             match run {
                 Ok(()) => {
+                    mesh_work(this, super::targets::RAN);
                     count(DRAWS);
                     static LOGGED: AtomicU64 = AtomicU64::new(0);
                     let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -776,6 +789,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     }
                 }
                 Err(e) => {
+                    mesh_work(this, super::targets::SKIPPED);
                     count(DRAWS_SKIPPED);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, Ordering::Relaxed) < 8 {
