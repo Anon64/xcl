@@ -4335,7 +4335,8 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
-        if let (Some(p), Some(b)) = (disk.as_deref(), keep_compute_blob(key, *ppv, dxil.len())) {
+        let (memory, to_disk) = compute_blob_kept(dxil.len(), in_driver, driver_cache::compute_keep_threshold());
+        if let (Some(p), Some(b)) = (disk.as_deref(), keep_compute_blob(key, *ppv, memory, to_disk && disk.is_some())) {
             driver_cache::keep(p, &b, in_driver);
         }
     } else if reused && from_disk {
@@ -4384,8 +4385,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 /// run still goes through the driver's compiler. On an NVIDIA GPU that is 5 – 27 s for each of
 /// a retail title's larger compute programs when its world loads: the title dispatches without
 /// them meanwhile and is ended before all are built, so the next run starts the same compiles
-/// again. A blob whose build took `KEEP` or longer is written under the hash of its DXIL and
-/// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
+/// again. A blob whose build took `KEEP` (a compute pipeline's: `COMPUTE_KEEP`) or longer is
+/// written under the hash of its DXIL and its flags (`<DXIL cache>\driver\`) and read when a
+/// later run has none in memory; the
 /// driver refuses the blob of another driver, adapter or root signature (the file is dropped
 /// and the program compiled as before). A translated graphics pipeline's blob goes under
 /// `graphics_file_hash`, the passes of a two-pass one under `TwoPassBlob`'s names.
@@ -4396,6 +4398,10 @@ pub(crate) mod driver_cache {
 
     /// builds shorter than this are not worth a file
     const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
+    /// … of a compute pipeline: one not kept is compiled again in every run, at its first bind,
+    /// often on one of the title's threads (a retail title's thread spent 228 ms on a 4 KB
+    /// program that no file was kept for)
+    const COMPUTE_KEEP: std::time::Duration = std::time::Duration::from_millis(20);
     static HITS: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     static STORED: AtomicU64 = AtomicU64::new(0);
@@ -4444,8 +4450,19 @@ pub(crate) mod driver_cache {
     /// Builds shorter than this keep no file (`KEEP`; `XCL_PSO_DISK_CACHE_MIN_MS` to choose).
     pub(super) fn keep_threshold() -> std::time::Duration {
         static MIN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-        *MIN.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE_MIN_MS").ok()
-            .and_then(|v| v.trim().parse().ok()).map_or(KEEP, std::time::Duration::from_millis))
+        *MIN.get_or_init(|| keep_threshold_of(std::env::var("XCL_PSO_DISK_CACHE_MIN_MS").ok().as_deref(), KEEP))
+    }
+
+    /// Compute builds shorter than this keep no file (`COMPUTE_KEEP`; `XCL_PSO_DISK_CACHE_MIN_MS`
+    /// to choose, as for the others).
+    pub(super) fn compute_keep_threshold() -> std::time::Duration {
+        static MIN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        *MIN.get_or_init(|| keep_threshold_of(std::env::var("XCL_PSO_DISK_CACHE_MIN_MS").ok().as_deref(), COMPUTE_KEEP))
+    }
+
+    /// A threshold in milliseconds from the environment (unset or not a number: `default`).
+    fn keep_threshold_of(v: Option<&str>, default: std::time::Duration) -> std::time::Duration {
+        v.and_then(|v| v.trim().parse().ok()).map_or(default, std::time::Duration::from_millis)
     }
 
     pub fn load(p: &Path) -> Option<Vec<u8>> {
@@ -4509,9 +4526,10 @@ pub(crate) mod driver_cache {
         ok
     }
 
-    /// Keep `blob`, of a build that took `took`, for the next run.
+    /// Keep `blob`, of a compute pipeline's build that took `took`, for the next run
+    /// (`compute_keep_threshold`).
     pub fn keep(p: &Path, blob: &[u8], took: std::time::Duration) {
-        keep_at(p, blob, took, KEEP);
+        keep_at(p, blob, took, compute_keep_threshold());
     }
 
     pub(super) fn keep_at(p: &Path, blob: &[u8], took: std::time::Duration, min: std::time::Duration) {
@@ -4575,6 +4593,23 @@ pub(crate) mod driver_cache {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// A compute build of 20 ms or more keeps its file (it was 250 ms, as for the others, and
+        /// `XCL_PSO_DISK_CACHE_MIN_MS` did not reach it); the switch chooses for both.
+        #[test]
+        fn a_compute_build_of_a_tenth_of_a_second_keeps_its_file() {
+            let ms = std::time::Duration::from_millis;
+            assert_eq!(keep_threshold_of(None, COMPUTE_KEEP), ms(20));
+            assert_eq!(keep_threshold_of(None, KEEP), ms(250), "the others' as before");
+            assert_eq!(keep_threshold_of(Some(" 100 "), COMPUTE_KEEP), ms(100));
+            assert_eq!(keep_threshold_of(Some("0"), KEEP), ms(0));
+            assert_eq!(keep_threshold_of(Some("soon"), COMPUTE_KEEP), ms(20));
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-compute-{}", std::process::id()));
+            let _directory = Directory(dir.clone());
+            let p = dir.join("driver").join(name(b"small program", 0));
+            keep(&p, &[4, 5, 6], ms(100));
+            assert_eq!(load(&p).as_deref(), Some(&[4u8, 5, 6][..]), "a 100 ms compute build is kept");
+        }
+
         #[test]
         fn an_overlapping_writer_cannot_modify_the_published_blob() {
             use std::io::Write;
@@ -4619,7 +4654,8 @@ pub(crate) mod driver_cache {
 /// up to `COMPUTE_BLOBS_MAX` bytes across ordinary compute and both two-pass PSOs.
 static COMPUTE_BLOBS: Mutex<Option<(HashMap<(u64, usize, i32), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
 const COMPUTE_BLOBS_MAX: usize = 512 << 20;
-/// smaller programs compile in milliseconds: not kept
+/// smaller programs mostly compile in milliseconds: not kept (a compute one's slow build only on
+/// disk: `compute_blob_kept`)
 const COMPUTE_BLOB_MIN_DXIL: usize = 16 << 10;
 
 fn compute_blob_key(dxil: &[u8], rs: usize, flags: i32) -> (u64, usize, i32) {
@@ -4687,6 +4723,17 @@ mod compute_blob_tests {
 
         assert!(super::remember_compute_blob(&mut store, (5, 6, 0), Vec::new()).is_none(), "an empty blob is nothing to keep");
     }
+
+    /// A small program's slow build keeps its blob on disk (not in memory); a big program's is
+    /// kept in memory, and on disk when its build was slow, as before.
+    #[test]
+    fn a_small_programs_slow_build_keeps_its_blob_on_disk() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(super::compute_blob_kept(4392, ms(228), ms(20)), (false, true), "4 KB of DXIL, 228 ms in the driver");
+        assert_eq!(super::compute_blob_kept(4392, ms(5), ms(20)), (false, false));
+        assert_eq!(super::compute_blob_kept(super::COMPUTE_BLOB_MIN_DXIL, ms(5), ms(20)), (true, false));
+        assert_eq!(super::compute_blob_kept(827_344, ms(57_200), ms(20)), (true, true));
+    }
 }
 
 fn store_compute_blob(key: (u64, usize, i32), blob: std::sync::Arc<Vec<u8>>) {
@@ -4724,16 +4771,28 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     (!bytes.is_empty()).then_some(bytes)
 }
 
+/// What the driver's blob of a compute build is kept for: (in memory, on disk). Memory takes a
+/// program of `COMPUTE_BLOB_MIN_DXIL` or more; the disk a build of `min` or longer whatever the
+/// program's size: a small program without its file is compiled again in every run, at its
+/// first bind (a retail title's thread spent 228 ms in the driver on one of 4 KB).
+fn compute_blob_kept(dxil_len: usize, took: std::time::Duration, min: std::time::Duration) -> (bool, bool) {
+    (dxil_len >= COMPUTE_BLOB_MIN_DXIL, took >= min)
+}
+
 /// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
-/// passes owned by `TwoPassPso`).
-unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) -> Option<std::sync::Arc<Vec<u8>>> {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() {
+/// passes owned by `TwoPassPso`), for the disk (`disk`) and in memory (`memory`) – as
+/// `compute_blob_kept` chooses.
+unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, memory: bool, disk: bool) -> Option<std::sync::Arc<Vec<u8>>> {
+    if !(memory || disk) || pso.is_null() {
         return None;
     }
     if let Some(b) = compute_blob(key) {
         return Some(b);
     }
     let bytes = read_pso_cached_blob(pso)?;
+    if !memory {
+        return (!bytes.is_empty()).then(|| std::sync::Arc::new(bytes));
+    }
     let mut g = COMPUTE_BLOBS.lock().unwrap();
     remember_compute_blob(g.get_or_insert_with(|| (HashMap::new(), 0)), key, bytes)
 }
@@ -5720,6 +5779,11 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    // (a compute pipeline's console program, as `translated_compute_pso` names it in the log)
+    let record = match &owned {
+        OwnedDesc::Compute(_, blobs) => blobs.first().map_or(0, |cs| crate::gpu::shader::fnv64(cs)),
+        _ => 0,
+    };
     let owned = std::sync::Arc::new(owned);
     let warm: Option<super::pso_async::Warm> = matches!(*owned, OwnedDesc::Graphics(..)).then(|| {
         let owned = owned.clone();
@@ -5734,9 +5798,9 @@ unsafe fn go_background(
         }
     });
     if super::pso_async::lazy() {
-        super::pso_async::submit_lazy_with(*ppv as usize, compute, job, key, warm);
+        super::pso_async::submit_lazy_with(*ppv as usize, compute, job, key, warm, record);
     } else {
-        super::pso_async::submit(*ppv as usize, compute, job);
+        super::pso_async::submit_with(*ppv as usize, compute, job, record);
     }
     Some(hr)
 }
