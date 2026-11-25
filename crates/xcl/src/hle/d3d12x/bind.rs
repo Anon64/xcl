@@ -446,11 +446,15 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
 
 /// The `io` block of a two-pass stage: its user SGPRs (`compute_pass`: the MS layout) with the
 /// argument table at `table_at`, and the high dword of unified memory's base, as the other binds
-/// write it (the translated pair picks each access's memory window from it).
-fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize) -> Vec<u32> {
+/// write it (the translated pair picks each access's memory window from it). After the
+/// arguments, the addresses of the view heap and the sampler heap set (`heaps`) when the root
+/// signature has its shaders index them (`console_list::with_heaps`): the console's mesh
+/// stages take them there as its compute and graphics stages do (s23 / s24 for a mesh stage
+/// with three tables, a root view and two constants).
+fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize, heaps: [u32; 2]) -> Vec<u32> {
     let mut io = match layout {
-        Some(l) if compute_pass => console_list::user_data_ms(l, args, table_at),
-        Some(l) => console_list::user_data_gfx(l, args, table_at),
+        Some(l) if compute_pass => console_list::with_heaps(l, None, console_list::user_data_ms(l, args, table_at), heaps),
+        Some(l) => console_list::with_heaps(l, None, console_list::user_data_gfx(l, args, table_at), heaps),
         None if compute_pass => {
             let mut v = vec![0u32; 16];
             v[8] = table_at as u32;
@@ -477,7 +481,7 @@ unsafe fn bind_two_pass_stage(
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
-    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
@@ -488,7 +492,7 @@ unsafe fn bind_two_pass_stage(
         .map_or(0, |l| if compute_pass { l.inline_ms } else { l.inline_gfx } as usize)
         .min(args.len());
     let table_at = copy(&args[inline..])?;
-    let io = two_pass_io(layout.as_deref(), &args, table_at as u64, compute_pass, u.base());
+    let io = two_pass_io(layout.as_deref(), &args, table_at as u64, compute_pass, u.base(), heaps);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs_raw = if compute_pass { tp.compute_rs } else { tp.mesh_rs } as *mut c_void;
@@ -2134,12 +2138,54 @@ void main(uint t : SV_GroupIndex) {
         use crate::gpu::recomp::{IO_UMA_BASE_HI, KERNEL_SGPRS};
         let base = 0x4_0000_0000usize;
         for compute_pass in [true, false] {
-            let io = two_pass_io(None, &[], 0x4_1234_5600, compute_pass, base);
+            let io = two_pass_io(None, &[], 0x4_1234_5600, compute_pass, base, [0; 2]);
             assert_eq!(io.len(), KERNEL_SGPRS);
             assert_eq!(io[IO_UMA_BASE_HI], 4, "compute pass {compute_pass}");
         }
-        let io = two_pass_io(None, &[], 0x4_1234_5600, true, base);
+        let io = two_pass_io(None, &[], 0x4_1234_5600, true, base, [0; 2]);
         assert_eq!((io[8], io[9]), (0x1234_5600, 4));
+    }
+
+    /// The two passes get the addresses of the heaps set after their arguments, the view heap's
+    /// first, as `bind_abi`'s stages do (`console_list::with_heaps`): for the console's most
+    /// common mesh layout (three tables, a root view, two constants) the compute pass's s23 /
+    /// s24, the pixel shader's right after its arguments from s8.
+    #[test]
+    fn two_pass_heap_addresses_follow_the_arguments() {
+        use crate::gpu::recomp::IO_UMA_BASE_HI;
+        // RTS0 v2: three tables, a root SRV, two constants; the root signature's flags at 20
+        let layout = |flags: u32| {
+            let params = [(0u32, 0u32), (0, 0), (0, 0), (3, 0), (1, 2)];
+            let n = params.len() as u32;
+            let mut r = vec![2u32, n, 24, 0, 0, flags];
+            for (k, &(ty, _)) in params.iter().enumerate() {
+                r.extend([ty, 0, 24 + 12 * n + 12 * k as u32]);
+            }
+            for &(_, count) in &params {
+                r.extend([0, 0, count]);
+            }
+            let blob: Vec<u8> = r.iter().flat_map(|w| w.to_le_bytes()).collect();
+            console_list::layout_from_blob(&blob).unwrap()
+        };
+        let words = [0x11u32, 0x22, 0x33, 0x5000_0000, 0x7, 5, 6];
+        let args: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let heaps = [0x6000_0000, 0x6381_0000];
+        let io = |flags: u32, compute_pass: bool| two_pass_io(Some(&layout(flags)), &args, 0x4_0000_0200, compute_pass, 0x4_0000_0000, heaps);
+        // the compute pass: table at s[8:9], arguments from s16, the heaps at s23 / s24
+        let cs = io(0xC00, true);
+        assert_eq!((cs[8], cs[9]), (0x200, 4));
+        assert_eq!(&cs[16..23], &words);
+        assert_eq!(&cs[23..26], &[0x6000_0000, 0x6381_0000, 0]);
+        assert_eq!(cs[IO_UMA_BASE_HI], 4);
+        assert_eq!(&io(0x800, true)[23..25], &[0x6381_0000, 0], "the sampler heap's alone");
+        assert_eq!(&io(0x400, true)[23..25], &[0x6000_0000, 0], "the view heap's alone");
+        assert_eq!(io(0, true)[23], 0, "no flags: no addresses");
+        // the pixel shader: table at s[0:1], arguments from s8, the heaps after them
+        let ps = io(0xC00, false);
+        assert_eq!((ps[0], ps[1]), (0x200, 4));
+        assert_eq!(&ps[8..15], &words);
+        assert_eq!(&ps[15..18], &[0x6000_0000, 0x6381_0000, 0]);
+        assert_eq!(io(0, false)[15], 0, "no flags: no addresses");
     }
 
     #[test]
