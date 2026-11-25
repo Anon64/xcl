@@ -443,10 +443,12 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+type Work = Box<dyn FnOnce() + Send>;
+
+fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
     Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
+        let (tx, rx) = mpsc::channel::<Work>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
@@ -454,21 +456,66 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
-                // (released by the title meanwhile)
-                if p.orphan.load(Ordering::Acquire) {
-                    let _ = p.job.lock().unwrap().take();
-                    continue;
-                }
-                // (None: a bind took it and builds it itself)
-                let job = p.job.lock().unwrap().take();
-                if let Some(job) = job {
-                    build(&p, job, false);
-                }
+                let Ok(work) = next else { return };
+                work();
             });
         }
         Mutex::new(tx)
     })
+}
+
+fn enqueue(p: Arc<Pending>) {
+    let _ = queue().lock().unwrap().send(Box::new(move || {
+        // (released by the title meanwhile)
+        if p.orphan.load(Ordering::Acquire) {
+            let _ = p.job.lock().unwrap().take();
+            return;
+        }
+        // (None: a bind took it and builds it itself)
+        let job = p.job.lock().unwrap().take();
+        if let Some(job) = job {
+            build(&p, job, false);
+        }
+    }));
+}
+
+/// This thread is a backlog worker whose build nobody waits for (yet).
+fn build_is_backlog_only() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| {
+        let d = p.demand.lock().unwrap();
+        d.preload_thread != 0 && !d.wanted()
+    }))
+}
+
+/// The caller also drains its batch. Multiple workers can therefore build
+/// different chains without ever waiting for a free worker to start a piece.
+/// A backlog worker's build nobody waits for keeps its pieces on its own thread: helpers would go
+/// to the workers whose builds binds wait for (`queue`), ahead of them.
+pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
+    let count = jobs.len();
+    let jobs = Arc::new(Mutex::new(jobs.into_iter().enumerate().collect::<Vec<_>>()));
+    let (send, recv) = mpsc::channel();
+    let drain = move || loop {
+        let job = jobs.lock().unwrap().pop();
+        let Some((i, job)) = job else { return };
+        // (a piece that panics fails: its result is still sent, or the caller would wait for ever)
+        let _ = send.send((i, std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).unwrap_or(0)));
+    };
+    // the helpers build for this worker's pipeline: the title waiting for it waits for them too
+    let parent = BUILDING.with(|b| b.borrow().clone());
+    let width = if build_is_backlog_only() { 1 } else { count.min(crate::gpu::recomp::dxc::compile_threads()) };
+    for _ in 1..width {
+        let (drain, parent) = (drain.clone(), parent.clone());
+        let _ = queue().lock().unwrap().send(Box::new(move || {
+            let before = BUILDING.with(|b| b.replace(parent));
+            drain();
+            BUILDING.with(|b| *b.borrow_mut() = before);
+        }));
+    }
+    drain();
+    let mut results = vec![0; count];
+    for (i, result) in recv.iter().take(count) { results[i] = result; }
+    results
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -568,7 +615,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, warm
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = queue().lock().unwrap().send(p);
+        enqueue(p);
         return;
     }
     let known = used::known(key);
@@ -1317,6 +1364,45 @@ mod used_tests {
         Arc::new(Pending::new(Box::new(|| 0), false, true, key, None, 0))
     }
 
+    /// A backlog worker's build nobody waits for builds the pieces of its dispatch chain itself:
+    /// none of them goes to the workers whose builds binds wait for.
+    #[test]
+    fn a_build_ahead_keeps_its_pieces_on_its_own_thread() {
+        let p = pending_compute(0x5EED_C1A1);
+        p.demand.lock().unwrap().preload_thread = 1;
+        let before = BUILDING.with(|b| b.replace(Some(p.clone())));
+        let here = std::thread::current().id();
+        let jobs: Vec<Job> = (0..6)
+            .map(|_| {
+                Box::new(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    usize::from(std::thread::current().id() == here)
+                }) as Job
+            })
+            .collect();
+        let on_here = build_pieces(jobs);
+        BUILDING.with(|b| *b.borrow_mut() = before);
+        assert_eq!(on_here, vec![1; 6], "every piece on the backlog worker's thread");
+    }
+
+    /// A piece whose build panics fails (0), on the caller's thread or a helper's, and the
+    /// caller still gets every other piece.
+    #[test]
+    fn a_piece_that_panics_fails_and_the_others_are_built() {
+        let jobs: Vec<Job> = (0..8usize)
+            .map(|i| {
+                Box::new(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    if i % 2 == 1 {
+                        panic!("piece {i}");
+                    }
+                    i + 1
+                }) as Job
+            })
+            .collect();
+        assert_eq!(build_pieces(jobs), [1, 0, 3, 0, 5, 0, 7, 0]);
+    }
+
     /// Work from the backlog as its workers do (a translated one goes back for its build): the
     /// key and step of each piece, in order.
     fn drain(b: &mut Backlog, ahead: bool, builds: bool) -> Vec<(u64, &'static str)> {
@@ -1734,7 +1820,7 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                enqueue(p);
             }
             pso
         }
@@ -1973,7 +2059,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         return built(p);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = queue().lock().unwrap().send(p.clone());
+        enqueue(p.clone());
     }
     if p.late.load(Ordering::Acquire) {
         return pso;
@@ -2058,7 +2144,7 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
 /// stood in the queue behind them. Without the backlog (`XCL_PSO_PRELOAD=0`): to those workers.
 fn send_spared(p: Arc<Pending>, q: Option<&Preload>) {
     let Some(q) = q else {
-        let _ = queue().lock().unwrap().send(p);
+        enqueue(p);
         return;
     };
     let mut b = q.list.lock().unwrap();
