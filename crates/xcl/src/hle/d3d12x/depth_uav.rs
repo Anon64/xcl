@@ -123,6 +123,14 @@ static TWINS: AtomicUsize = AtomicUsize::new(0);
 static MADE: AtomicU64 = AtomicU64::new(0);
 static REDIRECTED: AtomicU64 = AtomicU64::new(0);
 static NULL_VIEWS: AtomicU64 = AtomicU64::new(0);
+/// ClearUnorderedAccessView* done on a twin, and not done because what the view names is not known.
+static UAV_CLEARS: AtomicU64 = AtomicU64::new(0);
+static CLEARS_NOT_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a twin is alive: the gate of the paths that record.
+pub(super) fn any() -> bool {
+    TWINS.load(Ordering::Relaxed) != 0
+}
 
 fn u32_at(x: &[u8; 0x38], o: usize) -> u32 {
     u32::from_le_bytes(x[o..o + 4].try_into().unwrap())
@@ -277,6 +285,48 @@ pub(super) fn null_view(why: &'static str) {
 #[cfg(test)]
 static NULL_REASONS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
+/// What a ClearUnorderedAccessView* goes to the PC with (`clear_target`).
+#[derive(Debug, PartialEq)]
+pub(super) enum Clear {
+    /// the resource the title gave
+    AsIs,
+    /// the twin the slot's view names
+    Twin(usize),
+    /// nothing: what the slot's view names is not known
+    NotDone,
+}
+
+/// ClearUnorderedAccessView* of `res` through a GPU slot whose UAV in the shared heap names
+/// `named` (`console_heap::names_of`; None: the slot is not in the shared heap). The PC clear of
+/// a view of a twin must name the twin: the depth buffer with the twin's view is an invalid pair.
+pub(super) fn clear_target(res: usize, named: Option<usize>) -> Clear {
+    if !any() {
+        return Clear::AsIs;
+    }
+    let Some(o) = OBJECTS.get(res) else { return Clear::AsIs };
+    let twins = o.cell.inner.lock().unwrap().twins.each_ref().map(|t| t.as_ref().map(|t| t.res.as_raw() as usize));
+    let c = clear_choice(twins, named);
+    match c {
+        Clear::Twin(_) => UAV_CLEARS.fetch_add(1, Ordering::Relaxed),
+        Clear::NotDone => CLEARS_NOT_DONE.fetch_add(1, Ordering::Relaxed),
+        Clear::AsIs => 0,
+    };
+    c
+}
+
+/// `clear_target` for a buffer with the twins `twins`: the twin when the view names one; not
+/// done when what it names is not known; else as it came (a null view, another resource).
+fn clear_choice(twins: [Option<usize>; 2], named: Option<usize>) -> Clear {
+    if twins.iter().all(Option::is_none) {
+        return Clear::AsIs;
+    }
+    match named {
+        None => Clear::NotDone,
+        Some(n) if twins.contains(&Some(n)) => Clear::Twin(n),
+        Some(_) => Clear::AsIs,
+    }
+}
+
 /// The stencil plane's twin of `key`: R8_TYPELESS with unordered access, of the buffer's size,
 /// array and mips, in UNORDERED_ACCESS. Made through `real::dev_create_committed_resource`:
 /// a PC resource, adopted, never in title memory.
@@ -370,6 +420,12 @@ pub(super) fn dsv_names(handle: usize) -> Option<usize> {
 #[cfg(test)]
 pub(super) fn counts() -> (u64, usize, u64, Vec<&'static str>) {
     (MADE.load(Ordering::Relaxed), TWINS.load(Ordering::Relaxed), REDIRECTED.load(Ordering::Relaxed), NULL_REASONS.lock().unwrap().clone())
+}
+
+/// (tests) UAV clears done on a twin, and not done.
+#[cfg(test)]
+pub(super) fn clears() -> (u64, u64) {
+    (UAV_CLEARS.load(Ordering::Relaxed), CLEARS_NOT_DONE.load(Ordering::Relaxed))
 }
 
 /// CreateDepthStencilView of `res` at `handle` with D3D12_DSV_FLAGS `flags`.
@@ -626,5 +682,24 @@ mod tests {
         assert_eq!((v.Format, v.ViewDimension, unsafe { v.Anonymous.Texture2DArray.ArraySize }), (DXGI_FORMAT_R8_UINT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY, 4));
         let v = twin_view(None, 1);
         assert_eq!((v.Format, v.ViewDimension, unsafe { v.Anonymous.Texture2D.PlaneSlice }), (DXGI_FORMAT_R8_UINT, D3D12_UAV_DIMENSION_TEXTURE2D, 0));
+    }
+
+    #[test]
+    fn the_resource_of_a_uav_clear_is_what_the_view_names() {
+        let (twin, buffer, other) = (0x7D00_0000_1000usize, 0x7D00_0000_2000usize, 0x7D00_0000_3000usize);
+        let twinned = [None, Some(twin)];
+        assert_eq!(clear_choice(twinned, Some(twin)), Clear::Twin(twin), "the view names the twin");
+        assert_eq!(clear_choice(twinned, Some(0)), Clear::AsIs, "a null view");
+        assert_eq!(clear_choice(twinned, Some(other)), Clear::AsIs, "a view of another resource");
+        assert_eq!(clear_choice(twinned, None), Clear::NotDone, "a slot outside the shared heap: not known");
+        // a buffer without a twin, whatever the slot
+        for named in [None, Some(0), Some(buffer)] {
+            assert_eq!(clear_choice([None, None], named), Clear::AsIs, "{named:?}");
+        }
+        // a buffer XCL does not keep, or one without a twin
+        assert!(register(buffer, &desc(3, 64, 64, 45, 1, 6), None, 0x10));
+        assert_eq!(clear_target(buffer, None), Clear::AsIs);
+        assert_eq!(clear_target(other, None), Clear::AsIs);
+        forget(buffer);
     }
 }

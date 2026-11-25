@@ -4722,9 +4722,11 @@ fn uav_clear_handles(gpu: Option<super::console_heap::Slot>, cpu: Option<super::
 
 /// command list #53 / #54 ClearUnorderedAccessViewUint / Float(GPU handle, CPU handle,
 /// resource, values[4], rects, rect list) (PC #49 / #50): console handles are addresses of
-/// console heap slots (heap #9 / #10), not PC descriptors
+/// console heap slots (heap #9 / #10), not PC descriptors. A depth buffer whose UAV views are
+/// views of its twin (`depth_uav`) is cleared through the twin the GPU slot's view names.
 unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usize, values: *const c_void, n: u32, rects: *const windows::Win32::Foundation::RECT) {
-    let (gpu, cpu) = match uav_clear_handles(super::console_heap::slot(gpu), super::console_heap::slot(cpu)) {
+    let gpu_slot = super::console_heap::slot(gpu);
+    let (gpu, cpu) = match uav_clear_handles(gpu_slot, super::console_heap::slot(cpu)) {
         UavClearHandles::Console { gpu, cpu } => (gpu, cpu),
         UavClearHandles::Pc => (gpu, cpu),
         UavClearHandles::Unusable => {
@@ -4735,6 +4737,15 @@ unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usi
             return;
         }
     };
+    let mut res = res;
+    if super::depth_uav::any() {
+        let named = gpu_slot.filter(|s| s.shared_srv != 0).map(|s| super::console_heap::names_of(&s).1);
+        match super::depth_uav::clear_target(res, named) {
+            super::depth_uav::Clear::AsIs => {}
+            super::depth_uav::Clear::Twin(t) => res = t,
+            super::depth_uav::Clear::NotDone => return,
+        }
+    }
     pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
 }
 
