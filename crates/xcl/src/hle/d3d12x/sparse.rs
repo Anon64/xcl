@@ -2531,8 +2531,8 @@ impl State {
 /// Window tiles asked for by `map_mirror`: each is queued once, until it is forgotten
 /// (`forget_mirrors`) or left out (`State::map_mirrors`).
 static MIRROR_ASKED: super::sharded::Sharded<()> = super::sharded::Sharded::new();
-/// How often a tile left `MIRROR_ASKED` (a view that went, a tile given back with its source, an
-/// ask that found no source): whoever remembers having asked (`view_want`'s threads) asks again.
+/// How often a tile left `MIRROR_ASKED` (a view that went, a tile given back with its source):
+/// whoever remembers having asked (`view_want`'s threads) asks again.
 static MIRROR_FORGOTTEN: AtomicU64 = AtomicU64::new(0);
 
 /// Counts up whenever a tile that was asked for may be asked for again (`map_mirror` would
@@ -2545,6 +2545,8 @@ pub fn mirror_asks_forgotten() -> u64 {
 fn forget_ask(t: usize) {
     if MIRROR_ASKED.remove(t).is_some() {
         MIRROR_FORGOTTEN.fetch_add(1, Ordering::Release);
+        #[cfg(test)]
+        tests::ASKS_FORGOTTEN.with(|n| n.set(n.get() + 1));
     }
 }
 /// The tiles asked for that no submit has taken yet. A lock of its own: `map_mirror` is called
@@ -2701,6 +2703,14 @@ pub fn forget_mirrors(a: usize, n: usize) {
         return;
     }
     let end = a.saturating_add(n);
+    // (out of the queue before out of the set: an ask in between finds the tile still asked
+    // for, or stays queued, and the count after it has the thread ask again. The other way
+    // round, an ask in between went with the queue and left the tile asked for, never mapped)
+    MIRROR_ASKS.lock().unwrap().retain(|&t| !(t < end && t + TILE > a));
+    #[cfg(test)]
+    if let Some(f) = tests::BETWEEN_FORGETS.with(|f| f.take()) {
+        f();
+    }
     let mut asked: Vec<usize> = Vec::new();
     MIRROR_ASKED.for_each(|t, _| {
         if t < end && t + TILE > a {
@@ -2710,7 +2720,6 @@ pub fn forget_mirrors(a: usize, n: usize) {
     for t in asked {
         forget_ask(t);
     }
-    MIRROR_ASKS.lock().unwrap().retain(|&t| !(t < end && t + TILE > a));
     if lock_sources(&SOURCES).runs.is_empty() {
         return;
     }
@@ -2924,7 +2933,11 @@ impl State {
             }
             match Some(g).filter(|g| !self.mapped.contains_key(g) && self.window_index(*g).is_some()).and_then(mirror_source_tile) {
                 Some(c) => want.push((g, c)),
-                None => forget_ask(g),
+                // (not counted: an address left out at every submit would empty every thread's
+                // memory of its asks at every submit; a pair made later changes the views)
+                None => {
+                    MIRROR_ASKED.remove(g);
+                }
             }
         }
         if want.is_empty() {
@@ -3078,7 +3091,13 @@ impl State {
         for w in gone {
             self.drop_mirror(w);
         }
-        self.asks.retain(|&w| !touches(w) && !mirror_source_tile(w).is_some_and(touches));
+        self.asks.retain(|&w| {
+            let keep = !touches(w) && !mirror_source_tile(w).is_some_and(touches);
+            if !keep {
+                forget_ask(w);
+            }
+            keep
+        });
         if self.parked.len() >= PARKED_MAX && self.flush_parked() {
             self.retire_free_pools();
         }
@@ -3653,6 +3672,11 @@ mod tests {
         /// Run by `take_asks` on this thread between the look up of the asked tiles' pairs and
         /// their link (once)
         pub(super) static BEFORE_LINK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+        /// Run by `forget_mirrors` on this thread between dropping the queued asks and the asked
+        /// set's tiles (once)
+        pub(super) static BETWEEN_FORGETS: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+        /// The asks `forget_ask` counted on this thread (`MIRROR_FORGOTTEN` is every test's)
+        pub(super) static ASKS_FORGOTTEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     /// The runs of the tiles mapped, made from all of them (but those over a CPU view: their
@@ -5122,6 +5146,75 @@ mod tests {
         forget_mirrors(AT, 4 * TILE);
         assert!(!MIRROR_ASKED.contains(AT) && !MIRROR_ASKS.lock().unwrap().contains(&AT), "forgotten tiles may be asked for again");
         assert!(mirror_asks_forgotten() >= before + 4, "whoever remembers having asked for them is told");
+    }
+
+    /// A thread asks for a tile while `forget_mirrors` forgets it: once the forget is done the
+    /// tile is queued or may be asked for again, and the thread is told to. Before, the asked set
+    /// lost the tile first, the ask in between queued it anew and the queue lost it after: asked
+    /// for, in no queue, never mapped (the GPU read zeros there).
+    #[test]
+    fn a_tile_asked_for_while_it_is_forgotten_is_not_lost() {
+        // (an address nothing reserves: only the asking is looked at)
+        const AT: usize = 0x7ff3_0010_0000;
+        assert_eq!(map_mirror(AT, TILE), 1);
+        let between = std::rc::Rc::new(std::cell::Cell::new(None));
+        let b = between.clone();
+        BETWEEN_FORGETS.with(|f| f.set(Some(Box::new(move || b.set(Some(map_mirror(AT, TILE)))))));
+        let (counted, before) = (ASKS_FORGOTTEN.with(|n| n.get()), mirror_asks_forgotten());
+        forget_mirrors(AT, TILE);
+        assert_eq!(between.get(), Some(0), "asked for in between: still asked for, not queued anew");
+        assert_eq!(ASKS_FORGOTTEN.with(|n| n.get()), counted + 1, "the forget after it is counted");
+        assert!(mirror_asks_forgotten() > before);
+        let queued = MIRROR_ASKS.lock().unwrap().contains(&AT);
+        assert!(!MIRROR_ASKED.contains(AT) || queued, "asked for and in no queue: never mapped");
+        assert_eq!(map_mirror(AT, TILE), 1, "asked for again: queued");
+        forget_mirrors(AT, TILE);
+    }
+
+    /// An asked tile that `take_asks` leaves out (no pair: here past the GPU view's span) leaves
+    /// the asked set uncounted, and may be asked for again. Counted, an address bound at every
+    /// draw emptied every thread's memory of its asks at every submit, and every thread asked
+    /// again.
+    #[test]
+    fn an_ask_left_out_is_not_counted_and_may_be_asked_for_again() {
+        unsafe {
+            let Some(mut v) = Views::new(127) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let g = v.w + 127 * TILE;
+            assert_eq!(cpu_of(g), g, "no pair past the views");
+            assert_eq!(map_mirror(g + 0x40, 0x100), 1);
+            // (taken by the test's state as a submit takes them; other tests' asks stay queued)
+            MIRROR_ASKS.lock().unwrap().retain(|&t| t != g);
+            v.s.asks.push(g);
+            let counted = ASKS_FORGOTTEN.with(|n| n.get());
+            v.s.map_mirrors();
+            assert!(v.s.asks.is_empty() && v.s.mirror_src.is_empty() && !v.s.mapped.contains_key(&g), "left out");
+            assert_eq!(ASKS_FORGOTTEN.with(|n| n.get()), counted, "not counted");
+            assert_eq!(map_mirror(g, TILE), 1, "asked for again");
+            MIRROR_ASKS.lock().unwrap().retain(|&t| t != g);
+            MIRROR_ASKED.remove(g);
+        }
+    }
+
+    /// An ask a submit took that `forget_mirrors_in` drops (its CPU view forgotten) may be asked
+    /// for again, and the threads that remember asking for it are told. Before, it stayed in the
+    /// asked set: asked for again, it was not queued.
+    #[test]
+    fn an_ask_dropped_by_a_forget_may_be_asked_for_again() {
+        unsafe {
+            let Some(mut v) = Views::new(131) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let (w, c) = (v.w, v.c);
+            assert_eq!(map_mirror(w + 0x40, 0x100), 1);
+            MIRROR_ASKS.lock().unwrap().retain(|&t| t != w);
+            v.s.asks.push(w);
+            let (counted, before) = (ASKS_FORGOTTEN.with(|n| n.get()), mirror_asks_forgotten());
+            v.s.forget_mirrors_in(c, c + TILE);
+            assert!(v.s.asks.is_empty(), "the ask over the CPU tile forgotten goes");
+            assert_eq!(ASKS_FORGOTTEN.with(|n| n.get()), counted + 1, "and is counted");
+            assert!(mirror_asks_forgotten() > before);
+            assert_eq!(map_mirror(w, TILE), 1, "asked for again");
+            MIRROR_ASKS.lock().unwrap().retain(|&t| t != w);
+            MIRROR_ASKED.remove(w);
+        }
     }
 
     /// Past `mirror_cap` tiles over CPU views get no video memory (counted once each); room
