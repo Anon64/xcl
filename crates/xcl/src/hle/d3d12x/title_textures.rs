@@ -855,7 +855,9 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
         );
     }
     let t1 = std::time::Instant::now();
-    own_work(|| refresh_once(queue, !(old && look_skip())));
+    // (XCL's copy of the frame to its window reads no memory of the title)
+    let look = !(old && look_skip()) && !super::present::presenting();
+    own_work(|| refresh_once(queue, look));
     super::submit_cost::refresh(t1.elapsed());
 }
 
@@ -1448,8 +1450,11 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
             // a presented frame where ~3 MB had changed, and the submits waited here.
             if unchanged_skip() {
+                let t = std::time::Instant::now();
                 let h = content_hash(&title_bytes(va, tex.size() as usize));
-                if same_as_last_upload(r.as_raw() as usize, h) {
+                let same = same_as_last_upload(r.as_raw() as usize, h);
+                super::submit_cost::texture_compared(tex.size() as usize, same, t.elapsed());
+                if same {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
                         crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
@@ -1461,7 +1466,9 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
             bytes += tex.size() as usize;
             picked.push((r, va, tex, states));
         }
+        let t_detile = std::time::Instant::now();
         let subs = subresources_of_all(&picked, bytes);
+        let detile = t_detile.elapsed();
         let mut batch = Vec::with_capacity(picked.len());
         for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
@@ -1471,6 +1478,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        let t_submit = std::time::Instant::now();
         if let Some(tq) = title_queue_for(dev, title) {
             match own_work(|| submit_on_title_queue(dev, &tq, &batch)) {
                 Ok(failed) => {
@@ -1481,6 +1489,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
                 }
                 Err(e) => warn(&e),
             }
+            super::submit_cost::textures_uploaded(batch.len(), bytes, detile, t_submit.elapsed());
             continue;
         }
         let queue = match upload_queue(dev, device) {
@@ -1502,6 +1511,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
             }
             Err(e) => warn(&e),
         }
+        super::submit_cost::textures_uploaded(batch.len(), bytes, detile, t_submit.elapsed());
     }
 }
 
