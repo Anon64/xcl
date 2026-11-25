@@ -927,9 +927,16 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
 unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty: &mut Vec<usize>, page: &mut u32) {
     let end = base + size;
     let mut at = base;
+    // (`XCL_LOOK_STATS=2`: each call timed, for the look split)
+    let split = super::look_stats::deep();
     while at < end {
         let mut n = buf.len();
-        if GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page) != 0 {
+        let t = split.then(std::time::Instant::now);
+        let failed = GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page) != 0;
+        if let Some(t) = t {
+            super::look_stats::watch_call(t.elapsed(), end - at, if failed { 0 } else { n });
+        }
+        if failed {
             break;
         }
         dirty.extend(buf[..n].iter().map(|&p| p as usize));
