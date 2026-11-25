@@ -80,6 +80,8 @@ struct Inner {
 /// UNORDERED_ACCESS.
 struct Twin {
     res: ID3D12Resource,
+    /// its number in the log (`#n`)
+    n: u64,
 }
 
 // D3D12 resources are free-threaded
@@ -249,9 +251,9 @@ pub(super) unsafe fn resolve_uav(dev: *mut c_void, res: *mut c_void, rd: Option<
                 let Some(t) = make_twin(dev, &key) else { return Resolve::Null("the twin could not be made") };
                 TWINS.fetch_add(1, Ordering::Relaxed);
                 let raw = t.as_raw();
-                inner.twins[1] = Some(Twin { res: t });
-                o.cell.twinned.store(true, Ordering::Relaxed);
                 let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+                inner.twins[1] = Some(Twin { res: t, n });
+                o.cell.twinned.store(true, Ordering::Relaxed);
                 if n <= 8 || n.is_power_of_two() {
                     crate::xlog_info!(
                         "D3D12.X: depth UAV twin #{n}: the stencil plane of a {}x{}x{} depth buffer (PC format {}, console format {}) at {:#x} is an R8 texture; the buffer was made in state {:#x}",
@@ -325,6 +327,67 @@ fn clear_choice(twins: [Option<usize>; 2], named: Option<usize>) -> Clear {
         Some(n) if twins.contains(&Some(n)) => Clear::Twin(n),
         Some(_) => Clear::AsIs,
     }
+}
+
+/// `XCL_DUMP_TARGETS`: every twin alive, with its tag in the dump ("twin<n> <plane>"). Each
+/// rests in UNORDERED_ACCESS.
+pub(super) fn twins_to_dump() -> Vec<(String, ID3D12Resource)> {
+    if !any() {
+        return Vec::new();
+    }
+    let cells: Vec<Arc<Cell>> = CELLS.lock().unwrap().as_ref().map_or(Vec::new(), |m| m.values().filter(|c| c.twinned.load(Ordering::Relaxed)).cloned().collect());
+    let mut out = Vec::new();
+    for c in cells {
+        let inner = c.inner.lock().unwrap();
+        for (t, plane) in inner.twins.iter().zip(["depth", "stencil"]) {
+            if let Some(t) = t {
+                out.push((format!("twin{} {plane}", t.n), t.res.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// `XCL_DUMP_TARGETS`: what the twin dumped as `tag` (`twins_to_dump`) into the readback buffer
+/// `rb` at `fp` holds: its most frequent values, how many differ and the share of zeros.
+pub(super) unsafe fn log_values(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, tag: &str) {
+    let mut p: *mut c_void = std::ptr::null_mut();
+    if rb.Map(0, None, Some(&mut p)).is_err() || p.is_null() {
+        return;
+    }
+    let f = &fp.Footprint;
+    let len = (rb.GetDesc().Width as usize).saturating_sub(fp.Offset as usize);
+    let data = std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize), len);
+    let counts = byte_counts(data, f.Width as usize, f.Height as usize, f.RowPitch as usize);
+    rb.Unmap(0, None);
+    let (top, distinct, zero) = most_frequent(&counts);
+    let (n, plane) = tag.strip_prefix("twin").and_then(|t| t.split_once(' ')).unwrap_or((tag, ""));
+    let values = top.iter().map(|(v, c)| format!("{v} ×{c}")).collect::<Vec<_>>().join(", ");
+    crate::xlog_info!("D3D12.X: target dump: depth UAV twin #{n} ({}x{}, {plane}): {values} ({distinct} distinct values, {zero:.1} % zero)", f.Width, f.Height);
+}
+
+/// Texels by byte value of a `w`x`h` 8-bit image whose rows start `pitch` bytes apart (the
+/// padding after each row is not counted; a short buffer ends the count).
+fn byte_counts(data: &[u8], w: usize, h: usize, pitch: usize) -> [u64; 256] {
+    let mut c = [0u64; 256];
+    for y in 0..h {
+        let Some(row) = data.get(y * pitch..y * pitch + w) else { break };
+        for &v in row {
+            c[v as usize] += 1;
+        }
+    }
+    c
+}
+
+/// The eight most frequent values with their counts (most first; equal counts: the smaller
+/// value first), the number of distinct values and the share of zeros in %.
+fn most_frequent(c: &[u64; 256]) -> (Vec<(u8, u64)>, usize, f64) {
+    let mut v: Vec<(u8, u64)> = (0..256).filter(|&i| c[i] != 0).map(|i| (i as u8, c[i])).collect();
+    let distinct = v.len();
+    let total: u64 = c.iter().sum();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v.truncate(8);
+    (v, distinct, if total == 0 { 0.0 } else { c[0] as f64 * 100.0 / total as f64 })
 }
 
 /// The stencil plane's twin of `key`: R8_TYPELESS with unordered access, of the buffer's size,
@@ -701,5 +764,25 @@ mod tests {
         assert_eq!(clear_target(buffer, None), Clear::AsIs);
         assert_eq!(clear_target(other, None), Clear::AsIs);
         forget(buffer);
+    }
+
+    #[test]
+    fn the_values_of_a_twin_are_counted_by_row_pitch() {
+        // 3x2 texels, rows 8 bytes apart: the padding (0xEE) is not counted
+        let data = [0, 8, 8, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 7, 8, 0, 0xEE];
+        let c = byte_counts(&data, 3, 2, 8);
+        assert_eq!((c[0], c[7], c[8], c[0xEE]), (2, 1, 3, 0));
+        let (top, distinct, zero) = most_frequent(&c);
+        assert_eq!((top, distinct), (vec![(8, 3), (0, 2), (7, 1)], 3));
+        assert!((zero - 100.0 * 2.0 / 6.0).abs() < 1e-9, "{zero}");
+        // a buffer shorter than the rows it should hold: the rows that are there
+        assert_eq!(byte_counts(&data[..10], 3, 2, 8).iter().sum::<u64>(), 3);
+        // ten values once each and 200 three times: 200 first, then the smaller values, eight in all
+        let mut c = [0u64; 256];
+        (1..=10).for_each(|v| c[v] = 1);
+        c[200] = 3;
+        let (top, distinct, zero) = most_frequent(&c);
+        assert_eq!((top, distinct, zero), (vec![(200, 3), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1)], 11, 0.0));
+        assert_eq!(most_frequent(&[0; 256]), (vec![], 0, 0.0), "nothing counted");
     }
 }
