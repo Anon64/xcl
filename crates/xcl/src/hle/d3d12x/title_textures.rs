@@ -1671,14 +1671,21 @@ unsafe fn sample_fingerprint(src: usize, size: usize) -> u64 {
     content_hash(&mix)
 }
 
-/// Record baseline fingerprints for unwatched textures queued into `todo` so late streaming writes
-/// into mapped physical pages are caught at subsequent frame milestones.
+/// Record baseline fingerprints for unwatched textures that go up whole in `todo` so late streaming
+/// writes into mapped physical pages are caught at subsequent frame milestones.
 unsafe fn seed_stream_recheck(todo: &[Due], watched: &[(usize, usize)], frame: u64) {
     if !stream_recheck_enabled() || todo.is_empty() {
         return;
     }
     let mut seeded = Vec::new();
     for d in todo {
+        // A partial upload sends only the written pages it knows of, or nothing when they are
+        // unchanged, so the PC texture does not hold what its memory holds now: the baseline of
+        // the last whole upload stays, and so does its schedule (moving the schedule on every
+        // partial upload would keep a texture written every few frames from reaching a milestone).
+        if !d.whole {
+            continue;
+        }
         let size = d.tex.size() as usize;
         if size == 0 || range_is_fully_watched(d.src, size, watched) {
             continue;
@@ -3479,6 +3486,8 @@ pub(super) mod tests {
 
     #[test]
     fn stream_recheck_schedule_catches_late_writes_and_resets_milestones() {
+        // (STREAM_RECHECK is shared with the other stream recheck test)
+        let _guard = TEST_LOCK.lock().unwrap();
         let desc = console_desc(3, 256, 256, 1, 1, 28, 0x109); // 256 KiB RGBA8
         let tex = Arc::new(xg::Texture::new(&desc).expect("layout"));
         let size = tex.size() as usize;
@@ -3564,6 +3573,111 @@ pub(super) mod tests {
 
         forget(res_id);
         forget(gpu_res_id);
+    }
+
+    /// A partial upload does not replace the baseline of the last whole upload: an unwatched write
+    /// it did not send is still caught at the milestone.
+    #[test]
+    fn stream_recheck_keeps_the_whole_upload_baseline_over_partial_uploads() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            // (software adapter only: the resource only gives the Due its key)
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let hp = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 0x1_0000,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut res: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, None, &mut res).unwrap();
+            let res = res.unwrap();
+            let res_id = res.as_raw() as usize;
+
+            let desc = console_desc(3, 256, 256, 1, 1, 28, 0x109); // 256 KiB RGBA8
+            let tex = Arc::new(xg::Texture::new(&desc).expect("layout"));
+            let size = tex.size() as usize;
+            let mut backing = vec![0u8; size];
+            let va = backing.as_ptr() as usize;
+            let entry = Entry {
+                device: 0,
+                va,
+                src: va,
+                in_gpu_view: false,
+                tex: Arc::clone(&tex),
+                states: vec![D3D12_RESOURCE_STATE_COMMON],
+                pending: false,
+                gpu_written: false,
+                placed: false,
+                unmapped: false,
+                seq: 0,
+                known: Default::default(),
+                target: false,
+            };
+            {
+                let mut t = TEXTURES.lock().unwrap();
+                let (d, _) = t.insert(res_id, entry);
+                adjust_pending(d);
+            }
+            let due = |whole: bool| Due {
+                res: res.clone(),
+                device: 0,
+                src: va,
+                tex: Arc::clone(&tex),
+                states: vec![D3D12_RESOURCE_STATE_COMMON],
+                known: Default::default(),
+                whole,
+                again: texture_upload::Change::None,
+                target: false,
+            };
+
+            // The whole upload at frame 0 sets the baseline.
+            seed_stream_recheck(&[due(true)], &[], 0);
+            let fp0 = sample_fingerprint(va, size);
+            assert_eq!(STREAM_RECHECK.lock().unwrap().get(&res_id).copied(), Some(StreamRecheck { base_frame: 0, stage: 0, last_fp: fp0 }));
+
+            // An unwatched page is written, then a partial upload (of other pages) runs at frame 2.
+            backing[size - 16] = 0xCD;
+            seed_stream_recheck(&[due(false)], &[], 2);
+            assert_eq!(
+                STREAM_RECHECK.lock().unwrap().get(&res_id).copied(),
+                Some(StreamRecheck { base_frame: 0, stage: 0, last_fp: fp0 }),
+                "a partial upload must not replace the baseline or move the schedule"
+            );
+
+            // At frame 6 milestone 0 is due from either base frame, and it finds what the GPU does
+            // not hold yet.
+            recheck_streamed_unwatched_at(&[], 6);
+            {
+                let mut t = TEXTURES.lock().unwrap();
+                let e = t.by_res.get_mut(&res_id).unwrap();
+                assert!(e.pending, "the unwatched write the partial upload did not send must queue the texture");
+                e.pending = false;
+                PENDING.fetch_sub(1, Ordering::Relaxed);
+            }
+
+            forget(res_id);
+        }
     }
 
     /// `read_committed` copies committed pages and leaves uncommitted gaps zeroed, including
