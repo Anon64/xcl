@@ -5874,6 +5874,8 @@ unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value
 /// Fence::Signal (CPU)
 unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT {
     let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Fence", "Signal")));
+    // (work that waits for it may use memory committed since it was submitted)
+    super::sparse::send_pending();
     let hr = f(this, value);
     super::fence_x::note_cpu_signal(this as usize);
     hr

@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use windows::core::Interface;
@@ -950,6 +950,8 @@ impl State {
         }
         if self.pending.len() >= PENDING_MAX {
             self.flush_pending();
+        } else if !self.pending.is_empty() {
+            pending_soon();
         }
     }
 
@@ -1760,7 +1762,7 @@ pub(super) unsafe fn pc_execute(queue: &ID3D12CommandQueue, list: &ID3D12Graphic
 
 /// copies back submitted and not landed yet, and whether any ran on the readback queue
 static RB_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static RB_ASYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RB_ASYNC: AtomicBool = AtomicBool::new(false);
 
 /// Whether copies back land asynchronously (any ran on the readback queue so far)
 pub fn readbacks_async() -> bool {
@@ -1965,6 +1967,60 @@ pub unsafe fn decommitted(a: usize, n: usize) {
         return;
     };
     s.decommit_range(a, n);
+}
+
+/// Tiles wait for their mapping call (`State::pending`; read without the lock).
+static PENDING: AtomicBool = AtomicBool::new(false);
+static PENDING_WAKE: (Mutex<()>, std::sync::Condvar) = (Mutex::new(()), std::sync::Condvar::new());
+
+/// A tile's mapping was put off: sent by the thread started here in 2 ms, unless something sends
+/// it before. Work already on the GPU can reach the memory without another submit (it waits for a
+/// value the CPU writes).
+fn pending_soon() {
+    if PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-tile-maps".into()).spawn(|| loop {
+            {
+                let mut g = PENDING_WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
+                while !PENDING.load(Ordering::Acquire) {
+                    g = PENDING_WAKE.1.wait(g).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            if PENDING.load(Ordering::Acquire) {
+                send_pending();
+            }
+        });
+    });
+    drop(PENDING_WAKE.0.lock().unwrap_or_else(|e| e.into_inner()));
+    PENDING_WAKE.1.notify_one();
+}
+
+/// The mappings put off go to the GPU now: the CPU is about to signal a fence, and work submitted
+/// before the title committed the memory may run because of it.
+pub fn send_pending() {
+    if !PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    // (a signal under the state's lock must not wait for it; the thread sends them then)
+    let t0 = std::time::Instant::now();
+    loop {
+        match STATE.try_lock() {
+            Ok(mut g) => {
+                PENDING.store(false, Ordering::Release);
+                if let Some(s) = g.as_mut() {
+                    unsafe { s.flush_pending() };
+                }
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return PENDING.store(false, Ordering::Release),
+            Err(std::sync::TryLockError::WouldBlock) if t0.elapsed().as_millis() >= 2 => return,
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+        }
+    }
 }
 
 impl State {
@@ -2197,6 +2253,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let Some(s) = g.as_mut() else { return };
     s.drain_readbacks(Drain::Finished);
     // the title's work sees what was committed mapped …
+    PENDING.store(false, Ordering::Release);
     s.flush_pending();
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
@@ -2507,6 +2564,7 @@ mod tests {
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
+                pending: Vec::new(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2527,6 +2585,8 @@ mod tests {
             };
             s.commit_range(base, TILE);
             assert!(s.mapped.contains_key(&base));
+            // (as before the title's submit)
+            s.flush_pending();
             std::ptr::write_bytes(base as *mut u8, 0, 256);
 
             // the title's queue: blocked on a fence nothing has signalled yet, then a copy of
@@ -2595,6 +2655,39 @@ mod tests {
         drop(held);
         asked.join().unwrap();
         assert!(answered, "queue() waited for the sparse state's lock");
+    }
+
+    /// A mapping put off does not wait for the title's next submit: a CPU signal sends it, and
+    /// without one it goes a few milliseconds after the commit (work the title submitted before
+    /// may reach the memory once a value the CPU writes lets it run).
+    #[test]
+    fn a_mapping_put_off_is_sent_without_a_submit() {
+        if super::super::backend() != super::super::Backend::Real {
+            return;
+        }
+        unsafe {
+            let _ = super::super::real::device_raw();
+            let Some((at, len)) = alloc(64 * TILE, TILE) else { return };
+            let put_off = || STATE.lock().unwrap().as_ref().is_some_and(|s| s.pending.iter().any(|t| (at..at + len).contains(t)));
+            let mapped = || STATE.lock().unwrap().as_ref().is_some_and(|s| (at..at + len).step_by(TILE).all(|t| s.mapped.contains_key(&t)));
+            send_pending();
+            assert!(mapped() && !put_off(), "a CPU signal sends what is put off");
+            decommitted(at, len);
+            VirtualFree(at as *mut c_void, len, MEM_DECOMMIT);
+            // (as a submit does: the tiles unmapped, so the next commit needs mappings again)
+            if let Some(s) = STATE.lock().unwrap().as_mut() {
+                s.flush_parked();
+            }
+            assert!(!VirtualAlloc(at as *const c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null());
+            committed(at, len);
+            let t0 = std::time::Instant::now();
+            while put_off() {
+                assert!(t0.elapsed().as_secs() < 5, "nothing sent the mappings");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(mapped());
+            assert!(free(at));
+        }
     }
 
     /// A block freed on one thread while another allocates: its address goes back to the
@@ -3059,10 +3152,22 @@ mod tests {
             // the buffer is gone and it was decommitted
             *s.pinned.entry(tile).or_default() += 1;
             let at = base + TILE;
+            assert!(s.pending.contains(&at), "its mapping is not sent yet");
             s.decommit_range(at, TILE);
             assert!(!s.flush_parked(), "nothing to unmap");
             assert_eq!(s.kept.get(&at), Some(&tile));
             assert!(!s.free.contains(&tile));
+            // kept before its mapping was sent: that stays pending, and the commit that takes the
+            // tile back sends it
+            let v = s.value;
+            s.flush_pending();
+            assert_eq!((s.value, &s.pending), (v, &vec![at]), "no mapping of a kept tile");
+            s.commit_range(at, TILE);
+            s.flush_pending();
+            assert!(s.value > v && s.pending.is_empty(), "mapped with the commit");
+            s.decommit_range(at, TILE);
+            assert!(!s.flush_parked(), "nothing to unmap");
+            assert_eq!(s.kept.get(&at), Some(&tile));
             let v = s.value;
             s.to_zero.clear();
             s.commit_range(at, TILE);
