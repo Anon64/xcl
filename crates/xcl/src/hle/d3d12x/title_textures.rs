@@ -1136,6 +1136,16 @@ pub fn note_known_write(at: usize, len: usize) {
     KNOWN.lock().unwrap().push((at, len));
 }
 
+#[cfg(test)]
+pub(super) fn known_in(at: usize, len: usize) -> Vec<(usize, usize)> {
+    KNOWN.lock().unwrap().iter().copied().filter(|r| r.0 >= at && r.0 < at + len).collect()
+}
+
+#[cfg(test)]
+pub(super) fn forget_known_in(at: usize, len: usize) {
+    KNOWN.lock().unwrap().retain(|r| r.0 < at || r.0 >= at + len);
+}
+
 /// The pages of the known writes, added to `dirty`.
 fn take_known(dirty: &mut Vec<usize>) {
     let ranges = std::mem::take(&mut *KNOWN.lock().unwrap());
@@ -1237,6 +1247,7 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
     let t_recheck = std::time::Instant::now();
     recheck_gpu_view_sources();
     retry_failed();
+    super::file_reads::take_finished();
     super::submit_cost::recheck(t_recheck.elapsed());
     let mut page = 0x1000u32;
     let t_ranges = std::time::Instant::now();
