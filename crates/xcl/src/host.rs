@@ -50,7 +50,6 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut own_cost = crate::hle::api_cost::submitter_totals();
             let mut views = crate::hle::d3d12x::view_want::totals();
             let mut tile_calls = crate::hle::d3d12x::sparse::tile_calls();
-            let mut said_budget = false;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -107,8 +106,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
                 let mb = |b: u64| b >> 20;
+                // (at the end: tools read the line's beginning; the guard script reads the budget)
+                let budget_text = if budget != 0 { format!("; video memory budget {} MB", mb(budget)) } else { String::new() };
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped){budget_text}",
                     mb(private as u64),
                     mb(local),
                     mb(non_local),
@@ -122,13 +123,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 // past the budget Windows moves the process's video memory off the card and
                 // every frame pays for bringing it back; a run at the card's limit is also
                 // where the driver gave up (the guard script ends a run that stays there)
-                match crate::hle::d3d12x::real::over_video_budget(local, budget) {
-                    Some(over) => crate::xlog_warn!("video memory: {} MB in use, {} MB over the budget of {} MB Windows gives this process", mb(local), mb(over), mb(budget)),
-                    None if budget != 0 && !said_budget => {
-                        said_budget = true;
-                        crate::xlog_info!("video memory: the budget Windows gives this process is {} MB", mb(budget));
-                    }
-                    None => {}
+                if let Some(over) = crate::hle::d3d12x::real::over_video_budget(local, budget) {
+                    crate::xlog_warn!("video memory: {} MB in use, {} MB over the budget of {} MB Windows gives this process", mb(local), mb(over), mb(budget));
                 }
                 last = now;
             }
