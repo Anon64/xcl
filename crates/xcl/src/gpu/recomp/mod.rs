@@ -669,6 +669,14 @@ pub fn dispatch_loop_budget(groups: [u32; 3]) -> u32 {
     (DISPATCH_LOOP_PASSES / n).clamp(1, u32::MAX as u64) as u32
 }
 
+/// Whether dispatches pass `dispatch_loop_budget` (`XCL_DISPATCH_LOOP_BUDGET=0`, read once: they
+/// leave `IO_LOOP_BUDGET` at 0 and every loop has the lane's 65 536 passes in both translators,
+/// as before, to compare).
+pub fn dispatch_loop_budget_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DISPATCH_LOOP_BUDGET").map_or(true, |v| v.trim() != "0"))
+}
+
 /// Structured code longer than this many bytes per byte of program falls back to the `pc` form.
 /// Each guard of the structured form lists every pending skip flag, so it grows with the
 /// square of the flags: one retail program made 455 B per byte (148 MB, 14 MB as `pc` blocks),

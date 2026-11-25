@@ -253,6 +253,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `XCL_PSO_TRACE=1` logs every driver compile. A huge compute program the driver refuses is
   logged with the driver's verdict (`the driver refused the compute PSO of record HASH … with
   0x…`): its dispatches are skipped.
+- A loop in a translated compute program ends an entry after its dispatch's share of passes
+  (between 1024 and 65 536 a thread, fewer the more threads the dispatch has), so one that runs
+  away does not hold the GPU past the time Windows gives it; `XCL_DISPATCH_LOOP_BUDGET=0` leaves
+  every loop the thread's 65 536 passes, as before (to compare).
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation. For each, it names the translated
