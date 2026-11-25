@@ -465,9 +465,13 @@ struct State {
     /// tiles over a CPU view with video memory now, and the most there may be (`XCL_MIRROR_MB`)
     mirrored: usize,
     mirror_cap: usize,
-    /// tiles over a CPU view left without video memory for `mirror_cap` (asked again once their
-    /// CPU view is written)
+    /// tiles over a CPU view left without video memory for `mirror_cap`, or as none was to be had:
+    /// given it once there is room (`retry_refused`), or once their CPU view is written
     refused: FxHashSet<usize>,
+    /// when a tile over a CPU view last found no video memory (`take_tile`): for a moment the
+    /// others do not try to make a heap again (each tried, and logged it), and the refused ones
+    /// wait
+    no_memory: Option<std::time::Instant>,
     counts: MirrorCounts,
 }
 
@@ -479,7 +483,7 @@ struct MirrorCounts {
     /// tiles filled whole from their CPU view, and the bytes of their committed pages
     fills: u64,
     fill_bytes: u64,
-    /// tiles refused for `mirror_cap` (each once until it has video memory)
+    /// tiles refused for `mirror_cap` or for want of video memory (each once until it has some)
     refused: u64,
     /// tiles whose video memory went back (their CPU view decommitted, or the view gone)
     given_back: u64,
@@ -829,6 +833,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         mirrored: 0,
         mirror_cap: mirror_cap(),
         refused: FxHashSet::default(),
+        no_memory: None,
         counts: MirrorCounts::default(),
     })
 }
@@ -2566,7 +2571,7 @@ pub unsafe fn source_decommitted(a: usize, n: usize) {
 /// or over CPU memory in it, show nothing from here on (their video memory goes back), and may be
 /// asked for again (the addresses may be given out anew). Call it once the pair is dropped
 /// (`kernelx::mirrors::released`): with no tile linked anywhere it takes no state's lock, and a
-/// tile linked after that looks its pair up again (`State::map_mirrors`), so one of the two sees
+/// tile linked after that looks its pair up again (`State::take_asks`), so one of the two sees
 /// the other.
 pub fn forget_mirrors(a: usize, n: usize) {
     if n == 0 {
@@ -2653,24 +2658,30 @@ impl State {
     /// pool (cleared when it was used before), mapped with the next flush; all of it goes up at
     /// the next submit (`fill`). `force`: past `mirror_cap` too (it counts all the same), for a
     /// placed buffer's tile: the buffer maps its tiles once, and video memory the window tile got
-    /// later would not be the buffer's. False: past `mirror_cap` (counted, and logged at powers of
-    /// two) or no video memory.
+    /// later would not be the buffer's. False: past `mirror_cap` (logged at powers of two) or no
+    /// video memory (now or a moment ago, `no_memory`): `w` is in `refused` then (counted once).
     unsafe fn new_mirror(&mut self, w: usize, src: usize, holes: u16, force: bool) -> bool {
         if let Some(tile) = self.parked.remove(&w).or_else(|| self.kept.remove(&w)) {
             self.mapped.insert(w, TileEntry { src, gen: next_gen(), ..TileEntry::with_holes(tile, holes) });
             self.to_zero.insert((w, TILE));
         } else {
-            if !force && self.mirrored >= self.mirror_cap {
+            let at_cap = !force && self.mirrored >= self.mirror_cap;
+            // (a moment after a heap could not be made, only tiles at hand)
+            let wait = at_cap || (!force && self.short_of_memory() && self.free.is_empty() && self.parked.is_empty() && self.retired.is_empty());
+            let got = if wait { None } else { self.take_tile() };
+            let Some((tile, reused)) = got else {
+                if !wait {
+                    self.no_memory = Some(std::time::Instant::now());
+                }
                 if self.refused.insert(w) {
                     self.counts.refused += 1;
                     let n = self.counts.refused;
-                    if n.is_power_of_two() {
+                    if at_cap && n.is_power_of_two() {
                         crate::xlog_warn!("sparse: {n} GPU-view tiles left without video memory (XCL_MIRROR_MB) – the GPU reads zeros there");
                     }
                 }
                 return false;
-            }
-            let Some((tile, reused)) = self.take_tile() else { return false };
+            };
             self.mapped.insert(w, TileEntry { src, gen: next_gen(), ..TileEntry::with_holes(tile, holes) });
             if reused {
                 self.to_zero.insert((w, TILE));
@@ -2684,11 +2695,63 @@ impl State {
         true
     }
 
+    /// A tile over a CPU view found no video memory a moment ago (`no_memory`, 1 s)
+    fn short_of_memory(&self) -> bool {
+        self.no_memory.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1))
+    }
+
+    /// Tiles refused (`refused`) get video memory once there is room again, as much as there is
+    /// and `MIRROR_ASKS_MAX` at most a submit: what their CPU view held goes up then (written
+    /// once before, it may never be written again). One whose CPU tile has no committed page
+    /// leaves `refused` (a write there brings it back, `mirror_writes`), as does one no longer
+    /// linked or with video memory.
+    unsafe fn retry_refused(&mut self) {
+        if self.refused.is_empty() || self.mirrored >= self.mirror_cap || self.short_of_memory() {
+            return;
+        }
+        let room = (self.mirror_cap - self.mirrored).min(MIRROR_ASKS_MAX);
+        let mut take: Vec<(usize, usize)> = Vec::new();
+        let mut gone: Vec<usize> = Vec::new();
+        for &w in &self.refused {
+            if take.len() == room {
+                break;
+            }
+            match self.mirror_src.get(&w) {
+                Some(&c) if !self.mapped.contains_key(&w) => take.push((w, c)),
+                _ => gone.push(w),
+            }
+        }
+        for w in gone {
+            self.refused.remove(&w);
+        }
+        if take.is_empty() {
+            return;
+        }
+        // (in the order of their CPU tiles: a query for each region of them)
+        take.sort_unstable_by_key(|t| t.1);
+        let holes = self.holes_now(&take.iter().map(|t| t.1).collect::<Vec<_>>());
+        for (&(w, c), h) in take.iter().zip(holes) {
+            if h == 0xFFFF {
+                self.refused.remove(&w);
+            } else if !self.new_mirror(w, c, h, false) {
+                // (no video memory after all: the rest wait too)
+                break;
+            }
+        }
+    }
+
+    /// At the top of a submit: the tiles asked for shown over their CPU views (`take_asks`), and
+    /// the tiles refused before given video memory if there is room again (`retry_refused`).
+    unsafe fn map_mirrors(&mut self) {
+        self.take_asks();
+        self.retry_refused();
+    }
+
     /// The tiles asked for (`asks`, `MIRROR_ASKS_MAX` at most a submit) shown over their CPU
     /// views: a tile of a sparse window in a GPU view gets video memory, unless its CPU tile has
     /// no committed page (it waits in `mirrors` for the CPU to write there). Others are left out,
     /// and may be asked for again.
-    unsafe fn map_mirrors(&mut self) {
+    unsafe fn take_asks(&mut self) {
         if self.asks.is_empty() {
             return;
         }
@@ -2777,6 +2840,9 @@ impl State {
         }
         // (tile over it, CPU tile, holes written – None: the tile has no video memory)
         let mut ask: Vec<(usize, usize, Option<u16>)> = Vec::new();
+        // (a tile refused is not asked about while there is no room or memory for it: it would be
+        // refused again, and its CPU tile may be written at every submit)
+        let waiting = self.mirrored >= self.mirror_cap || self.short_of_memory();
         for &(t, bits) in &written {
             for &w in &self.mirrors[&t] {
                 match self.mapped.get(&w) {
@@ -2786,6 +2852,7 @@ impl State {
                         }
                     }
                     Some(_) => {}
+                    None if waiting && self.refused.contains(&w) => {}
                     None => ask.push((w, t, None)),
                 }
             }
@@ -2884,7 +2951,7 @@ impl State {
         }
         if !over.is_empty() {
             // linked before their CPU tiles' pages are asked about (`holes_now`), and given up
-            // when their pair went meanwhile (as in `map_mirrors`)
+            // when their pair went meanwhile (as in `take_asks`)
             over.retain(|&(t, c)| {
                 if self.mirror_src.contains_key(&t) {
                     return true;
@@ -3285,7 +3352,7 @@ mod tests {
     thread_local! {
         /// The VirtualQuery calls `source_holes` made on this thread.
         pub(super) static VIRTUAL_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-        /// Run by `map_mirrors` on this thread between the look up of the asked tiles' pairs and
+        /// Run by `take_asks` on this thread between the look up of the asked tiles' pairs and
         /// their link (once)
         pub(super) static BEFORE_LINK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
     }
@@ -3505,6 +3572,7 @@ mod tests {
                 mirrored: 0,
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
+                no_memory: None,
                 counts: MirrorCounts::default(),
             };
             s.commit_range(base, TILE);
@@ -3785,6 +3853,7 @@ mod tests {
                 mirrored: 0,
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
+                no_memory: None,
                 counts: MirrorCounts::default(),
             };
 
@@ -4010,6 +4079,7 @@ mod tests {
                 mirrored: 0,
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
+                no_memory: None,
                 counts: MirrorCounts::default(),
             };
 
@@ -4124,6 +4194,7 @@ mod tests {
                 mirrored: 0,
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
+                no_memory: None,
                 counts: MirrorCounts::default(),
             };
 
@@ -5127,6 +5198,62 @@ mod tests {
             assert_eq!((v.s.mirrored, v.s.counts.refused), (2, 0));
             assert!(v.s.fill.contains(&w));
             v.submit(&[c + PAGE]);
+        }
+    }
+
+    /// A tile refused at `mirror_cap` gets video memory at a submit once there is room again,
+    /// filled with what its CPU view held (written once before, maybe never again); while there
+    /// is none, a write to its CPU tile does not ask Windows about it. Before, it waited for a
+    /// write after the room came back, and asked Windows at every write meanwhile.
+    #[test]
+    fn a_tile_refused_at_the_cap_gets_video_memory_when_there_is_room() {
+        unsafe {
+            let Some(mut v) = Views::new(103) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let (w, c) = (v.w, v.c);
+            v.commit(0, 2);
+            v.write(0, 2, 43);
+            // (the third CPU tile half committed: asked about, the rest takes a VirtualQuery)
+            assert!(!VirtualAlloc((c + 2 * TILE) as *const c_void, 8 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            std::ptr::write_bytes((c + 2 * TILE) as *mut u8, 0x5A, 8 * PAGE);
+            v.s.mirror_cap = 2;
+            v.s.asks.extend([w, w + TILE, w + 2 * TILE]);
+            v.submit(&[]);
+            assert!(!v.s.mapped.contains_key(&(w + 2 * TILE)) && v.s.refused.contains(&(w + 2 * TILE)));
+            let q0 = VIRTUAL_QUERIES.with(|n| n.get());
+            v.submit(&[c + 2 * TILE]);
+            assert_eq!(VIRTUAL_QUERIES.with(|n| n.get()), q0, "at the cap, Windows is not asked about it");
+            assert!(!v.s.mapped.contains_key(&(w + 2 * TILE)));
+            // room again (a CPU tile decommitted whole), and no write: it gets its video memory
+            v.s.source_decommitted_in(c, TILE);
+            assert_ne!(VirtualFree(c as *mut c_void, TILE, MEM_DECOMMIT), 0);
+            assert_eq!(v.s.mirrored, 1);
+            v.submit(&[]);
+            assert_eq!(v.s.mapped.get(&(w + 2 * TILE)).map(|e| e.holes), Some(0xFF00));
+            assert!(v.s.refused.is_empty() && v.s.mirrored == 2 && v.s.counts.refused == 1);
+            assert!((0..8).all(|i| v.s.mapped[&(w + 2 * TILE)].sent[i].is_some()), "what the CPU view held went up");
+        }
+    }
+
+    /// A tile that found no video memory is refused like one at the cap (not asked for again at
+    /// every ask), and gets it at a submit once there is some. Before, it was not even recorded:
+    /// it read zeros until its CPU tile was written again.
+    #[test]
+    fn a_tile_refused_for_want_of_video_memory_gets_it_later() {
+        unsafe {
+            let Some(mut v) = Views::new(107) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let w = v.w;
+            v.commit(0, 1);
+            v.write(0, 1, 47);
+            // (as after a heap that could not be made)
+            v.s.no_memory = Some(std::time::Instant::now());
+            v.s.asks.push(w);
+            v.submit(&[]);
+            assert!(!v.s.mapped.contains_key(&w) && v.s.refused.contains(&w));
+            assert_eq!(v.s.counts.refused, 1);
+            v.s.no_memory = None;
+            v.submit(&[]);
+            assert!(v.s.mapped.contains_key(&w) && v.s.refused.is_empty());
+            assert!(v.s.mapped[&w].sent.iter().all(|p| p.is_some()), "what the CPU view held went up");
         }
     }
 
