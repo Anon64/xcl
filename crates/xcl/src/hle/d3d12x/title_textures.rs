@@ -1609,7 +1609,9 @@ const STREAM_SAMPLE_SLICE: usize = 16 * 1024;
 struct StreamRecheck {
     base_frame: u64,
     stage: u8,
-    last_fp: u64,
+    /// `None`: no whole upload since the entry was made (a partial upload made it), so the PC
+    /// texture has no known content to compare with and the first milestone queues a whole upload.
+    last_fp: Option<u64>,
 }
 
 static STREAM_RECHECK: Mutex<BTreeMap<usize, StreamRecheck>> = Mutex::new(BTreeMap::new());
@@ -1678,25 +1680,32 @@ unsafe fn seed_stream_recheck(todo: &[Due], watched: &[(usize, usize)], frame: u
         return;
     }
     let mut seeded = Vec::new();
+    let mut unsent = Vec::new();
     for d in todo {
-        // A partial upload sends only the written pages it knows of, or nothing when they are
-        // unchanged, so the PC texture does not hold what its memory holds now: the baseline of
-        // the last whole upload stays, and so does its schedule (moving the schedule on every
-        // partial upload would keep a texture written every few frames from reaching a milestone).
-        if !d.whole {
-            continue;
-        }
         let size = d.tex.size() as usize;
         if size == 0 || range_is_fully_watched(d.src, size, watched) {
             continue;
         }
+        // A partial upload sends only the written pages it knows of, or nothing when they are
+        // unchanged, so the PC texture does not hold what its memory holds now: the baseline of
+        // the last whole upload stays, and so does its schedule (moving the schedule on every
+        // partial upload would keep a texture written every few frames from reaching a milestone).
+        // A texture with no entry (retired, pruned, never seeded) gets one without a baseline, so
+        // its first milestone queues the whole upload that sets one.
+        if !d.whole {
+            unsent.push(d.res.as_raw() as usize);
+            continue;
+        }
         let fp = sample_fingerprint(d.src, size);
-        seeded.push((d.res.as_raw() as usize, StreamRecheck { base_frame: frame, stage: 0, last_fp: fp }));
+        seeded.push((d.res.as_raw() as usize, StreamRecheck { base_frame: frame, stage: 0, last_fp: Some(fp) }));
     }
-    if !seeded.is_empty() {
+    if !seeded.is_empty() || !unsent.is_empty() {
         let mut g = STREAM_RECHECK.lock().unwrap();
         for (res, state) in seeded {
             g.insert(res, state);
+        }
+        for res in unsent {
+            g.entry(res).or_insert(StreamRecheck { base_frame: frame, stage: 0, last_fp: None });
         }
     }
 }
@@ -1715,7 +1724,7 @@ unsafe fn recheck_streamed_unwatched(watched: &[(usize, usize)], frame: u64) {
 /// Re-fingerprint due unwatched textures at `frame`, re-queuing changed entries and resetting
 /// their milestone schedule so subsequent higher-resolution mip streams are also caught.
 unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) {
-    let due: Vec<(usize, u64)> = {
+    let due: Vec<(usize, Option<u64>)> = {
         let g = STREAM_RECHECK.lock().unwrap();
         if g.is_empty() {
             return;
@@ -1765,7 +1774,7 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
         return;
     }
 
-    let results: Vec<(usize, u64, u64)> = check
+    let results: Vec<(usize, Option<u64>, u64)> = check
         .into_iter()
         .map(|(res, src, size, prev_fp)| (res, prev_fp, sample_fingerprint(src, size)))
         .collect();
@@ -1777,8 +1786,9 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
             let Some(st) = g.get_mut(&res) else {
                 continue;
             };
-            if cur_fp != prev_fp {
-                *st = StreamRecheck { base_frame: frame, stage: 0, last_fp: cur_fp };
+            // (an entry without a baseline is always queued)
+            if prev_fp != Some(cur_fp) {
+                *st = StreamRecheck { base_frame: frame, stage: 0, last_fp: Some(cur_fp) };
                 changed.push(res);
             } else {
                 st.stage = st.stage.saturating_add(1);
@@ -3535,8 +3545,8 @@ pub(super) mod tests {
         let fp0 = unsafe { sample_fingerprint(va, size) };
         {
             let mut g = STREAM_RECHECK.lock().unwrap();
-            g.insert(res_id, StreamRecheck { base_frame: 100, stage: 0, last_fp: fp0 });
-            g.insert(gpu_res_id, StreamRecheck { base_frame: 100, stage: 0, last_fp: fp0 });
+            g.insert(res_id, StreamRecheck { base_frame: 100, stage: 0, last_fp: Some(fp0) });
+            g.insert(gpu_res_id, StreamRecheck { base_frame: 100, stage: 0, last_fp: Some(fp0) });
         }
 
         // Before first milestone (+4 frames -> frame 104), nothing is checked or re-queued.
@@ -3560,7 +3570,7 @@ pub(super) mod tests {
             assert!(!g.contains_key(&gpu_res_id), "gpu_written texture must be pruned from STREAM_RECHECK");
             let st = g.get(&res_id).copied().expect("schedule reset after change");
             assert_eq!((st.base_frame, st.stage), (104, 0));
-            assert_ne!(st.last_fp, fp0);
+            assert_ne!(st.last_fp, Some(fp0));
         }
 
         // Advance through all 5 milestones with no further writes: entry must not re-queue and must
@@ -3654,14 +3664,14 @@ pub(super) mod tests {
             // The whole upload at frame 0 sets the baseline.
             seed_stream_recheck(&[due(true)], &[], 0);
             let fp0 = sample_fingerprint(va, size);
-            assert_eq!(STREAM_RECHECK.lock().unwrap().get(&res_id).copied(), Some(StreamRecheck { base_frame: 0, stage: 0, last_fp: fp0 }));
+            assert_eq!(STREAM_RECHECK.lock().unwrap().get(&res_id).copied(), Some(StreamRecheck { base_frame: 0, stage: 0, last_fp: Some(fp0) }));
 
             // An unwatched page is written, then a partial upload (of other pages) runs at frame 2.
             backing[size - 16] = 0xCD;
             seed_stream_recheck(&[due(false)], &[], 2);
             assert_eq!(
                 STREAM_RECHECK.lock().unwrap().get(&res_id).copied(),
-                Some(StreamRecheck { base_frame: 0, stage: 0, last_fp: fp0 }),
+                Some(StreamRecheck { base_frame: 0, stage: 0, last_fp: Some(fp0) }),
                 "a partial upload must not replace the baseline or move the schedule"
             );
 
@@ -3675,6 +3685,126 @@ pub(super) mod tests {
                 e.pending = false;
                 PENDING.fetch_sub(1, Ordering::Relaxed);
             }
+
+            forget(res_id);
+        }
+    }
+
+    /// A partial upload of a texture whose recheck entry has retired makes an entry without a
+    /// baseline: its first milestone queues a whole upload, which sets the baseline.
+    #[test]
+    fn stream_recheck_partial_upload_without_an_entry_queues_a_whole_upload() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            // (software adapter only: the resource only gives the Due its key)
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let hp = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 0x1_0000,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut res: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, None, &mut res).unwrap();
+            let res = res.unwrap();
+            let res_id = res.as_raw() as usize;
+
+            let desc = console_desc(3, 256, 256, 1, 1, 28, 0x109); // 256 KiB RGBA8
+            let tex = Arc::new(xg::Texture::new(&desc).expect("layout"));
+            let size = tex.size() as usize;
+            let mut backing = vec![0u8; size];
+            let va = backing.as_ptr() as usize;
+            let entry = Entry {
+                device: 0,
+                va,
+                src: va,
+                in_gpu_view: false,
+                tex: Arc::clone(&tex),
+                states: vec![D3D12_RESOURCE_STATE_COMMON],
+                pending: false,
+                gpu_written: false,
+                placed: false,
+                unmapped: false,
+                seq: 0,
+                known: Default::default(),
+                target: false,
+            };
+            {
+                let mut t = TEXTURES.lock().unwrap();
+                let (d, _) = t.insert(res_id, entry);
+                adjust_pending(d);
+            }
+            let due = |whole: bool| Due {
+                res: res.clone(),
+                device: 0,
+                src: va,
+                tex: Arc::clone(&tex),
+                states: vec![D3D12_RESOURCE_STATE_COMMON],
+                known: Default::default(),
+                whole,
+                again: texture_upload::Change::None,
+                target: false,
+            };
+            let pending = || TEXTURES.lock().unwrap().by_res.get(&res_id).unwrap().pending;
+            let entry = || STREAM_RECHECK.lock().unwrap().get(&res_id).copied();
+
+            // A whole upload at frame 0, then every milestone finds nothing new and the entry retires.
+            seed_stream_recheck(&[due(true)], &[], 0);
+            for f in [4, 16, 56, 176, 576] {
+                recheck_streamed_unwatched_at(&[], f);
+                assert!(!pending(), "unchanged texture must not re-queue at frame {f}");
+            }
+            assert_eq!(entry(), None, "entry must retire after final 400-frame milestone");
+
+            // An unwatched page is written, a partial upload (of other pages) runs at frame 600, and
+            // another unwatched page is written after it.
+            backing[16] = 0x11;
+            seed_stream_recheck(&[due(false)], &[], 600);
+            assert_eq!(entry(), Some(StreamRecheck { base_frame: 600, stage: 0, last_fp: None }), "a partial upload without an entry makes one without a baseline");
+            backing[size - 16] = 0x22;
+            // A later partial upload leaves that entry as it is.
+            seed_stream_recheck(&[due(false)], &[], 602);
+            assert_eq!(entry(), Some(StreamRecheck { base_frame: 600, stage: 0, last_fp: None }), "a partial upload must not touch an existing entry");
+
+            recheck_streamed_unwatched_at(&[], 603);
+            assert!(!pending(), "nothing is checked before the first milestone");
+            recheck_streamed_unwatched_at(&[], 604);
+            {
+                let mut t = TEXTURES.lock().unwrap();
+                let e = t.by_res.get_mut(&res_id).unwrap();
+                assert!(e.pending, "the first milestone of an entry without a baseline must queue the texture");
+                e.pending = false;
+                PENDING.fetch_sub(1, Ordering::Relaxed);
+            }
+
+            // The whole upload that follows sets the baseline: with no further write, the next
+            // milestone queues nothing.
+            seed_stream_recheck(&[due(true)], &[], 605);
+            let fp = sample_fingerprint(va, size);
+            assert_eq!(entry(), Some(StreamRecheck { base_frame: 605, stage: 0, last_fp: Some(fp) }));
+            recheck_streamed_unwatched_at(&[], 609);
+            assert!(!pending(), "after the whole upload an unchanged texture must not re-queue");
+            assert_eq!(entry(), Some(StreamRecheck { base_frame: 605, stage: 1, last_fp: Some(fp) }));
 
             forget(res_id);
         }
