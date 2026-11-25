@@ -1709,6 +1709,9 @@ fn wake_sync_watchdog() {
                 }
             }
             let had_expired = !expired.is_empty();
+            if had_expired {
+                super::indirect_guard::report_now();
+            }
             for (va, val, fence, waiter_q, waiter_ty, prod_q, prod_ty, rec, sub, done) in expired {
                 unsafe {
                     let _ = fence.Signal(val);
