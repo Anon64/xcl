@@ -53,10 +53,14 @@ struct State {
 const SCRATCH_BLOCK: u64 = 1 << 20;
 const SCRATCH_CAP: u64 = 16 << 20;
 /// Most bytes of buffers kept for reuse (`FREE_RES`)
-const FREE_RES_CAP: u64 = 256 << 20;
+const FREE_RES_CAP: u64 = 1 << 30;
+/// How long a buffer no recording took again stays in `FREE_RES`. Recordings take them again
+/// within a frame or so, and the GPU is done with one there already (its allocator was reset):
+/// only video memory waits on this.
+const FREE_RES_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<(ID3D12Resource, u64, usize)>>>> = Mutex::new(None);
-static FREE_RES: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
+static FREE_RES: Mutex<FreePool<(ID3D12Resource, u64, usize)>> = Mutex::new(FreePool::new(FREE_RES_CAP));
 
 fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, usize)>) {
     if bufs.is_empty() {
@@ -78,16 +82,27 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, us
 pub(super) fn release_allocator_res(allocator: usize) {
     let aged = UNKNOWN_RES.lock().unwrap().take_older(std::time::Instant::now(), UNKNOWN_RES_AGE);
     let bufs = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
-    if aged.is_empty() && bufs.is_none() {
-        return;
-    }
-    let mut free = FREE_RES.lock().unwrap();
-    for b in bufs.into_iter().flatten().chain(aged) {
-        let held: u64 = free.iter().map(|f| f.1).sum();
-        if pool_keeps(free.len(), held, b.1) {
-            free.push(b);
+    // (let go outside the lock)
+    let _gone = {
+        let mut free = FREE_RES.lock().unwrap();
+        let now = std::time::Instant::now();
+        let mut gone = free.take_idle(now, FREE_RES_IDLE);
+        for b in bufs.into_iter().flatten().chain(aged) {
+            gone.extend(free.put(now, b.1, b.2, b));
         }
-    }
+        gone
+    };
+}
+
+/// A buffer of `FREE_RES` on the device `dev` of `min..=max` bytes, for a recording to take.
+fn take_free(dev: usize, min: u64, max: u64) -> Option<(ID3D12Resource, u64, usize)> {
+    let (gone, picked) = {
+        let mut free = FREE_RES.lock().unwrap();
+        (free.take_idle(std::time::Instant::now(), FREE_RES_IDLE), free.take(dev, min, max))
+    };
+    // (let go outside the lock)
+    drop(gone);
+    picked
 }
 
 /// How long the two-pass buffers of a recording with no known allocator are kept: no fence or
@@ -139,9 +154,61 @@ impl<T> Aging<T> {
 /// the two-pass buffers of recordings with no known allocator (`hold_res_until_reset`)
 static UNKNOWN_RES: Mutex<Aging<(ID3D12Resource, u64, usize)>> = Mutex::new(Aging::new(UNKNOWN_RES_CAP));
 
-/// Whether `FREE_RES`, holding `count` buffers of `held` bytes, keeps one of `bytes` more.
-fn pool_keeps(count: usize, held: u64, bytes: u64) -> bool {
-    count < 16 && held + bytes <= FREE_RES_CAP
+/// Buffers the GPU is done with, kept for the recordings that need one next (`FREE_RES`): each
+/// with when it was handed back, its bytes and its device, oldest first. What it keeps is what
+/// recordings took again in the last `FREE_RES_IDLE`, and at most `cap` bytes, so a steady frame
+/// takes back what the one before it handed back and makes none.
+struct FreePool<T> {
+    free: Vec<(std::time::Instant, u64, usize, T)>,
+    bytes: u64,
+    cap: u64,
+}
+
+impl<T> FreePool<T> {
+    const fn new(cap: u64) -> Self {
+        FreePool { free: Vec::new(), bytes: 0, cap }
+    }
+
+    /// Keep `item` of `bytes` on the device `dev` from `now`. Past the cap the oldest go (what
+    /// is returned).
+    fn put(&mut self, now: std::time::Instant, bytes: u64, dev: usize, item: T) -> Vec<T> {
+        self.bytes += bytes;
+        self.free.push((now, bytes, dev, item));
+        let mut over = Vec::new();
+        while self.bytes > self.cap && !self.free.is_empty() {
+            let (_, b, _, t) = self.free.remove(0);
+            self.bytes -= b;
+            over.push(t);
+        }
+        over
+    }
+
+    /// The smallest kept on `dev` of `min..=max` bytes, of those the last handed back (so the
+    /// ones no recording needs grow old and go).
+    fn take(&mut self, dev: usize, min: u64, max: u64) -> Option<T> {
+        let i = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, &(_, b, d, _))| d == dev && b >= min && b <= max)
+            .min_by_key(|&(i, &(_, b, _, _))| (b, std::cmp::Reverse(i)))?
+            .0;
+        let (_, b, _, t) = self.free.remove(i);
+        self.bytes -= b;
+        Some(t)
+    }
+
+    /// What was kept `age` or longer at `now`, no recording having taken it.
+    fn take_idle(&mut self, now: std::time::Instant, age: std::time::Duration) -> Vec<T> {
+        let n = self.free.iter().take_while(|&&(at, ..)| now.saturating_duration_since(at) >= age).count();
+        self.free
+            .drain(..n)
+            .map(|(_, b, _, t)| {
+                self.bytes -= b;
+                t
+            })
+            .collect()
+    }
 }
 
 /// the state of each list's recording
@@ -562,19 +629,37 @@ fn two_pass_steps(max: u32) -> impl Iterator<Item = (u32, bool)> {
     (0..max).flat_map(|k| [(k, true), (k, false)])
 }
 
-/// The record buffer of this list for `need_bytes` (at most 128 MiB): buffer, address, bytes.
+/// Smallest and largest record buffer. The smallest is an argument scratch block's size
+/// (`SCRATCH_BLOCK`), so a freed one of either serves both.
+const RECORD_MIN: u64 = 1 << 20;
+const RECORD_MAX: u64 = 128 << 20;
+/// Record bytes an ExecuteIndirect of two-pass commands asks for: a command's groups are known on
+/// the GPU only (`SCALE_ARGS_HLSL` keeps them to what fits).
+const INDIRECT_RECORDS: u64 = 32 << 20;
+
+/// Bytes of a record buffer for `need` bytes of records: the power of two at or above it, from
+/// `RECORD_MIN` to `RECORD_MAX`. A few sizes go from recording to recording through `FREE_RES`; a
+/// buffer made to each need would seldom fit the next.
+fn record_buffer_bytes(need: u64) -> u64 {
+    need.clamp(RECORD_MIN, RECORD_MAX).next_power_of_two()
+}
+
+/// Record bytes a two-pass ExecuteIndirect asks for: `INDIRECT_RECORDS`, or less when a command's
+/// groups (at most 65 535 / `split` in X, `record_groups`) need less – the same groups fit.
+fn indirect_record_need(record_bytes: u64, split: u32) -> u64 {
+    INDIRECT_RECORDS.min(record_bytes.saturating_mul(65_535 / split.max(1) as u64))
+}
+
+/// The record buffer of this list for `need_bytes` (at most `RECORD_MAX`): buffer, address, bytes.
 unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
-    let need = need_bytes.max(4 << 20).next_multiple_of(1 << 20).min(128 << 20);
+    let need = record_buffer_bytes(need_bytes);
     if let Some((buf, cap, _dev)) = with(this, |s| s.res_buf.as_ref().filter(|(_, cap, _)| *cap >= need).cloned()) {
         let va = buf.GetGPUVirtualAddress();
         return Ok((buf, va, cap));
     }
     let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
     let dev_key = dev.as_raw() as usize;
-    let picked = {
-        let mut free = FREE_RES.lock().unwrap();
-        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= need).map(|i| free.swap_remove(i))
-    };
+    let picked = take_free(dev_key, need, u64::MAX);
     let entry = match picked {
         Some(e) => e,
         None => (default_uav_buffer(&dev, need, "two-pass res buffer")?, need, dev_key),
@@ -736,10 +821,7 @@ unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Res
         return Err(format!("its rewritten arguments are past {} MiB this recording", SCRATCH_CAP >> 20));
     }
     let dev_key = dev.as_raw() as usize;
-    let picked = {
-        let mut free = FREE_RES.lock().unwrap();
-        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= size && *cap <= remaining).map(|i| free.swap_remove(i))
-    };
+    let picked = take_free(dev_key, size, remaining);
     let block = match picked {
         Some(e) => e,
         None => (default_uav_buffer(dev, size, "two-pass argument scratch")?, size, dev_key),
@@ -988,7 +1070,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     _ => return Err("its arguments are not in a console buffer in unified memory".into()),
                 };
                 let record_bytes = tp.record.record_dwords() as u64 * 4;
-                let (res_buf, res_va, cap) = ensure_res_buffer(this, 32 << 20)?;
+                let (res_buf, res_va, cap) = ensure_res_buffer(this, indirect_record_need(record_bytes, tp.mesh_groups_per_record))?;
                 let cap = record_groups(cap, record_bytes, tp.mesh_groups_per_record);
                 if cap == 0 {
                     return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
@@ -2759,12 +2841,78 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(mesh, [[1, 6, 1, 1], [2, 72, 1, 1], [3, 3000, 1, 1], [4, 0, 1, 1], [5, 3000, 1, 1], [6, 3000, 1, 1], [7, 3000, 1, 1], [8, 0, 1, 1]]);
     }
 
+    /// Freed two-pass buffers are kept, many of one size too (a frame of recordings hands back
+    /// tens of 32 MiB ones, and the next takes them again), up to the cap in bytes, oldest let go
+    /// first; one no recording took for `FREE_RES_IDLE` goes.
     #[test]
     fn freed_two_pass_buffers_kept_for_reuse_are_capped() {
-        assert!(pool_keeps(0, 0, 128 << 20));
-        assert!(pool_keeps(1, 128 << 20, 128 << 20));
-        assert!(!pool_keeps(2, 256 << 20, 4 << 20));
-        assert!(!pool_keeps(16, 0, 1 << 20));
+        use std::time::{Duration, Instant};
+        let t = Instant::now();
+        let mib = 1u64 << 20;
+        let mut p: FreePool<u32> = FreePool::new(1 << 30);
+        for k in 0..32 {
+            assert!(p.put(t, 32 * mib, 7, k).is_empty(), "32 x 32 MiB fit 1 GiB");
+        }
+        assert_eq!(p.bytes, 1 << 30);
+        assert_eq!(p.put(t, mib, 7, 99), vec![0], "past the cap the oldest goes");
+        assert_eq!(p.bytes, (1 << 30) - 31 * mib);
+        // nothing is idle yet; then all of them are
+        assert!(p.take_idle(t + Duration::from_millis(1999), FREE_RES_IDLE).is_empty());
+        assert_eq!(p.take_idle(t + FREE_RES_IDLE, FREE_RES_IDLE).len(), 32);
+        assert_eq!((p.bytes, p.free.len()), (0, 0));
+    }
+
+    /// A recording takes the smallest freed buffer that is large enough, of its device and within
+    /// its bound, the one handed back last of those: a large one stays for a large need, and the
+    /// spare ones of a size grow old.
+    #[test]
+    fn a_recording_takes_the_smallest_freed_buffer_that_fits() {
+        use std::time::{Duration, Instant};
+        let t = Instant::now();
+        let mib = 1u64 << 20;
+        let mut p: FreePool<&str> = FreePool::new(1 << 30);
+        p.put(t, 32 * mib, 1, "32 a");
+        p.put(t, 4 * mib, 1, "4 a");
+        p.put(t + Duration::from_millis(10), 4 * mib, 1, "4 b");
+        p.put(t, mib, 2, "1 other device");
+        assert_eq!(p.take(1, mib, u64::MAX), Some("4 b"));
+        assert_eq!(p.take(1, 8 * mib, 16 * mib), None, "the 32 MiB one is past the bound");
+        assert_eq!(p.take(1, 8 * mib, u64::MAX), Some("32 a"));
+        assert_eq!(p.take(1, mib, u64::MAX), Some("4 a"));
+        assert_eq!(p.take(1, 0, u64::MAX), None);
+        assert_eq!(p.take(2, 0, u64::MAX), Some("1 other device"));
+        assert_eq!(p.bytes, 0);
+    }
+
+    /// Record buffers come in powers of two from 1 MiB, and a draw has as many groups with a record
+    /// as with the sizes before (its need, at least 4 MiB, in MiB): none drops groups it drew
+    /// before. An ExecuteIndirect keeps the groups a command had with 32 MiB.
+    #[test]
+    fn two_pass_record_buffers_fit_what_their_draws_need() {
+        let mib = 1u64 << 20;
+        assert_eq!(record_buffer_bytes(0), mib);
+        assert_eq!(record_buffer_bytes(2 * 47_632), mib, "a DispatchMesh of two groups of #304's record");
+        assert_eq!(record_buffer_bytes(mib + 1), 2 * mib);
+        assert_eq!(record_buffer_bytes(130 * 47_632), 8 * mib);
+        assert_eq!(record_buffer_bytes(32 * mib), 32 * mib);
+        assert_eq!(record_buffer_bytes(1 << 40), 128 * mib);
+        let before = |need: u64| need.max(4 << 20).next_multiple_of(1 << 20).min(128 << 20);
+        for record in [64u64, 500, 4_096, 47_632, 300_000, 3 << 20, 200 << 20] {
+            for split in [1u32, 2, 4, 7] {
+                for groups in [1u32, 2, 8, 52, 92, 130, 704, 2_817, 9_000, 65_535] {
+                    let need = groups as u64 * record;
+                    let old = groups.min(record_groups(before(need), record, split));
+                    let new = groups.min(record_groups(record_buffer_bytes(need), record, split));
+                    assert!(new >= old, "{groups} groups of {record} B, split {split}: {new} < {old}");
+                }
+                let ei = record_buffer_bytes(indirect_record_need(record, split));
+                assert!(ei <= 32 * mib);
+                assert_eq!(record_groups(ei, record, split), record_groups(32 * mib, record, split), "{record} B, split {split}");
+            }
+        }
+        assert_eq!(indirect_record_need(64, 1), 65_535 * 64, "small records: their groups in X bound it");
+        assert_eq!(record_buffer_bytes(indirect_record_need(64, 1)), 4 * mib);
+        assert_eq!(indirect_record_need(47_632, 1), 32 * mib);
     }
 
     #[test]
@@ -3037,7 +3185,7 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             } else { None };
             drop((first, second, large, reused));
             for list in [consumer, producer, empty] { forget(list); }
-            FREE_RES.lock().unwrap().retain(|(_, _, d)| *d != key);
+            while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
             assert!(taken <= SCRATCH_CAP, "pooled block exceeds recording budget: {taken} > {SCRATCH_CAP}");
         }
     }
