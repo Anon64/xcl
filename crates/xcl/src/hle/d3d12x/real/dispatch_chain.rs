@@ -118,6 +118,18 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
     resource
 }
 
+/// A piece or the whole form on `list`: on a list XCL adopted (a title's) past the hook of a
+/// title's SetPipelineState, as `bind::bind_abi` binds a compute pipeline. Through the hook it
+/// became the list's bound pipeline (the first one of a list split after it) and got a DRED
+/// marker without a label.
+unsafe fn bind(list: &ID3D12GraphicsCommandList, pso: &ID3D12PipelineState) {
+    if is_adopted(list.as_raw()) {
+        super::super::list_x::set_compute_pipeline(list.as_raw(), pso.as_raw());
+    } else {
+        list.SetPipelineState(pso);
+    }
+}
+
 /// Called with the original six ABI views bound. The extended signature is
 /// common to every piece and the whole fallback. Choose before recording any
 /// part of the dispatch, including when scratch allocation fails.
@@ -135,7 +147,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let scratch = size.filter(|&n| n <= u32::MAX as u64 + 1 && allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
         .and_then(|n| scratch_buffer(&chain.builder.device, n));
     let Some(scratch) = scratch else {
-        list.SetPipelineState(&chain.whole()?);
+        bind(list, &chain.whole()?);
         list.Dispatch(x, y, z);
         return Ok(());
     };
@@ -143,6 +155,6 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let held = Arc::new(Recording { scratch, first, chain });
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
-    pso::record_dispatch_chain(list, grid, &held.scratch, std::iter::once(&held.first).chain(&held.chain.tail));
+    pso::record_dispatch_chain(list, grid, &held.scratch, std::iter::once(&held.first).chain(&held.chain.tail), |p| bind(list, p));
     Ok(())
 }

@@ -1207,10 +1207,11 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
     abi_signature(dev, graphics, samplers, false)
 }
 
-/// Record all piece dispatches after the six common root views have been bound.
+/// Record all piece dispatches after the six common root views have been bound. `bind` sets each
+/// piece on `list` (on a title's list: past the hook of a title's SetPipelineState).
 pub(crate) unsafe fn record_dispatch_chain<'a>(
     list: &ID3D12GraphicsCommandList, grid: [u32; 3], scratch: &ID3D12Resource,
-    pieces: impl IntoIterator<Item = &'a ID3D12PipelineState>,
+    pieces: impl IntoIterator<Item = &'a ID3D12PipelineState>, bind: impl Fn(&ID3D12PipelineState),
 ) {
     let [x, y, z] = grid;
     list.SetComputeRootUnorderedAccessView(6, scratch.GetGPUVirtualAddress());
@@ -1221,7 +1222,7 @@ pub(crate) unsafe fn record_dispatch_chain<'a>(
         }
         let constants = [x, y, z, i as u32];
         list.SetComputeRoot32BitConstants(7, 4, constants.as_ptr().cast(), 0);
-        list.SetPipelineState(piece);
+        bind(piece);
         list.Dispatch(x, y, z);
     }
 

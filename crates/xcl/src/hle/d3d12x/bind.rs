@@ -1346,7 +1346,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         Ok(()) => {
             if compute {
                 match super::real::dispatch_chain::whole(pso) {
-                    Ok(Some(whole)) => list.SetPipelineState(&whole),
+                    // (past the hook, as `bind_abi` binds the pipeline)
+                    Ok(Some(whole)) => super::list_x::set_compute_pipeline(this, whole.as_raw()),
                     Ok(None) => {}
                     Err(e) => {
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
