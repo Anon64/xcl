@@ -542,7 +542,7 @@ pub(super) unsafe fn note_render_targets(this: *mut c_void, n: u32, rtvs: *const
 /// The render target views bound on `list` (each one of a single descriptor range too).
 pub(super) unsafe fn bound_render_targets(list: *mut c_void) -> Vec<usize> {
     static INC: AtomicU32 = AtomicU32::new(0);
-    let Some(rt) = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).and_then(|s| s.bindings.render_targets.clone()) else {
+    let Some(rt) = recording(list as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).and_then(|s| s.bindings.render_targets.clone()) else {
         return Vec::new();
     };
     if rt.single == 0 || rt.num_targets <= 1 {
