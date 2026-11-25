@@ -916,7 +916,13 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             }
             Err(e) => {
                 p.disabled = matches!(&e, FenceError::Removed(_));
-                crate::xlog_error!("present: frame dump copy: {e}");
+                // (a copy queued behind the title's work is no stopped GPU: not the fence's
+                // text, which a watchdog reads as one; its buffers stay on the ring slot)
+                if let FenceError::Timeout(ms) = e {
+                    crate::xlog_warn!("present: frame dump copy: not finished after {ms} ms – this dump is skipped");
+                } else {
+                    crate::xlog_error!("present: frame dump copy: {e}");
+                }
                 if p.disabled {
                     return;
                 }
