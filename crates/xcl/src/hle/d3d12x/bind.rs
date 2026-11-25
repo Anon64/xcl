@@ -479,8 +479,7 @@ unsafe fn bind_two_pass_stage(
     // the pair is translated with heap windows when they are on (`pso::mem_windows`): as `bind_abi`
     super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
-    let windows = super::real::uma_window_vas();
-    let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
+    let first = first_window(super::real::uma_window_va(0), u.shadowed())?;
     let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
@@ -497,7 +496,7 @@ unsafe fn bind_two_pass_stage(
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs_raw = if compute_pass { tp.compute_rs } else { tp.mesh_rs } as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs_raw).ok_or("two-pass root signature")?;
-    let views = [va(io_at), res_va].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    let views = [va(io_at), res_va].into_iter().chain((0..4).map(|k| super::real::uma_window_va(k).unwrap_or(first)));
     if compute_pass {
         list.SetComputeRootSignature(rs);
         for (k, v) in views.enumerate() {
@@ -1514,6 +1513,18 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     Ok(())
 }
 
+/// Window 0's GPU address (`window0`: `real::uma_window_va(0)`), which a bind on XCL's ABI
+/// reads descriptor tables from and binds for a window without a buffer of its own. Shadowed
+/// unified memory whose sparse windows could not be made (no reserved resources either) has
+/// none there, and a null root descriptor is not bound.
+fn first_window(window0: Option<u64>, shadowed: bool) -> Result<u64, String> {
+    let first = window0.ok_or("unified memory is not open on the GPU")?;
+    if first == 0 && shadowed {
+        return Err("window 0 of unified memory has no buffer on the GPU".into());
+    }
+    Ok(first)
+}
+
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
@@ -1522,12 +1533,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         super::list_x::ensure_view_heap(this);
     }
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
-    let first = super::real::uma_window_va(0).ok_or("unified memory is not open on the GPU")?;
-    // shadowed unified memory whose sparse windows could not be made (no reserved resources
-    // either): descriptor tables are read from window 0, and a null root descriptor is not bound
-    if first == 0 && u.shadowed() {
-        return Err("window 0 of unified memory has no buffer on the GPU".into());
-    }
+    let first = first_window(super::real::uma_window_va(0), u.shadowed())?;
     let (layout, args, heaps) = with(this, |s| {
         let (layout, args) = if gfx { (&s.layout_gfx, &s.args_gfx) } else { (&s.layout, &s.args) };
         (layout.clone(), args.clone(), s.heaps)
@@ -2144,6 +2150,17 @@ void main(uint t : SV_GroupIndex) {
         }
         let io = two_pass_io(None, &[], 0x4_1234_5600, true, base, [0; 2]);
         assert_eq!((io[8], io[9]), (0x1234_5600, 4));
+    }
+
+    /// Binds on XCL's ABI (`bind_abi`, both two-pass stages) take window 0 the same way: not
+    /// open on the GPU is refused, and so is shadowed memory without a buffer there (a null root
+    /// descriptor); unshadowed memory with none keeps going as before.
+    #[test]
+    fn binds_refuse_shadowed_memory_without_window_0() {
+        assert!(first_window(None, false).is_err());
+        assert!(first_window(Some(0), true).is_err());
+        assert_eq!(first_window(Some(0), false), Ok(0));
+        assert_eq!(first_window(Some(0x7_0000_0000), true), Ok(0x7_0000_0000));
     }
 
     /// The two passes get the addresses of the heaps set after their arguments, the view heap's
