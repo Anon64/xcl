@@ -30,6 +30,7 @@ pub mod real;
 mod shader_cache_session;
 pub mod sparse;
 pub mod title_list;
+mod submit_cost;
 pub mod title_textures;
 pub mod vram;
 

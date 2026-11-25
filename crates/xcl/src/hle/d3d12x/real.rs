@@ -5843,6 +5843,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         return;
     }
     // textures in title memory the CPU wrote since: uploaded again first
+    let submit_t0 = std::time::Instant::now();
     super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
@@ -5857,18 +5858,23 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::gpu_profile::note_queue(this);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
+        let t = std::time::Instant::now();
         f(this, chunk.len() as u32, chunk.as_ptr());
+        let t1 = std::time::Instant::now();
+        super::submit_cost::driver(t1 - t);
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
         super::list_x::note_submitted(this);
+        super::submit_cost::after(t1.elapsed());
     });
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
+    super::submit_cost::done(submit_t0);
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code

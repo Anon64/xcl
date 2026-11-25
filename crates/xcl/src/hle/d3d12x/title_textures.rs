@@ -702,7 +702,9 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
     if BUSY.with(|b| b.get()) {
         return;
     }
+    let t0 = std::time::Instant::now();
     let _refresh = REFRESH.lock().unwrap();
+    super::submit_cost::lock_wait(t0.elapsed());
     // with the lock: the look before this one is done, and its uploads are submitted
     let old = closed_before_last_look(lists);
     static N: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -714,7 +716,9 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
             if look_skip() { "their looks were left out" } else { "XCL_LOOK_SKIP=1 leaves their looks out" }
         );
     }
+    let t1 = std::time::Instant::now();
     own_work(|| refresh_once(queue, !(old && look_skip())));
+    super::submit_cost::refresh(t1.elapsed());
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
