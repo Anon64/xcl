@@ -287,6 +287,63 @@ pub mod mirrors {
             .filter_map(|(&gpu, &(size, cpu))| (cpu_va >= cpu && cpu_va < cpu + size).then(|| gpu + (cpu_va - cpu)))
             .collect()
     }
+
+    /// Bytes of a page the queue's page-mapping method maps (the console's 64 KiB pages).
+    pub const PAGE: usize = 0x1_0000;
+
+    /// The mappings of one call of the queue's page-mapping method, `CopyPageMappingsBatchX(count,
+    /// batches, pool, pool pages, …)` (queue #29; #31 in the newer layout), checked whole: (GPU-view
+    /// page, the pool page it is given or `None`: unmapped), in the call's order. `count` batches
+    /// of 24 bytes – the first destination address (u64), the number of ranges (u32), a pointer
+    /// to them at +16 – each range three u32: the kind (0: `count` pool pages from `start` on,
+    /// 1: pool page `start` at each of `count` pages, 2: unmapped, 3: left as they are), `start`
+    /// and `count`. The pool is `pool_pages` pages of `PAGE` at `pool`. `None` when a batch or a
+    /// range is not readable, a range leaves the pool or has an unknown kind, or the call names
+    /// over `MOST` pages. No lock.
+    pub unsafe fn decode_batches(count: u32, batches: usize, pool: usize, pool_pages: u32) -> Option<Vec<(usize, Option<usize>)>> {
+        const BATCH: usize = 24;
+        const RANGE: usize = 12;
+        const MOST: usize = 1 << 20;
+        let readable = crate::gpu::shader::readable;
+        let n = count as usize;
+        if n == 0 {
+            return Some(Vec::new());
+        }
+        if n > MOST || !readable(batches, n * BATCH) {
+            return None;
+        }
+        let mut changes: Vec<(usize, Option<usize>)> = Vec::new();
+        for b in 0..n {
+            let p = batches + b * BATCH;
+            let dest = (p as *const u64).read_unaligned() as usize & !(PAGE - 1);
+            let ranges_n = ((p + 8) as *const u32).read_unaligned() as usize;
+            let ranges = ((p + 16) as *const usize).read_unaligned();
+            if ranges_n == 0 {
+                continue;
+            }
+            if ranges_n > MOST || !readable(ranges, ranges_n * RANGE) {
+                return None;
+            }
+            let mut at = dest;
+            for r in 0..ranges_n {
+                let q = (ranges + r * RANGE) as *const u32;
+                let (kind, start, len) = (q.read_unaligned(), q.add(1).read_unaligned() as usize, q.add(2).read_unaligned() as usize);
+                let inside = |k: usize| start.checked_add(k).is_some_and(|e| e <= pool_pages as usize);
+                if changes.len() + len > MOST || at.checked_add(len * PAGE).is_none() {
+                    return None;
+                }
+                match kind {
+                    0 if inside(len) => changes.extend((0..len).map(|k| (at + k * PAGE, Some(pool + (start + k) * PAGE)))),
+                    1 if start < pool_pages as usize => changes.extend((0..len).map(|k| (at + k * PAGE, Some(pool + start * PAGE)))),
+                    2 => changes.extend((0..len).map(|k| (at + k * PAGE, None))),
+                    3 => {}
+                    _ => return None,
+                }
+                at += len * PAGE;
+            }
+        }
+        Some(changes)
+    }
 }
 
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
@@ -3575,6 +3632,65 @@ mod tests {
             // freed: no address names them
             assert_eq!(FreeTitlePhysicalPages(null, 2, pages.as_mut_ptr()), 1);
             assert!(AWAY.lock().unwrap().as_ref().is_some_and(|a| a.title.values().all(|&v| v != p && v != q)));
+        }
+    }
+
+    /// A batch of the queue's page-mapping method: the first destination, the number of ranges
+    /// (`kind, start, count` each) and a pointer to them.
+    #[repr(C)]
+    struct Batch {
+        dest: u64,
+        ranges_n: u32,
+        _pad: u32,
+        ranges: usize,
+    }
+    fn batch(dest: usize, r: &[[u32; 3]]) -> Batch {
+        Batch { dest: dest as u64, ranges_n: r.len() as u32, _pad: 0, ranges: r.as_ptr() as usize }
+    }
+
+    /// The page-mapping method's batches decode to (GPU-view page, pool page or unmapped) in the
+    /// call's order, from the destination's page on; a call with anything wrong in it gives
+    /// nothing at all.
+    #[test]
+    fn the_page_mapping_batches_are_decoded_whole() {
+        use mirrors::{decode_batches, PAGE};
+        let (d, d2, pool, pool_pages) = (0x7100_0004_0000usize, 0x7300_0000_0000usize, 0x7200_0000_0000usize, 64u32);
+        unsafe {
+            // two pool pages from 10 on, one page kept, pool page 5 three times, one unmapped;
+            // then a second batch of two pages
+            let r1 = [[0, 10, 2], [3, 0, 1], [1, 5, 3], [2, 0, 1]];
+            let r2 = [[0, 0, 2]];
+            let b = [batch(d + 0x1234, &r1), batch(d2, &r2)];
+            let want = vec![
+                (d, Some(pool + 10 * PAGE)),
+                (d + PAGE, Some(pool + 11 * PAGE)),
+                (d + 3 * PAGE, Some(pool + 5 * PAGE)),
+                (d + 4 * PAGE, Some(pool + 5 * PAGE)),
+                (d + 5 * PAGE, Some(pool + 5 * PAGE)),
+                (d + 6 * PAGE, None),
+                (d2, Some(pool)),
+                (d2 + PAGE, Some(pool + PAGE)),
+            ];
+            assert_eq!(decode_batches(2, b.as_ptr() as usize, pool, pool_pages), Some(want));
+            // a batch with no ranges gives nothing and refuses nothing
+            let none = Batch { dest: d as u64, ranges_n: 0, _pad: 0, ranges: 0 };
+            assert_eq!(decode_batches(1, [none].as_ptr() as usize, pool, pool_pages), Some(Vec::new()));
+            assert_eq!(decode_batches(0, 0, pool, pool_pages), Some(Vec::new()), "no batches");
+
+            // bad calls: a range leaving the pool (after a good one), an unknown kind, ranges and
+            // batches that are not readable, more than MOST pages
+            let leaves = [[0, 0, 1], [0, 63, 2]];
+            assert_eq!(decode_batches(1, [batch(d, &leaves)].as_ptr() as usize, pool, pool_pages), None);
+            let one_out = [[1, 64, 1]];
+            assert_eq!(decode_batches(1, [batch(d, &one_out)].as_ptr() as usize, pool, pool_pages), None);
+            let unknown = [[7, 0, 1]];
+            assert_eq!(decode_batches(1, [batch(d, &unknown)].as_ptr() as usize, pool, pool_pages), None);
+            let unreadable = Batch { dest: d as u64, ranges_n: 1, _pad: 0, ranges: 0 };
+            assert_eq!(decode_batches(1, [unreadable].as_ptr() as usize, pool, pool_pages), None);
+            assert_eq!(decode_batches(1, 0, pool, pool_pages), None, "batches not readable");
+            let many = [[2, 0, (1 << 20) + 1]];
+            assert_eq!(decode_batches(1, [batch(d, &many)].as_ptr() as usize, pool, pool_pages), None);
+            assert_eq!(decode_batches((1 << 20) + 1, b.as_ptr() as usize, pool, pool_pages), None);
         }
     }
 
