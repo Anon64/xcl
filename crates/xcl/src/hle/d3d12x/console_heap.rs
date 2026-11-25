@@ -25,6 +25,7 @@
 //! Without the shared heap (it could not be made) a heap keeps its own PC heap: SRV at 2k,
 //! UAV at 2k + 1.
 
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 
 use windows::core::Interface;
@@ -129,14 +130,121 @@ unsafe fn fill_nulls(dev: &ID3D12Device, cpu: u64, inc: u32, from: u32, to: u32,
     while at < to {
         let skew = at % 2;
         let n = (NULL_BLOCK - skew).min(to - at);
-        dev.CopyDescriptorsSimple(
-            n,
-            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + at as u64 * inc as u64) as usize },
-            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (nulls + skew as u64 * inc as u64) as usize },
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-        );
+        copy_views(dev, n, cpu + at as u64 * inc as u64, nulls + skew as u64 * inc as u64);
         at += n;
     }
+}
+
+/// CopyDescriptorsSimple of `n` view descriptors, past XCL's hook of an adopted device (which
+/// looks up the console heaps for each call: `HEAPS`, then `GLOBAL`), so that it can be made
+/// with `SLOT_WRITES` held.
+unsafe fn copy_views(dev: &ID3D12Device, n: u32, dst: u64, src: u64) {
+    let raw = dev.as_raw();
+    if super::real::is_adopted(raw) {
+        let f: unsafe extern "system" fn(*mut std::ffi::c_void, u32, u64, u64, u32) = std::mem::transmute(super::real::orig_fn(raw, 24));
+        return f(raw, n, dst, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32);
+    }
+    dev.CopyDescriptorsSimple(n, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+}
+
+/// Which PC resource the descriptor at each index of the shared heap names, and the other way
+/// round – so that the views of a resource that is destroyed can be made null views.
+///
+/// A title keeps T#s (each with an index in the shared heap) in its own memory, and its shaders
+/// read them from there. On the console a T# of a released texture still names memory (leftover
+/// bytes, nothing faults), and a title can sample a texture it has released (a material table
+/// not updated yet, a sample of weight zero). On the PC the slot would keep a descriptor of a
+/// destroyed resource: a shader that samples it touches an unmapped address.
+struct Names {
+    /// index → the resource its descriptor names (0: none, a null view, or not known); the truth
+    slots: Vec<AtomicUsize>,
+    /// resource → indexes that named it (some may name another since: `slots` says)
+    by: super::sharded::Sharded<Vec<u32>>,
+}
+
+impl Names {
+    fn new(n: usize) -> Names {
+        Names { slots: (0..n).map(|_| AtomicUsize::new(0)).collect(), by: super::sharded::Sharded::new() }
+    }
+
+    fn name(&self, i: u32) -> usize {
+        self.slots.get(i as usize).map_or(0, |s| s.load(Relaxed))
+    }
+
+    /// The descriptor at `i` names `res` now (0: none). With `SLOT_WRITES` held, along with the
+    /// write of the descriptor.
+    fn note(&self, i: u32, res: usize) {
+        let Some(s) = self.slots.get(i as usize) else { return };
+        if s.swap(res, Relaxed) == res || res == 0 {
+            return;
+        }
+        self.by.with(res, |v| {
+            v.push(i);
+            // a resource whose views are made again and again: only the indexes that still name it
+            if v.len() >= 64 && v.len().is_power_of_two() {
+                v.retain(|&j| self.name(j) == res);
+                v.sort_unstable();
+                v.dedup();
+            }
+        });
+    }
+
+    fn clear(&self, from: u32, to: u32) {
+        for i in from..to {
+            if let Some(s) = self.slots.get(i as usize) {
+                s.store(0, Relaxed);
+            }
+        }
+    }
+
+    /// The indexes whose descriptor may name `res` (None: none ever did – the common case, one
+    /// lookup), forgotten here.
+    fn candidates(&self, res: usize) -> Option<Vec<u32>> {
+        self.by.remove(res)
+    }
+
+    /// Whether the descriptor at `i` still names `res`: then it names nothing from now on (the
+    /// caller writes a null view there, with `SLOT_WRITES` held). One overwritten since names
+    /// another resource and stays.
+    fn claim(&self, i: u32, res: usize) -> bool {
+        self.slots.get(i as usize).is_some_and(|s| s.compare_exchange(res, 0, Relaxed, Relaxed).is_ok())
+    }
+}
+
+/// (made with the first view written to the shared heap: 8 bytes an index)
+static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
+
+/// Writes of descriptors into the shared heap and of what they name (`NAMES`), one at a time:
+/// a null view for a destroyed resource must not come over a view another thread just wrote.
+/// Taken before `GLOBAL` or `HEAPS`, never with them held.
+static SLOT_WRITES: Mutex<()> = Mutex::new(());
+
+fn names() -> &'static Names {
+    NAMES.get_or_init(|| Names::new(GLOBAL_MAX as usize))
+}
+
+/// What null views are copied from: the device, the shared heap's start and increment, the
+/// null views' start (None: no shared heap, or no null views).
+fn null_source() -> Option<(ID3D12Device, u64, u32, u64)> {
+    GLOBAL.lock().unwrap().as_ref().and_then(|s| s.nulls.as_ref().map(|n| (s.dev.clone(), s.cpu, s.inc, n.1)))
+}
+
+/// The PC resource `res` is destroyed next: every descriptor of the shared heap that still names
+/// it becomes the null view of its kind (SRV at even indexes, UAV at odd). The number of them.
+/// A resource that never had a view in the shared heap costs one lookup.
+pub fn resource_gone(res: usize) -> usize {
+    let Some(n) = NAMES.get() else { return 0 };
+    let Some(candidates) = n.candidates(res) else { return 0 };
+    let Some((dev, cpu, inc, nulls)) = null_source() else { return 0 };
+    let _w = SLOT_WRITES.lock().unwrap();
+    let mut nulled = 0;
+    for i in candidates {
+        if n.claim(i, res) {
+            unsafe { fill_nulls(&dev, cpu, inc, i, i + 1, nulls) };
+            nulled += 1;
+        }
+    }
+    nulled
 }
 
 /// view slots per page of a heap's place in the shared heap (2 PC descriptors each)
@@ -179,7 +287,6 @@ fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) 
 /// The shared shader-visible heap, made on first use. False: there is none (it could not be
 /// made) – view heaps then keep their own.
 pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
     {
         let g = GLOBAL.lock().unwrap();
         if g.is_some() {
@@ -368,10 +475,13 @@ pub fn release_global(first: u32, count: u32) {
     if count == 0 {
         return;
     }
-    let fill = GLOBAL.lock().unwrap().as_ref().and_then(|s| s.nulls.as_ref().map(|n| (s.dev.clone(), s.cpu, s.inc, n.1)));
-    if let Some((dev, cpu, inc, nulls)) = fill {
-        // (outside `GLOBAL`: the device's descriptor hooks; the range is still the released heap's)
+    if let Some((dev, cpu, inc, nulls)) = null_source() {
+        // (the range is still the released heap's)
+        let _w = SLOT_WRITES.lock().unwrap();
         unsafe { fill_nulls(&dev, cpu, inc, first, first + count, nulls) };
+        if let Some(n) = NAMES.get() {
+            n.clear(first, first + count);
+        }
     }
     if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
         merge_release(&mut s.free, first, count);
@@ -536,28 +646,46 @@ pub fn slot(cpu: u64) -> Option<Slot> {
     Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
 }
 
-/// The view just made in slot `s` (its SRV, or with `uav` its UAV) goes to the shared heap.
-pub unsafe fn publish(s: &Slot, uav: bool) {
+/// The view just made in slot `s` (its SRV, or with `uav` its UAV) of the PC resource `res` (0:
+/// a null view) goes to the shared heap.
+pub unsafe fn publish(s: &Slot, uav: bool, res: usize) {
     if s.shared_srv == 0 {
         return;
     }
-    if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
-        let (dst, src) = if uav { (s.shared_srv + g.inc as u64, s.pc_uav) } else { (s.shared_srv, s.pc_srv) };
-        g.dev.CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    let Some((dev, inc)) = GLOBAL.lock().unwrap().as_ref().map(|g| (g.dev.clone(), g.inc)) else { return };
+    let (dst, src) = if uav { (s.shared_srv + inc as u64, s.pc_uav) } else { (s.shared_srv, s.pc_srv) };
+    let _w = SLOT_WRITES.lock().unwrap();
+    copy_views(&dev, 1, dst, src);
+    names().note(s.index + uav as u32, res);
+}
+
+/// The PC resources the SRV and the UAV of view slot `s` name in the shared heap (0: not known,
+/// or the slot has no place there): what `publish_range` takes for a copy of it.
+pub fn names_of(s: &Slot) -> (usize, usize) {
+    match (s.shared_srv, NAMES.get()) {
+        (0, _) | (_, None) => (0, 0),
+        (_, Some(n)) => (n.name(s.index), n.name(s.index + 1)),
     }
 }
 
 /// `n` view slots from `first` were copied (in the title's heap): they go to the shared heap,
-/// a run per page (a heap's pages lie apart there).
-pub unsafe fn publish_range(first: &Slot, n: u32) {
+/// a run per page (a heap's pages lie apart there). `names`: what the source slots' SRV and UAV
+/// name (`names_of`), one pair a slot.
+pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
+    let Some(dev) = GLOBAL.lock().unwrap().as_ref().map(|g| g.dev.clone()) else { return };
     let mut done = 0;
     while done < n {
         let s = if done == 0 { Some(*first) } else { slot((first.at + (done * SLOT) as usize) as u64) };
         let Some(s) = s else { return };
         let run = (PAGE_SLOTS - s.k % PAGE_SLOTS).min(n - done);
         if s.shared_srv != 0 {
-            if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
-                g.dev.CopyDescriptorsSimple(2 * run, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let _w = SLOT_WRITES.lock().unwrap();
+            copy_views(&dev, 2 * run, s.shared_srv, s.pc_srv);
+            let m = self::names();
+            for j in 0..run {
+                let (srv, uav) = names.get((done + j) as usize).copied().unwrap_or((0, 0));
+                m.note(s.index + 2 * j, srv);
+                m.note(s.index + 2 * j + 1, uav);
             }
         }
         done += run;
@@ -868,6 +996,51 @@ mod tests {
             }
             assert_eq!(at, to, "{from}..{to}: all of it");
         }
+    }
+
+    /// What each index of the shared heap names: a destroyed resource's views (also copies of
+    /// them) are claimed for null views, an index overwritten since by another resource's view
+    /// is not, and a resource that never had a view costs one lookup and claims nothing.
+    #[test]
+    fn a_destroyed_resources_views_are_claimed_and_no_other() {
+        let (a, b, c) = (0xA000usize, 0xB000usize, 0xC000usize);
+        let n = Names::new(64);
+        n.note(4, a); // SRV of slot 2
+        n.note(5, a); // its UAV
+        n.note(8, a);
+        n.note(8, b); // overwritten by a view of b
+        // a copy of slot 2 to slot 6 (`names_of` of the source, then `publish_range`)
+        let (srv, uav) = (n.name(4), n.name(5));
+        n.note(12, srv);
+        n.note(13, uav);
+        n.note(20, a);
+        n.clear(20, 22); // a released range: null views there already
+        assert!(n.candidates(c).is_none(), "a resource without views");
+        let mut claimed: Vec<u32> = n.candidates(a).unwrap().into_iter().filter(|&i| n.claim(i, a)).collect();
+        claimed.sort_unstable();
+        assert_eq!(claimed, vec![4, 5, 12, 13], "a's views and their copies; not 8 (b's now), not 20 (nulled)");
+        assert_eq!((n.name(4), n.name(8), n.name(12)), (0, b, 0));
+        assert!(n.candidates(a).is_none(), "forgotten");
+        // b goes: its one view
+        let claimed: Vec<u32> = n.candidates(b).unwrap().into_iter().filter(|&i| n.claim(i, b)).collect();
+        assert_eq!(claimed, vec![8]);
+    }
+
+    /// A resource whose views are made again and again into the same few slots keeps a list of
+    /// those slots, not one entry for each view.
+    #[test]
+    fn views_made_again_do_not_grow_a_resources_list() {
+        let (a, b) = (0xA000usize, 0xB000usize);
+        let n = Names::new(64);
+        for k in 0..10_000u32 {
+            n.note(k % 4, a);
+            n.note(k % 4, b);
+        }
+        n.note(1, a);
+        let v = n.candidates(a).unwrap();
+        assert!(v.len() < 128, "{} entries", v.len());
+        assert_eq!(v.iter().filter(|&&i| n.claim(i, a)).count(), 1, "only slot 1 is a's now");
+        assert!(n.candidates(b).unwrap().len() < 128);
     }
 
     #[test]
