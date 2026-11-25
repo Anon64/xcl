@@ -3064,6 +3064,32 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
 }
 
+/// A UAV barrier for all resources on `list`, where a list takes one (a copy list and a bundle
+/// do not).
+unsafe fn flush_barrier(list: *mut c_void) {
+    let ty = list_type(list);
+    if ty == D3D12_COMMAND_LIST_TYPE_DIRECT || ty == D3D12_COMMAND_LIST_TYPE_COMPUTE {
+        uav_barrier_x(list, 0, std::ptr::null());
+    }
+}
+
+/// command list #131 FlushGpuCacheRangeX / #132 FlushShaderCacheRangeX (cache flags, wait flags,
+/// address, bytes), the newer layout's: the console writes its caches back (or drops what they
+/// hold) for a range of memory and waits for the work before it. It is how a title orders a pass
+/// behind the one that wrote what it reads – a retail title calls them thousands of times a minute,
+/// and answered with nothing its passes had no order there. The PC has no ranges of caches: a UAV
+/// barrier for everything.
+pub(super) unsafe extern "system" fn flush_cache_range_x(this: *mut c_void, flags: u32, wait: u32, _va: u64, bytes: u64) {
+    if (flags != 0 || wait != 0) && bytes != 0 {
+        flush_barrier(this);
+    }
+}
+
+/// command list #67 (newer layout: #69) FlushPipelineX(flags, address, bytes)
+pub(super) unsafe extern "system" fn flush_pipeline_x(this: *mut c_void, _flags: u32, _va: u64, _bytes: u64) {
+    flush_barrier(this);
+}
+
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
 pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
@@ -6350,6 +6376,56 @@ mod tests {
                 would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
                 "a wait only this signal satisfies, armed before the waiter's own signal, MUST be a cycle"
             );
+        }
+    }
+
+    /// The console's cache flushes are UAV barriers for all resources on lists that take them; a
+    /// flush of nothing, a copy list's and a bundle's are not.
+    #[test]
+    fn cache_flushes_are_uav_barriers() {
+        #[repr(C)]
+        struct FakeFlushList {
+            vt: *const usize,
+            ty: i32,
+            barriers: Mutex<Vec<(i32, usize)>>,
+        }
+        unsafe extern "system" fn get_type(this: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+            D3D12_COMMAND_LIST_TYPE((*(this as *const FakeFlushList)).ty)
+        }
+        unsafe extern "system" fn barrier(this: *mut c_void, n: u32, b: *const D3D12_RESOURCE_BARRIER) {
+            for k in 0..n as usize {
+                let b = &*b.add(k);
+                let res = (*b.Anonymous.UAV).pResource.as_ref().map_or(0, |r| r.as_raw() as usize);
+                (*(this as *const FakeFlushList)).barriers.lock().unwrap().push((b.Type.0, res));
+            }
+        }
+        let mut orig_vt = [0usize; 64];
+        orig_vt[PC_GET_TYPE] = get_type as usize;
+        orig_vt[PC_RESOURCE_BARRIER] = barrier as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let mut fake = Box::new(FakeFlushList { vt: unsafe { ext_vt.as_ptr().add(1) }, ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0, barriers: Mutex::new(Vec::new()) });
+        let uav = (D3D12_RESOURCE_BARRIER_TYPE_UAV.0, 0);
+        unsafe {
+            let list = &mut *fake as *mut FakeFlushList as *mut c_void;
+            flush_cache_range_x(list, 0xc3c0, 0x8002_0000, 0, 0xFFFF_FFFF_FF00);
+            flush_cache_range_x(list, 0, 0x8000_0000, 0x1000, 0x100);
+            flush_pipeline_x(list, 1, 0, 0);
+            assert_eq!(*fake.barriers.lock().unwrap(), vec![uav; 3]);
+            // nothing asked for, or of no memory
+            flush_cache_range_x(list, 0, 0, 0, 0x1000);
+            flush_cache_range_x(list, 0xc3c0, 0, 0, 0);
+            assert_eq!(fake.barriers.lock().unwrap().len(), 3);
+            fake.ty = D3D12_COMMAND_LIST_TYPE_DIRECT.0;
+            flush_cache_range_x(list, 0xc3c0, 0, 0, 1);
+            assert_eq!(fake.barriers.lock().unwrap().len(), 4);
+            for ty in [D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_BUNDLE] {
+                fake.ty = ty.0;
+                flush_cache_range_x(list, 0xc3c0, 0, 0, 1);
+                flush_pipeline_x(list, 1, 0, 0);
+            }
+            assert_eq!(fake.barriers.lock().unwrap().len(), 4);
         }
     }
 

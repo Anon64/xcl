@@ -1071,6 +1071,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (61, l::fill32_x as usize),
                 (62, l::fill64_x as usize),
                 (63, l::fill128_x as usize),
+                (67, l::flush_pipeline_x as usize),
                 (68, l::set_depth_bounds_x as usize),
                 (69, l::write32_bottom_x as usize),
                 (70, l::write64_bottom_x as usize),
@@ -1085,6 +1086,9 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
+                // the newer layout's (called before anything tells the layouts apart)
+                (131, l::flush_cache_range_x as usize),
+                (132, l::flush_cache_range_x as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
@@ -5598,7 +5602,7 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 21] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
+const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (69, 67), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
