@@ -399,14 +399,7 @@ pub mod mirrors {
             if page != 0 {
                 self.by_page.entry(page).or_default().push(g);
             }
-            if at != 0 {
-                self.by_at.insert((at, g));
-                let n = self.blocks.entry(at >> 24).or_insert(0);
-                *n += 1;
-                if *n == 1 {
-                    SHOWN_GEN.fetch_add(1, Ordering::Release);
-                }
-            }
+            self.link_at(at, g);
             self.log.insert(seq, g);
             self.shown.insert(g, Shown { page, at, tile, call, seq });
             MAPPED.store(self.shown.len(), Ordering::Release);
@@ -430,17 +423,52 @@ pub mod mirrors {
                     self.by_page.remove(&e.page);
                 }
             }
-            if e.at != 0 {
-                self.by_at.remove(&(e.at, g));
-                if let Some(n) = self.blocks.get_mut(&(e.at >> 24)) {
+            self.unlink_at(e.at, g);
+            self.log.remove(&e.seq);
+        }
+
+        /// `g` is kept at `at` (0: nothing) in `by_at` and `blocks`.
+        fn link_at(&mut self, at: usize, g: usize) {
+            if at != 0 {
+                self.by_at.insert((at, g));
+                let n = self.blocks.entry(at >> 24).or_insert(0);
+                *n += 1;
+                if *n == 1 {
+                    SHOWN_GEN.fetch_add(1, Ordering::Release);
+                }
+            }
+        }
+
+        /// `g` is no longer kept at `at` (0: nothing) in `by_at` and `blocks`.
+        fn unlink_at(&mut self, at: usize, g: usize) {
+            if at != 0 {
+                self.by_at.remove(&(at, g));
+                if let Some(n) = self.blocks.get_mut(&(at >> 24)) {
                     *n -= 1;
                     if *n == 0 {
-                        self.blocks.remove(&(e.at >> 24));
+                        self.blocks.remove(&(at >> 24));
                         SHOWN_GEN.fetch_add(1, Ordering::Release);
                     }
                 }
             }
-            self.log.remove(&e.seq);
+        }
+
+        /// The page `g` shows is kept at `at` now (0: nowhere), with `tile` for it. A move
+        /// keeps its call and its place in the log; `changed` (a call) logs it as a change of
+        /// what `g` shows: its bytes appear or go.
+        fn place(&mut self, g: usize, at: usize, tile: bool, changed: Option<u64>) {
+            let Some(mut e) = self.shown.get(&g).copied() else { return };
+            self.unlink_at(e.at, g);
+            self.link_at(at, g);
+            (e.at, e.tile) = (at, tile);
+            if let Some(call) = changed {
+                self.log.remove(&e.seq);
+                self.seq += 1;
+                (e.seq, e.call) = (self.seq, call);
+                self.log.insert(e.seq, g);
+                CHANGE_SEQ.store(e.seq, Ordering::Release);
+            }
+            self.shown.insert(g, e);
         }
     }
 
@@ -456,6 +484,8 @@ pub mod mirrors {
     static CHANGE_SEQ: AtomicU64 = AtomicU64::new(0);
     /// Counts the times a 16 MiB block came to hold the place of a shown page, or ceased to.
     static SHOWN_GEN: AtomicU64 = AtomicU64::new(0);
+    /// GPU-view pages whose page moved, and whose place followed it (`page_at`).
+    static MOVED: AtomicU64 = AtomicU64::new(0);
 
     fn read_pages() -> std::sync::RwLockReadGuard<'static, Pages> {
         PAGES.read().unwrap_or_else(|e| e.into_inner())
@@ -626,6 +656,47 @@ pub mod mirrors {
         CALLS.load(Ordering::Acquire)
     }
 
+    /// XCL keeps physical page `page`'s bytes at `at` now (0: nowhere; `tile`: a tile may show
+    /// it there): the GPU-view pages that show it follow. A move is no change of what they show
+    /// (their call and their place in the log stay), but a page that gets its first place, or
+    /// loses it, is: its bytes appear or go. `None` when no page shows it elsewhere (one atomic
+    /// load while nothing is recorded); else where it was kept and the pages that followed.
+    /// Called on the moving thread with AWAY held, before the memory it left can go.
+    pub(super) fn page_at(page: usize, at: usize, tile: bool) -> Option<(usize, Vec<usize>)> {
+        if MAPPED.load(Ordering::Acquire) == 0 || !read_pages().by_page.contains_key(&page) {
+            return None;
+        }
+        let mut p = write_pages();
+        let moving: Vec<(usize, usize)> =
+            p.by_page.get(&page)?.iter().filter_map(|&g| p.shown.get(&g).filter(|e| e.at != at || e.tile != tile).map(|e| (g, e.at))).collect();
+        if moving.is_empty() {
+            return None;
+        }
+        let call = calls();
+        let from = moving.iter().map(|&(_, f)| f).find(|&f| f != 0).unwrap_or(0);
+        for &(g, was) in &moving {
+            p.place(g, at, tile, ((was == 0) != (at == 0)).then_some(call));
+        }
+        drop(p);
+        MOVED.fetch_add(moving.len() as u64, Ordering::Relaxed);
+        Some((from, moving.into_iter().map(|(g, _)| g).collect()))
+    }
+
+    /// Physical page `page` was freed: the GPU-view pages that showed it show nothing from here
+    /// on (a change of what they show). Returns them. Caller holds AWAY.
+    pub(super) fn page_freed(page: usize) -> Vec<usize> {
+        if MAPPED.load(Ordering::Acquire) == 0 || !read_pages().by_page.contains_key(&page) {
+            return Vec::new();
+        }
+        let mut p = write_pages();
+        let gone = p.by_page.get(&page).cloned().unwrap_or_default();
+        let call = calls();
+        for &g in &gone {
+            p.set(g, 0, 0, false, call);
+        }
+        gone
+    }
+
     /// What the record says of GPU-view page `g` (a test's own pages).
     #[cfg(test)]
     pub(super) fn shown_at(g: usize) -> Option<Shown> {
@@ -646,6 +717,22 @@ fn place_of(away: Option<&Away>, page: usize) -> (usize, bool) {
 /// unified memory or a graphics reservation (a tile of a GPU view may show such a place).
 fn freeing_is_seen(at: usize) -> bool {
     crate::gpu::uma::get().is_some_and(|u| u.contains(at)) || in_graphics_reservation(at)
+}
+
+/// XCL keeps physical page `page`'s bytes at `at` now (0: nowhere; `home`: its home): the
+/// GPU-view pages that show it follow (`mirrors::page_at`). `whole`: its 64 KiB were copied
+/// there, a known write at the new address – a CPU write made just before the move went with the
+/// page and has no other report. Call it with AWAY held, once the bytes are in place and before
+/// the memory the page left can go.
+unsafe fn page_placed(page: usize, at: usize, home: bool, whole: bool) {
+    if !mirrors::any_mapped() {
+        return;
+    }
+    let tile = at != 0 && (home || freeing_is_seen(at));
+    let Some((_from, _shown)) = mirrors::page_at(page, at, tile) else { return };
+    if whole {
+        crate::hle::d3d12x::title_textures::note_known_write(at, PHYS_PAGE);
+    }
 }
 
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
@@ -1948,6 +2035,7 @@ unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usi
         // never used where it was mapped: its home still holds the page (zeros)
         if lazy::unmark(at) {
             pagelog::note("page unmapped (never used there)", at, 0, page);
+            page_placed(page, page_home(page).unwrap_or(0), true, false);
             return false;
         }
         pagelog::note("page unmapped (copied home)", at, 0, page);
@@ -1965,6 +2053,7 @@ unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usi
             #[cfg(test)]
             tests::HOME_COPIES.with(|c| c.set(c.get() + 1));
         }
+        page_placed(page, home.unwrap_or(0), true, home.is_some());
         // (an address among the homes the caller maps back is one of them: it stays)
         if !committed.contains(&at) {
             release_at(at);
@@ -2012,6 +2101,7 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
         crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
     }
     std::ptr::copy_nonoverlapping(old as *const u8, at as *mut u8, PHYS_PAGE);
+    page_placed(page, at, false, true);
     release_at(old);
     away.at.insert(at, page);
     away.page.insert(page, at);
@@ -2084,6 +2174,8 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
                 note_mapping_at(at);
                 pagelog::note("page freed while mapped (the address keeps its bytes)", at, 0, *arr.add(i));
             }
+            // (those at home too: their home goes with the block)
+            mirrors::page_freed(*arr.add(i));
         }
         // (page numbers are never handed out again: their entries go)
         if !away.title.is_empty() {
@@ -2222,6 +2314,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             away.at.insert(at, p);
             away.page.insert(p, at);
             away.title.insert(at, p);
+            page_placed(p, at, false, false);
             pagelog::note("page mapped (never used: zeros on first touch)", at, 0, p);
             continue;
         }
@@ -2239,6 +2332,8 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
                 crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
             }
             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
+            // (before the home can be given back)
+            page_placed(p, at, false, true);
             // (giving homes back decommits them, and one may be an address in the run)
             if sparse_run.holds(home) || away.gone.len() + 1 >= GIVE_BACK_PAGES {
                 sparse_run.flush();
@@ -2253,6 +2348,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             if in_sparse {
                 sparse_run.add(at);
             }
+            page_placed(p, at, false, true);
         }
         away.at.insert(at, p);
         away.page.insert(p, at);
@@ -4090,6 +4186,86 @@ mod tests {
             assert!(!touched(g, SIZE));
             assert_eq!(VirtualFree(pool as *mut c_void, 0, mem::MEM_RELEASE), 1);
             mem::VirtualFree(plain as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// A GPU-view page follows its physical page where XCL keeps it: mapped elsewhere (its bytes
+    /// move there), unmapped (home, with its bytes), mapped at the CPU view's same offset, and a
+    /// page never used mapped elsewhere (a place not committed yet). A move is no change of what
+    /// the page shows; a freed page shows nothing.
+    #[test]
+    fn a_gpu_view_page_follows_its_physical_page() {
+        use mirrors::{apply_batches, resolve, shown_at, shows, Shown, Shows, PAGE};
+        const SIZE: usize = 137 * PAGE;
+        let g = 0x7280_0000_0000usize;
+        let null = std::ptr::null_mut();
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
+            let [a, b] = pages;
+            let (home_a, home_b) = (page_home(a).unwrap(), page_home(b).unwrap());
+            let cv = cpu_view(SIZE, g);
+            // the pool and another address, graphics reservations both
+            let pool = reserve_watched(2 * PAGE, 0x2000, mem::PAGE_READWRITE) as usize;
+            let r = reserve_watched(2 * PAGE, 0x2000, mem::PAGE_READWRITE) as usize;
+            assert!(pool != 0 && r != 0);
+            for (at, page) in [(pool, a), (pool + PAGE, b)] {
+                let mut one = [page];
+                assert_eq!(MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, at);
+            }
+            *((pool + 0x10) as *mut u32) = 0xA;
+            // a at view pages 2 and 5, b (never used) at 3
+            let (r1, r2) = ([[0, 0, 2]], [[0, 0, 1]]);
+            let bs = [batch(g + 2 * PAGE, &r1), batch(g + 5 * PAGE, &r2)];
+            assert!(apply_batches(2, bs.as_ptr() as usize, pool, 2).is_some());
+            assert_eq!(shows(g + 2 * PAGE), Shows::Page { at: pool, tile: true });
+            let first = shown_at(g + 2 * PAGE).unwrap();
+
+            // mapped elsewhere: its bytes move, both view pages follow, what they show is unchanged
+            let mut one = [a];
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, r);
+            assert_eq!(*((r + 0x10) as *const u32), 0xA);
+            for k in [2, 5] {
+                assert_eq!(shows(g + k * PAGE + 0x10), Shows::Page { at: r + 0x10, tile: true });
+            }
+            assert!(shown_at(g + 2 * PAGE).is_some_and(|e| e.page == a && e.call == first.call && e.seq == first.seq), "a move is no change");
+            // unmapped there: home, with its bytes
+            let mut none = [0usize];
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, none.as_mut_ptr()) as usize, r);
+            assert_eq!(shows(g + 5 * PAGE), Shows::Page { at: home_a, tile: true });
+            assert_eq!(*((home_a + 0x10) as *const u32), 0xA);
+            // mapped at the CPU view's offset of view page 2: kept at the same offset there, and
+            // elsewhere for view page 5
+            assert_eq!(MapTitlePhysicalPages((cv + 2 * PAGE) as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, cv + 2 * PAGE);
+            assert_eq!(*((cv + 2 * PAGE + 0x10) as *const u32), 0xA);
+            let mut at = Vec::new();
+            assert_eq!(resolve(g + 2 * PAGE, PAGE, &mut at), Some([0, 1, 0, 0]));
+            assert_eq!(resolve(g + 5 * PAGE, PAGE, &mut at), Some([1, 0, 0, 0]));
+            assert_eq!(at, vec![cv + 2 * PAGE]);
+            // b, never used, mapped elsewhere: its place follows, not committed (unless its home
+            // is committed memory: then its bytes were copied)
+            let mut one = [b];
+            assert_eq!(MapTitlePhysicalPages((r + PAGE) as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, r + PAGE);
+            assert_eq!(shows(g + 3 * PAGE), Shows::Page { at: r + PAGE, tile: true });
+            assert_eq!(committed_page(r + PAGE), !lazy_home(home_b));
+            assert_eq!(first, shown_at(g + 2 * PAGE).map(|e| Shown { at: first.at, tile: first.tile, ..e }).unwrap(), "only the place changed");
+
+            // freed (unmapped first): what the view pages showed is gone, a change of what they show
+            for at in [cv + 2 * PAGE, r + PAGE] {
+                assert_eq!(MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, none.as_mut_ptr()) as usize, at);
+            }
+            assert_eq!(FreeTitlePhysicalPages(null, 2, pages.as_mut_ptr()), 1);
+            for k in [2, 3, 5] {
+                assert_eq!(shows(g + k * PAGE), Shows::Nothing);
+            }
+            assert!(shown_at(g + 2 * PAGE).is_some_and(|e| e.page == 0 && e.at == 0 && e.seq > first.seq));
+            assert_eq!(VirtualFree(cv as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert!((0..8).all(|k| shown_at(g + k * PAGE).is_none()));
+            for q in [pool, r] {
+                assert_eq!(VirtualFree(q as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            }
         }
     }
 
