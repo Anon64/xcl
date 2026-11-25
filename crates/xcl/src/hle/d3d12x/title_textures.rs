@@ -878,6 +878,61 @@ unsafe fn walk() {
     }
 }
 
+/// Diagnostic: where the written pages of the looks are, in 64 MiB pieces. The 12 with the most
+/// pages are logged every 4096 looks, each with its UMA window and that window's kind.
+fn note_dirty_regions(u: &crate::gpu::uma::Uma) {
+    static COUNTS: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+    static LOOKS: AtomicU64 = AtomicU64::new(0);
+    const PIECE: usize = 64 << 20;
+    DIRTY_BUF.with(|d| {
+        let d = d.borrow();
+        if d.is_empty() {
+            return;
+        }
+        let mut g = COUNTS.lock().unwrap();
+        let m = g.get_or_insert_with(Default::default);
+        let (mut last, mut n) = (usize::MAX, 0u64);
+        for &p in d.iter() {
+            let b = p & !(PIECE - 1);
+            if b != last {
+                if n != 0 {
+                    *m.entry(last).or_insert(0) += n;
+                }
+                last = b;
+                n = 0;
+            }
+            n += 1;
+        }
+        if n != 0 {
+            *m.entry(last).or_insert(0) += n;
+        }
+    });
+    let looks = LOOKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if looks % 4096 == 0 {
+        let mut g = COUNTS.lock().unwrap();
+        if let Some(m) = g.as_mut() {
+            let total: u64 = m.values().sum();
+            let mut v: Vec<(usize, u64)> = m.iter().map(|(&a, &c)| (a, c)).collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = v
+                .iter()
+                .take(12)
+                .map(|&(a, c)| {
+                    let w = u.window_of(a);
+                    let kind = match w {
+                        Some(k) if u.is_committed_window(k) => "committed",
+                        Some(_) => "sparse",
+                        None => "outside",
+                    };
+                    format!("{a:#x} ({kind}{}): {} %", w.map_or(String::new(), |k| format!(" window {k}")), c * 100 / total.max(1))
+                })
+                .collect();
+            crate::xlog_info!("D3D12.X: written pages of the last 4096 looks by 64 MiB piece ({total} pages in {} pieces): {}", v.len(), top.join(", "));
+            m.clear();
+        }
+    }
+}
+
 unsafe fn refresh_once(queue: *mut c_void) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
@@ -908,6 +963,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    note_dirty_regions(u);
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
