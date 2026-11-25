@@ -300,6 +300,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    if !gfx && super::real::skip_named_cs(pso) {
+        return;
+    }
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
@@ -942,6 +945,9 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
+    }
+    if super::real::skip_named_cs(pso) {
+        return Ok(());
     }
     bind_abi(this, list, pso, false)?;
     let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::Dispatch, [x, y, z]);

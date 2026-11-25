@@ -1733,6 +1733,14 @@ pub fn pso_layout(pso: usize) -> Option<String> {
     PSO_LAYOUTS.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
+/// `XCL_SKIP_CS=<hash>,<hash>` (diagnostic, with `XCL_GPU_PROFILE=1`, whose report names the
+/// hashes): dispatches of these console compute programs are left out.
+pub fn skip_named_cs(pso: usize) -> bool {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| std::env::var("XCL_SKIP_CS").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()).unwrap_or_default());
+    !list.is_empty() && pso_shaders(pso).is_some_and(|(h, _)| list.contains(&h))
+}
+
 pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
     PSO_SHADERS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
