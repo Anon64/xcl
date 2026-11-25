@@ -891,6 +891,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         match run {
             Ok(()) => {
                 mesh_work(this, super::targets::RAN);
+                super::watch::note(raw_pso, super::watch::MESH, [groups, 0, 0]);
                 count(DRAWS);
                 static LOGGED: AtomicU64 = AtomicU64::new(0);
                 let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1015,6 +1016,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             match run {
                 Ok(()) => {
                     mesh_work(this, super::targets::RAN);
+                    super::watch::note(raw_pso, super::watch::INDIRECT_MESH, [max, 0, 0]);
                     count(DRAWS);
                     static LOGGED: AtomicU64 = AtomicU64::new(0);
                     let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;

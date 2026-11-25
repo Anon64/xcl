@@ -779,7 +779,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if dumping_targets {
         super::targets::submitted();
     }
-    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+    let presented = {
+        let _in_driver = super::watch::in_driver(super::watch::Call::Present);
+        sc.Present(0, DXGI_PRESENT(0)).ok()
+    };
+    if let Err(e) = presented {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");

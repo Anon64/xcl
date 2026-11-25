@@ -35,6 +35,7 @@ mod shader_cache_session;
 mod sharded;
 pub mod sparse;
 mod targets;
+mod watch;
 pub mod title_list;
 mod submit_cost;
 mod texture_upload;

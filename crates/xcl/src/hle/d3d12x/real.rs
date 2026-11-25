@@ -677,15 +677,11 @@ pub fn init() -> Result<String, String> {
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
-        // with `XCL_DRED` a thread looks for the removal too: a title whose threads all wait
-        // (for pipelines being built, for a fence) submits and presents nothing, and the
-        // report of the faulting address would never be written
-        if std::env::var_os("XCL_DRED").is_some() {
-            let _ = std::thread::Builder::new().name("xcl-dred".into()).spawn(|| loop {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                stop_if_device_removed();
-            });
-        }
+        // a thread looks for the removal too: a title whose threads all wait (for pipelines
+        // being built, for a fence) submits and presents nothing, and the report of the faulting
+        // address would never be written. It also times the calls into the driver and takes a
+        // stop asked for from outside (`watch`).
+        super::watch::start();
         *ADAPTER.lock().unwrap() = name.clone();
         Ok(name)
     }
@@ -7391,6 +7387,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    // (not while a call into the driver stands still: `watch`)
+    super::watch::wait_while_stalled();
     // textures in title memory the CPU wrote since: uploaded again first
     let submit_t0 = std::time::Instant::now();
     super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
@@ -7408,7 +7406,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::gpu_profile::note_queue(this);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         let t = std::time::Instant::now();
-        f(this, chunk.len() as u32, chunk.as_ptr());
+        {
+            let _in_driver = super::watch::in_driver(super::watch::Call::Execute);
+            f(this, chunk.len() as u32, chunk.as_ptr());
+        }
         let t1 = std::time::Instant::now();
         super::submit_cost::driver(t1 - t);
         super::list_x::copy_scratch_submitted(this, chunk);
@@ -7699,6 +7700,7 @@ pub fn stop_if_device_removed() {
     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
     if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {
         log_device_removed();
+        super::watch::report("the device was removed");
         let msg = format!("the D3D12 device was removed ({:#x}: {}) – the title is stopped", e.code().0 as u32, e.message());
         crate::xlog_error!("{msg}");
         crate::report::write_final(Some(msg));
