@@ -1674,6 +1674,15 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
     if !formats.is_empty() && !desc(rt).is_some_and(|d| formats.contains(&d.2)) {
         return;
     }
+    // `XCL_TRACE_AFTER_S=110`: no kind is listed before that many seconds of the run (a title's
+    // menus fill the list long before its world draws), and each kind listed then also gets its
+    // root arguments: constants, the first words of root buffers, the first slots of its tables
+    // with what the GPU holds of the title textures there (`root_args_summary`)
+    static AFTER: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    let after = *AFTER.get_or_init(|| std::env::var("XCL_TRACE_AFTER_S").ok().and_then(|v| v.trim().parse().ok()));
+    if after.is_some_and(|s| crate::log::uptime() < s) {
+        return;
+    }
     {
         let mut g = SEEN.lock().unwrap();
         let key = (vs, ps, desc(rt));
@@ -1707,6 +1716,12 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
         tex.join(", "),
         super::list_x::state_summary(this)
     );
+    if after.is_some() {
+        crate::xlog_info!("frame trace: … its root arguments: {}", root_args_summary(this, 8));
+        // and, once, what the view heaps hold at that point of the run
+        static CENSUS: std::sync::Once = std::sync::Once::new();
+        CENSUS.call_once(super::console_heap::census);
+    }
 }
 
 /// `XCL_TRACE_SHADERS=hash,…` (dump hashes, hex): the draws traced with their root arguments
@@ -1843,6 +1858,12 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
     let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
     let Some(layout) = layout else { return String::new() };
     let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    // `XCL_TRACE_SLOTS=n`: the first n slots of each table instead of 4, with all eight words
+    // of their image descriptors (a view's levels and its smallest level of detail are in the
+    // later ones)
+    static SLOTS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let more = *SLOTS.get_or_init(|| std::env::var("XCL_TRACE_SLOTS").ok().and_then(|v| v.trim().parse().ok()));
+    let (slots, words) = (more.unwrap_or(4).clamp(1, 64), if more.is_some() { 8 } else { 4 });
     let mut what = Vec::new();
     for (i, p) in layout.params.iter().enumerate() {
         match *p {
@@ -1854,19 +1875,38 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
             }
             Param::Table { at } => {
                 let t = word(at as usize) as usize;
-                let slots: Vec<String> = (0..4usize)
+                let slots: Vec<String> = (0..slots)
                     .map(|k| {
                         let at = u.base() + t + 32 * k;
                         let w = super::console_heap::words_at((t + 32 * k) as u32);
+                        // with `XCL_TRACE_SLOTS`: the image the T# describes (format, width,
+                        // height, first and last level of the view, levels of the texture, smallest
+                        // level of detail), the slot's own index in the shared heap, and the
+                        // resource the T#'s index names there – a T# the title copied as memory
+                        // carries its source slot's index, and samples whatever that slot holds now
+                        let image = w.filter(|_| more.is_some()).and_then(|w| crate::gpu::desc::image(&w)).map_or(String::new(), |t| {
+                            let own = super::console_heap::slot(at as u64).map(|s| s.index);
+                            let named = super::console_heap::named_by_index(w.map_or(0, |w| w[0]));
+                            let nd = (named != 0 && named != super::console_heap::GONE).then(|| ID3D12Resource::from_raw_borrowed(&(named as *mut c_void)).map(|x| x.GetDesc())).flatten();
+                            if nd.is_some() && super::title_textures::address(named).is_some() {
+                                super::title_textures::probe_gpu_content(named);
+                            }
+                            format!(
+                                " image {:?}, own index {own:?}, its index names {named:#x} {:?} title {:?}",
+                                (t.format, t.width, t.height, t.base_level, t.last_level, t.max_mip, t.min_lod),
+                                nd.map(|d| (d.Width, d.Height, d.Format.0, d.MipLevels)),
+                                super::title_textures::address(named).map(|a| format!("{a:#x}"))
+                            )
+                        });
                         match super::console_heap::resource_at(at) {
                             Some(r) => {
                                 if super::title_textures::address(r).is_some() {
                                     super::title_textures::probe_gpu_content(r);
                                 }
                                 let d = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc());
-                                format!("[{k}] {r:#x} {:?} title {:?} T# {:x?}", d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0)), super::title_textures::address(r).map(|a| format!("{a:#x}")), w.map(|w| w[..4].to_vec()))
+                                format!("[{k}] {r:#x} {:?} title {:?} T# {:x?}{image}", d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0)), super::title_textures::address(r).map(|a| format!("{a:#x}")), w.map(|w| w[..words].to_vec()))
                             }
-                            None => format!("[{k}] - T# {:x?}", w.map(|w| w[..4].to_vec())),
+                            None => format!("[{k}] - T# {:x?}{image}", w.map(|w| w[..words].to_vec())),
                         }
                     })
                     .collect();

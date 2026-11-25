@@ -819,6 +819,13 @@ pub fn resource_at(at: usize) -> Option<usize> {
     RES.lock().unwrap().as_ref()?.get(&at).copied()
 }
 
+/// The PC resource the descriptor at index `i` of the shared heap names (0: none or not known;
+/// `GONE`: the null view of a destroyed resource) – what a T# with that index in word 0 samples,
+/// whichever slot the T# lies in (`XCL_TRACE_FRAME` diagnostics).
+pub fn named_by_index(i: u32) -> usize {
+    NAMES.get().map_or(0, |n| n.name(i))
+}
+
 pub fn write(s: &Slot, words: &[u32]) {
     let n = words.len().min(if s.sampler { 4 } else { 8 });
     unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), s.at as *mut u32, n) };

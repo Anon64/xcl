@@ -2186,14 +2186,16 @@ fn note_content(va: usize, r: &ID3D12Resource, subs: &[texture::Subresource]) {
     );
 }
 
-/// `XCL_TRACE_FRAME`: what the GPU holds in level 0 of title texture `res` (read back on XCL's
-/// queue; the texture is taken to be in a shader-resource state) against the CPU's view of the
-/// memory now. Each texture once, four at most.
+/// `XCL_TRACE_FRAME`: what the GPU holds in each level of the first slice of title texture `res`
+/// (read back on XCL's queue; the texture is taken to be in a shader-resource state) against the
+/// CPU's view of the memory now. Each texture once, four at most (`XCL_TRACE_PROBES=n`: n).
 pub unsafe fn probe_gpu_content(res: usize) {
     static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| std::env::var("XCL_TRACE_PROBES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4));
     {
         let mut g = SEEN.lock().unwrap();
-        if g.contains(&res) || g.len() >= 4 {
+        if g.contains(&res) || g.len() >= most {
             return;
         }
         g.push(res);
@@ -2203,10 +2205,11 @@ pub unsafe fn probe_gpu_content(res: usize) {
     let r = res as *mut c_void;
     let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
     let rd = r.GetDesc();
-    let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-    let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
-    dev.GetCopyableFootprints(&rd, 0, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
-    let result = own_work(|| -> Result<Vec<u8>, String> {
+    let levels = (rd.MipLevels as usize).clamp(1, 16);
+    let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels];
+    let (mut rows, mut row_bytes, mut total) = (vec![0u32; levels], vec![0u64; levels], 0u64);
+    dev.GetCopyableFootprints(&rd, 0, levels as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut total));
+    let result = own_work(|| -> Result<Vec<Vec<u8>>, String> {
         let queue = upload_queue(dev, device)?;
         super::vram::before_execute(&queue);
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(|e| e.to_string())?;
@@ -2231,45 +2234,57 @@ pub unsafe fn probe_gpu_content(res: usize) {
         )
         .map_err(|e| e.to_string())?;
         let rb = rb.ok_or("no readback buffer")?;
-        let barrier = |a: D3D12_RESOURCE_STATES, b: D3D12_RESOURCE_STATES| D3D12_RESOURCE_BARRIER {
+        let barrier = |sub: u32, a: D3D12_RESOURCE_STATES, b: D3D12_RESOURCE_STATES| D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
             Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(r), Subresource: 0, StateBefore: a, StateAfter: b }),
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(r), Subresource: sub, StateBefore: a, StateAfter: b }),
             },
         };
         let srv = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
-        list.ResourceBarrier(&[barrier(srv, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
-        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-        list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, srv)]);
+        for (i, fp) in fps.iter().enumerate() {
+            list.ResourceBarrier(&[barrier(i as u32, srv, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 } };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            list.ResourceBarrier(&[barrier(i as u32, D3D12_RESOURCE_STATE_COPY_SOURCE, srv)]);
+        }
         list.Close().map_err(|e| e.to_string())?;
         queue.ExecuteCommandLists(&[Some(list.cast().map_err(|e| e.to_string())?)]);
         texture::wait(dev, &queue)?;
         let mut p: *mut c_void = std::ptr::null_mut();
         rb.Map(0, None, Some(&mut p)).map_err(|e| e.to_string())?;
-        let mut out = Vec::with_capacity(rows as usize * row_bytes as usize);
-        for y in 0..rows as usize {
-            out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(y * fp.Footprint.RowPitch as usize), row_bytes as usize));
+        let mut out = Vec::with_capacity(levels);
+        for (i, fp) in fps.iter().enumerate() {
+            let mut level = Vec::with_capacity(rows[i] as usize * row_bytes[i] as usize);
+            for y in 0..rows[i] as usize {
+                level.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), row_bytes[i] as usize));
+            }
+            out.push(level);
         }
         rb.Unmap(0, None);
         Ok(out)
     });
-    let cpu = subresources(va, &tex).into_iter().next().map(|s| s.data).unwrap_or_default();
+    let cpu = subresources(va, &tex);
     match result {
         Ok(gpu) => {
-            let nonzero = gpu.iter().filter(|&&b| b != 0).count();
-            let same = gpu.iter().zip(cpu.iter()).filter(|(a, b)| a == b).count();
+            let nonzero = |b: &[u8]| b.iter().filter(|&&x| x != 0).count();
+            let per: Vec<String> = gpu
+                .iter()
+                .enumerate()
+                .map(|(i, g)| {
+                    let c = cpu.get(i).map_or(&[][..], |s| s.data.as_slice());
+                    format!("L{i} {} B: GPU {} not zero, CPU {}, {} equal", g.len(), nonzero(g), nonzero(c), g.iter().zip(c.iter()).filter(|(a, b)| a == b).count())
+                })
+                .collect();
             crate::xlog_info!(
-                "frame trace: GPU content of title texture {res:#x} at {va:#x} ({}x{} format {}, {} mips, GPU-written {gpu_written}): {nonzero} of {} bytes of level 0 not zero; {same} equal to the CPU view ({} of its bytes not zero); first bytes {:02x?}",
+                "frame trace: GPU content of title texture {res:#x} at {va:#x} ({}x{} format {}, {} mips, GPU-written {gpu_written}): {}; first bytes of level 0 {:02x?}",
                 rd.Width,
                 rd.Height,
                 rd.Format.0,
                 rd.MipLevels,
-                gpu.len(),
-                cpu.iter().filter(|&&b| b != 0).count(),
-                &gpu[..gpu.len().min(16)]
+                per.join("; "),
+                gpu.first().map_or(&[][..], |g| &g[..g.len().min(16)])
             );
         }
         Err(e) => crate::xlog_warn!("frame trace: GPU content of title texture {res:#x}: {e}"),
