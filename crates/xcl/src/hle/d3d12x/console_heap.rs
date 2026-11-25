@@ -447,13 +447,18 @@ fn reserve_global(count: u32) -> Option<u32> {
     let r = take_range(&mut s.free, &mut next, cap, count);
     s.next = next;
     if r.is_none() {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-            crate::xlog_warn!("console descriptor heaps: the shared heap ({cap}) is full – shaders do not see the views of slots past it");
+        let n = NO_ROOM.fetch_add(1, Relaxed) + 1;
+        if n.is_power_of_two() {
+            crate::xlog_warn!(
+                "console descriptor heaps: the shared heap ({cap}) is full – a page of slots found no place there ({n} times so far): those slots name the null views at 0 / 1, shaders see none of their views"
+            );
         }
     }
     r
 }
+
+/// Pages that asked for a place in the shared heap and found no room (each try counts).
+static NO_ROOM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The place in the shared heap of the page slot `k` of `h` is in – (index of the page's
 /// first SRV there, the page's first slot) – given now if the page has none yet. None: the
@@ -640,7 +645,8 @@ pub struct Slot {
 }
 
 /// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
-/// of a heap in the shared heap gets its page's place there now if the page has none yet.
+/// of a heap in the shared heap gets its page's place there now if the page has none yet; one
+/// whose page finds no room there gets index 0, the null SRV / UAV pair.
 pub fn slot(cpu: u64) -> Option<Slot> {
     let mut heaps = HEAPS.lock().unwrap();
     let h = heaps.iter_mut().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
@@ -655,7 +661,11 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         let i = first + 2 * (k - k0);
         Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
     });
-    let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or((2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0));
+    // A heap meant for the shared heap whose page found no room there: lists bind only the
+    // shared heap, where 2k is another heap's view, a memory window's raw UAV (k from 2 to 9) or
+    // past the heap's end; its T#s name the null views at 0 / 1 instead, and nothing is copied.
+    let own = if h.pages.is_empty() { (2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0) } else { (0, 0, 0) };
+    let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or(own);
     Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
 }
 
@@ -784,7 +794,8 @@ pub fn census() {
         let mut examples: Vec<(u32, u32)> = Vec::new();
         let own_index = |k: u32| match h.pages.get((k / PAGE_SLOTS) as usize) {
             Some(&f) if f != UNMAPPED => f + 2 * (k % PAGE_SLOTS),
-            _ => 2 * k,
+            Some(_) => 0,
+            None => 2 * k,
         };
         for k in 0..h.n {
             let w = unsafe { std::slice::from_raw_parts((h.shadow + (k * SLOT) as usize) as *const u32, 8) };
@@ -1117,6 +1128,73 @@ mod tests {
         unregister(0xA1);
         unregister(0xA2);
         assert!(start(0xA1).is_none() && slot(v).is_none() && slot(sm).is_none());
+    }
+
+    /// The shared heap full: the slots of a page that finds no place there name the null views
+    /// at 0 / 1, never 2k (in the shared heap, the only view heap lists bind, that is another
+    /// heap's view, a memory window's raw UAV for k from 2 to 9, or past its end); a T# copied
+    /// there too. A page placed before keeps its place, and one placed once room is free again
+    /// gets its own. Every page that found no room is counted.
+    #[test]
+    fn a_slot_whose_page_finds_no_room_names_the_null_views() {
+        const CHILD: &str = "XCL_TEST_SHARED_HEAP_FULL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::a_slot_whose_page_finds_no_room_names_the_null_views", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let Some(u) = crate::gpu::uma::get() else { return };
+        use std::ffi::c_void;
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        let mut vt = [0usize; 4];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        let mut device = Object { vt: vt.as_ptr() };
+        let mut heap = Object { vt: vt.as_ptr() };
+        // room for one page of 256 slots past the null views and the memory windows
+        let base = crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+        unsafe {
+            *GLOBAL.lock().unwrap() = Some(Global {
+                dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),
+                heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
+                cpu: 0x10_0000, gpu: 0x20_0000, inc: 32, cap: base + 2 * PAGE_SLOTS,
+                next: base, free: Vec::new(), nulls: None,
+            });
+        }
+        let rel = |p: u64| (p as usize - u.base()) as u32;
+        assert!(register(0xC1, 2 * PAGE_SLOTS, 0x30_0000, 0, 32, false, true, true));
+        assert!(register(0xC2, 16, 0x40_0000, 0, 32, false, true, true));
+        let (a, b) = (start(0xC1).unwrap(), start(0xC2).unwrap());
+        let placed = slot(a + 2 * SLOT as u64).unwrap();
+        assert_eq!(placed.index, base + 4, "page 0 of the first heap takes the room there is");
+        assert_ne!(placed.shared_srv, 0);
+        let k = PAGE_SLOTS + 2;
+        let s = slot(a + (k * SLOT) as u64).unwrap();
+        assert_eq!((s.index, s.shared_srv, s.pc_gpu_uav), (0, 0, 0), "slot {k} of the first heap: its page found no room");
+        assert_eq!(s.pc_srv, 0x30_0000 + (2 * k * 32) as u64, "views are still made in the title's heap");
+        for k in 0..16 {
+            let s = slot(b + (k * SLOT) as u64).unwrap();
+            assert_eq!((s.index, s.shared_srv), (0, 0), "slot {k} of the second heap: no room for its page");
+        }
+        assert_eq!(NO_ROOM.load(Relaxed), 17, "every page that found no room, each time");
+        // a 2D T# copied into a slot without a place names the null views
+        write(&placed, &[base + 4, 0x0470_0000, 0, 9 << 28, 0, 0, 0, 0]);
+        copy_words(&placed, &s);
+        assert_eq!(words_at(rel(a + (k * SLOT) as u64)).unwrap()[..4], [0, 0x0470_0000, 0, 9 << 28]);
+        assert_eq!(slot(a + 2 * SLOT as u64).unwrap().index, base + 4, "a placed page keeps its place");
+        // the first heap goes: the second heap's page gets the room it left
+        unregister(0xC1);
+        let s = slot(b + 2 * SLOT as u64).unwrap();
+        assert_eq!(s.index, base + 4);
+        assert_ne!(s.shared_srv, 0);
+        unregister(0xC2);
+        *GLOBAL.lock().unwrap() = None;
     }
 
     /// Minecraft's view heaps: eight of 73 727 slots, 147 454 PC descriptors each – more in all
