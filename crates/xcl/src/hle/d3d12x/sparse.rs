@@ -1806,6 +1806,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let q = queue.as_raw() as usize;
     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
         let _ = queue.Wait(&s.fence, s.value);
+        super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &s.fence, s.value);
         s.waited.insert(q, s.value);
     }
 }
