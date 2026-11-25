@@ -1361,9 +1361,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             };
             // one dispatch: its group counts (as the guard let them through) folded or clamped on
             // the GPU (`clamp`, which writes a folded count into this dispatch's io), then the
-            // binding set again
+            // binding set again. Only on a direct or compute list XCL keeps state for, as
+            // `indirect_guard`: the pass records barriers, which a bundle cannot hold
             let mut clamped = None;
-            if compute && max == 1 && signature_dispatches(sig) {
+            let barriers = matches!(super::list_x::tracked_list_type(this), Some(t) if t == D3D12_COMMAND_LIST_TYPE_DIRECT || t == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            if compute && max == 1 && signature_dispatches(sig) && barriers {
                 let (from, at) = checked.as_ref().map_or((args, args_off), |c| c.arguments());
                 clamped = super::clamp::before(list, from, at, b.io + 4 * crate::gpu::recomp::IO_GROUP_LIMIT as u64);
                 if clamped.is_some() {
@@ -2143,21 +2145,22 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     }
     // more groups in X than D3D12 takes: folded (`recomp::IO_GROUP_LIMIT`). The loop budget is
     // the console's groups' share: those are the groups that run
-    let (limit, folded) = fold(x, y, z);
+    let (limit, folded) = fold_counts(x, y, z);
     // (the PC takes 65 535 groups a dimension at most, the debug layer's id 1296: what it does
-    // with more is not defined. One `fold` cannot fold is clamped: said, with the program)
-    if limit == 0 && x.max(y).max(z) > 65_535 {
+    // with more is not defined. One `fold` cannot fold is clamped: said here, with the program,
+    // in place of `fold`'s line)
+    if limit == 0 && folded != [x, y, z] {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 8 {
             let cs = super::real::pso_shaders(pso).map_or(0, |(cs, _)| cs);
-            crate::xlog_warn!("D3D12.X: Dispatch of {x} x {y} x {z} groups with cs {cs:016x}: past the PC's 65 535 groups a dimension");
+            crate::xlog_warn!("D3D12.X: Dispatch of {x} x {y} x {z} groups with cs {cs:016x}: past the PC's 65 535 groups a dimension and not foldable – clamped to 65535 a dimension");
         }
     }
     bind_abi(this, list, pso, false, Some([x, y, z]), limit)?;
-    let [x, y, z] = folded;
-    // (one span for a split program's whole chain of dispatches, cut into slabs from the folded groups)
+    // (one span for a split program's whole chain of dispatches, cut into slabs from the folded
+    // groups; the span names the console's)
     let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::Dispatch, [x, y, z]);
-    let ran = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
+    let ran = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), folded);
     super::gpu_profile::end(this, t);
     ran
 }
@@ -2187,16 +2190,24 @@ pub(super) fn dispatch_loop_budget_wanted() -> bool {
 /// `recomp::IO_GROUP_LIMIT` – 0: not folded –, the groups to dispatch). More than 65 535 in X
 /// with 1 in Y is folded into Y; any other count past 65 535 is clamped (logged once).
 pub(super) fn fold(x: u32, y: u32, z: u32) -> (u32, [u32; 3]) {
+    let (limit, groups) = fold_counts(x, y, z);
+    if limit == 0 && groups != [x, y, z] {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: a dispatch of {x}x{y}x{z} groups cannot be folded – clamped to 65535 a dimension");
+        }
+    }
+    (limit, groups)
+}
+
+/// `fold` without its log line (for a caller that says it with the program)
+fn fold_counts(x: u32, y: u32, z: u32) -> (u32, [u32; 3]) {
     use crate::gpu::recomp::FOLD_X;
     if x <= FOLD_X && y <= 65_535 && z <= 65_535 {
         return (0, [x, y, z]);
     }
     if y == 1 && z <= 65_535 && x.div_ceil(FOLD_X) <= 65_535 {
         return (x, [FOLD_X, x.div_ceil(FOLD_X), z]);
-    }
-    static N: AtomicU64 = AtomicU64::new(0);
-    if N.fetch_add(1, Ordering::Relaxed) < 4 {
-        crate::xlog_warn!("D3D12.X: a dispatch of {x}x{y}x{z} groups cannot be folded – clamped to 65535 a dimension");
     }
     (0, [x.min(65_535), y.min(65_535), z.min(65_535)])
 }
