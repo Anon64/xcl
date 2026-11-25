@@ -14,6 +14,49 @@ fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
     v
 }
 
+/// One console wave in two hardware halves (33 to 64 threads a group): the halves of a compute
+/// group exchange through the bounded counters, as those of larger groups do, and meet at no
+/// group barrier after the one at the program's start. A barrier at every exchange hung NVIDIA
+/// GPUs when several such programs ran at once (#1727; the change is #1741's).
+#[test]
+fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
+    use crate::gpu::recomp::CsInterface;
+    // v1 = lane 32's v0: the lower half needs the upper half's value
+    let code = prog(&[("V_READLANE_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 256), ("SRC1", 160)], None)]);
+    let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let dis = |threads: u32, code: &[u8]| {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        super::validate::disassemble(&super::kernel::translate_compute(code, o, &cs).unwrap_or_else(|e| panic!("{threads} threads: {e}")).dxil)
+    };
+    // (barrier mode 9: the thread group's sync with its memory fence, `ops::barrier::GROUP_SYNC`)
+    let syncs = |d: &str| d.matches("@dx.op.barrier(i32 80, i32 9)").count();
+    let Ok(alone) = dis(32, &code) else {
+        crate::gpu::recomp::runner::skip_test("no DXC");
+        return;
+    };
+    assert_eq!(syncs(&alone), 1, "the start's barrier:
+{alone}");
+    assert!(alone.matches("atomicrmw").count() < 3, "a half without a partner does not wait for one:
+{alone}");
+    for threads in [33, 64, 128] {
+        let d = dis(threads, &code).unwrap();
+        assert_eq!(syncs(&d), 1, "{threads} threads: a group barrier at the exchange:
+{d}");
+        assert!(d.matches("atomicrmw").count() >= 3, "{threads} threads: the exchange's counters:
+{d}");
+    }
+    // with the program's LDS the counters live in its top words
+    let with_lds = prog(&[
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 256), ("SRC1", 160)], None),
+    ]);
+    let d = dis(64, &with_lds).unwrap();
+    assert_eq!(syncs(&d), 1, "a group barrier at the exchange (LDS):
+{d}");
+    assert!(d.matches("atomicrmw").count() >= 3, "the exchange's counters (LDS):
+{d}");
+}
+
 #[test]
 fn straight_line_and_loop_kernels_validate() {
     let code = prog(&[

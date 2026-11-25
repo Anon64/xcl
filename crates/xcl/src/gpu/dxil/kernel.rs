@@ -546,14 +546,20 @@ impl Lw {
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
         }
-        lw.setup_storage(uses_lds, if split { slot } else { 1 });
+        // (before the storage: the spin exchange has its own slots and counters)
         if let (Some(t), true) = (group_threads, split) {
             lw.partner = match t {
                 0..=32 => Partner::Missing,
-                33..=64 => Partner::Present,
+                // One console wave in two hardware halves. The halves of a compute or mesh
+                // group meet through the bounded counters, as those of larger groups do: a
+                // group barrier at every exchange hung NVIDIA GPUs when several such programs
+                // ran at once (device hung, driver event 153: #1727; the change is #1741's).
+                // A geometry program sets its partner by phase (`translate_on_this_thread`).
+                33..=64 if !matches!(entry, Entry::Compute(_) | Entry::Mesh(_)) => Partner::Present,
                 _ => Partner::Spin,
             };
         }
+        lw.setup_storage(uses_lds, if split { slot } else { 1 });
         lw
     }
 

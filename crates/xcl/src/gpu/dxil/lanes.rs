@@ -39,7 +39,7 @@ impl Lw {
         } else if self.split {
             let w = self.s.groupshared("xcl_xw", i32, 1);
             self.xw = Some((w, 0));
-            if self.waves > 1 {
+            if self.waves > 1 || self.partner == Partner::Spin {
                 let x = self.s.groupshared("xcl_xs", i32, (4 * self.xslot * self.waves) as u64);
                 self.xs = Some((x, 0));
                 let c = self.s.groupshared("xcl_xc", i32, 2 * self.waves as u64);
