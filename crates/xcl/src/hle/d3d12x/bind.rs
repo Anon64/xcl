@@ -471,9 +471,16 @@ unsafe fn default_uav_buffer(dev: &ID3D12Device, bytes: u64, what: &str) -> Resu
         &mut res,
     )
     .map_err(|e| format!("{what} ({bytes:#x} B): {e}"))?;
-    // (a name for what a device removal reports about an address, `real::log_device_removed`)
+    // (a name for what a device removal reports about an address, `real::log_device_removed`;
+    // and where the first ones lie: an address just past one's end has no allocation to name)
     if let Some(r) = &res {
         let _ = r.SetName(&windows::core::HSTRING::from(format!("xcl {what}")));
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 48 || n.is_power_of_two() {
+            let va = r.GetGPUVirtualAddress();
+            crate::xlog_info!("D3D12.X: {what} #{n}: GPU addresses {va:#x} .. {:#x}", va + bytes);
+        }
     }
     res.ok_or_else(|| format!("null {what}"))
 }
