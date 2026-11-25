@@ -19,6 +19,8 @@ struct Stats {
     looks: u64,
     us: u64,
     pages: u64,
+    /// of them found between the submits (`XCL_LOOK_AHEAD`)
+    ahead: u64,
     runs: u64,
     /// pages also in the look before, and in all three before
     once: u64,
@@ -53,9 +55,9 @@ fn runs_of(pages: &[usize]) -> u64 {
     pages.iter().zip(std::iter::once(&usize::MAX).chain(pages)).filter(|(p, q)| **p != q.wrapping_add(0x1000)).count() as u64
 }
 
-/// A look found `pages` (sorted); it took `took`. `closed`: how long before its submit the youngest
-/// of the submit's lists was closed (None: not known).
-pub(super) fn look(pages: &[usize], took: Duration, closed: Option<u64>) {
+/// A look found `pages` (sorted), `ahead` of them before its submit; it took `took`. `closed`: how
+/// long before its submit the youngest of the submit's lists was closed (None: not known).
+pub(super) fn look(pages: &[usize], ahead: usize, took: Duration, closed: Option<u64>) {
     if !on() {
         return;
     }
@@ -64,6 +66,7 @@ pub(super) fn look(pages: &[usize], took: Duration, closed: Option<u64>) {
     s.looks += 1;
     s.us += took.as_micros() as u64;
     s.pages += pages.len() as u64;
+    s.ahead += ahead as u64;
     s.runs += runs_of(pages);
     s.once += in_all(pages, &s.before[..1]);
     s.thrice += in_all(pages, &s.before);
@@ -77,9 +80,10 @@ pub(super) fn look(pages: &[usize], took: Duration, closed: Option<u64>) {
         let a = |v: u64| v / 256;
         let share = |v: u64, of: u64| if of == 0 { 0 } else { v * 100 / of };
         crate::xlog_info!(
-            "D3D12.X: the last 256 looks for CPU writes: {:.2} ms and {} pages a look in {} runs ({} % of the pages also in the look before, {} % in all three before); {} scanned a look, {} % of them changed; youngest list closed before the submit: {} <20 µs, {} <100 µs, {} <500 µs, {} <2 ms, {} <10 ms, {} <50 ms, {} longer",
+            "D3D12.X: the last 256 looks for CPU writes: {:.2} ms and {} pages a look ({} found ahead) in {} runs ({} % of the pages also in the look before, {} % in all three before); {} scanned a look, {} % of them changed; youngest list closed before the submit: {} <20 µs, {} <100 µs, {} <500 µs, {} <2 ms, {} <10 ms, {} <50 ms, {} longer",
             s.us as f64 / 256e3,
             a(s.pages),
+            a(s.ahead),
             a(s.runs),
             share(s.once, s.pages),
             share(s.thrice, s.pages),
