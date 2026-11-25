@@ -179,6 +179,12 @@ pub unsafe fn drain_known(seal_now: bool) {
     for res in gone {
         // (its views in the shared heap become null views before the object goes)
         super::real::resource_ending(res);
+        // A placed buffer's tiles stay pinned until here: the held object maps them, and work
+        // queued before its release reads them through it. Unpinned right before the object goes
+        // (the queues are past that work), not after: then another thread could have made a
+        // buffer at the same address, whose tiles this would unpin. (`forget_buffer` takes no
+        // lock of this module's and does not wait for the sparse state's.)
+        super::sparse::forget_buffer(res);
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
     }

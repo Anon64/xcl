@@ -1765,27 +1765,22 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
 
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    // The last reference: kept until the queues are past the work in flight (`late_release`).
-    // (Two last-but-one releases at once can miss each other here; the object then goes at
-    // once, as before.)
-    let mut held = false;
+    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+    // Whether this is the last reference shows in the count after an AddRef of our own and its
+    // Release: 1 is ours alone. Then what XCL keeps by the object's address goes while the object
+    // is alive – after it, another thread can make a resource at that address, and the removals
+    // would strip that one (its pinned tiles too: `sparse::forget_buffer`). The last reference
+    // is kept until the queues are past the work in flight (`late_release`); its tiles are
+    // unpinned and its views made null views when it really goes.
+    // (Two releases of the last two references at once can both see more than 1 here; the one
+    // whose Release ends the object cleans up after it, as before.)
+    add(this);
+    let last = f(this) == 1;
+    let held = last && super::late_release::enabled();
     let mut pinned = false;
-    let n = if super::late_release::enabled() {
-        let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
-        if add(this) == 2 {
-            f(this);
-            held = true;
-            0
-        } else {
-            f(this);
-            f(this)
-        }
-    } else {
-        f(this)
-    };
+    let n = if last { 0 } else { f(this) };
     if n == 0 {
-        // (gone already when not held: its views are made null views as soon as can be; a held
-        // one's when `late_release` lets it go)
+        // (a held one's views when `late_release` lets it go)
         if !held {
             resource_ending(this as usize);
         }
@@ -1804,7 +1799,10 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
-        super::sparse::forget_buffer(this as usize);
+        // (a held placed buffer still maps its tiles: unpinned by `late_release` when it lets it go)
+        if !held {
+            super::sparse::forget_buffer(this as usize);
+        }
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
@@ -1823,6 +1821,9 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     }
     if held {
         super::late_release::hold(this as usize, pinned);
+    } else if last {
+        // (`XCL_LATE_RELEASE=0`: it goes now)
+        f(this);
     }
     n
 }
@@ -7474,6 +7475,65 @@ mod init_tests {
     #[test]
     fn every_window_of_sixteen_has_a_place_for_its_gpu_address() {
         assert_eq!(UMA_WINDOW_VAS.len(), crate::gpu::uma::MAX_HEAP_WINDOWS);
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    /// The last Release of a resource drops what XCL keeps by its address while the object is
+    /// still alive: once it is gone, another thread can make a resource at that address, whose
+    /// entries the removals would strip. (Run in a process of its own with `XCL_LATE_RELEASE=0`,
+    /// where the Release in `res_release` is the one that ends the object; with late releases on,
+    /// `late_release` ends it later.)
+    #[test]
+    fn the_last_release_drops_entries_before_the_object_goes() {
+        const CHILD: &str = "XCL_TEST_LAST_RELEASE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::real::release_tests::the_last_release_drops_entries_before_the_object_goes", "--nocapture"])
+                .env(CHILD, "1")
+                .env("XCL_LATE_RELEASE", "0")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        assert!(!super::super::late_release::enabled());
+        #[repr(C)]
+        struct Fake {
+            vt: *const usize,
+            refs: AtomicUsize,
+        }
+        // whether the entry was still there when the count reached 0
+        static ENTRY_AT_END: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const Fake)).refs.fetch_add(1, Ordering::SeqCst) as u32 + 1
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let n = (*(this as *const Fake)).refs.fetch_sub(1, Ordering::SeqCst) as u32 - 1;
+            if n == 0 {
+                ENTRY_AT_END.store(buffer_delta(this as usize) as i32, Ordering::SeqCst);
+            }
+            n
+        }
+        let mut orig = [0usize; 12];
+        orig[1] = add_ref as usize;
+        orig[2] = release as usize;
+        let mut ext = vec![0usize; 13];
+        ext[0] = orig.as_ptr() as usize;
+        ext[1..].copy_from_slice(&orig);
+        let fake = Box::new(Fake { vt: unsafe { ext.as_ptr().add(1) }, refs: AtomicUsize::new(2) });
+        let this = &*fake as *const Fake as *mut c_void;
+        BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(this as usize, 0x40);
+        unsafe {
+            assert_eq!(res_release(this), 1, "not the last");
+            assert_eq!(buffer_delta(this as usize), 0x40, "kept while another reference is held");
+            assert_eq!(res_release(this), 0);
+        }
+        assert_eq!(fake.refs.load(Ordering::SeqCst), 0);
+        assert_eq!(ENTRY_AT_END.load(Ordering::SeqCst), 0, "the entry went before the object");
     }
 }
 
