@@ -850,8 +850,45 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     if is_ext(v) {
         return;
     }
+    if dred_on() {
+        name_for_report(obj, kind);
+    }
     let ext = class_for(obj, v, kind);
     *(obj as *mut usize) = ext;
+}
+
+/// `XCL_DRED` is set (`init` turns the report on with it).
+fn dred_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_DRED").is_some())
+}
+
+/// With `XCL_DRED`: a resource, heap or pipeline the PC device made gets a name that says what
+/// it is, for what a device removal reports about an address (`log_device_removed` lists the
+/// allocations at the faulting address and those freed there lately by name). Later, more
+/// telling names replace it (a memory window's buffer, a title's buffer placed over tiles).
+unsafe fn name_for_report(obj: *mut c_void, kind: Kind) {
+    let name = match kind {
+        Kind::Resource => {
+            let Some(r) = ID3D12Resource::from_raw_borrowed(&obj) else { return };
+            let d = r.GetDesc();
+            if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+                format!("buffer {:#x} B flags {:#x}", d.Width, d.Flags.0)
+            } else {
+                format!("texture dim {} {}x{}x{} mips {} format {} samples {} flags {:#x}", d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0, d.SampleDesc.Count, d.Flags.0)
+            }
+        }
+        Kind::Heap => {
+            let Some(h) = ID3D12Heap::from_raw_borrowed(&obj) else { return };
+            let d = h.GetDesc();
+            format!("heap {:#x} B type {} flags {:#x}", d.SizeInBytes, d.Properties.Type.0, d.Flags.0)
+        }
+        Kind::PipelineState => "pipeline state".to_string(),
+        _ => return,
+    };
+    if let Some(o) = ID3D12Object::from_raw_borrowed(&obj) {
+        let _ = o.SetName(&windows::core::HSTRING::from(name));
+    }
 }
 
 unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
