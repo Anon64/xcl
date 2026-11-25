@@ -175,6 +175,12 @@ struct Profile {
     buf: usize,
     /// the readback buffer's mapping: two u64 a pair
     words: usize,
+    /// two dwords a pair the GPU sets to 1: [everything before the op has finished, the op has]
+    _marks: ID3D12Resource,
+    marks_va: u64,
+    marks: usize,
+    /// ops seen begun and not ended, and since when
+    running: HashMap<usize, Instant>,
     next: usize,
     ops: Vec<Option<Op>>,
     in_flight: usize,
@@ -218,6 +224,18 @@ unsafe fn init(dev: &ID3D12Device) -> Option<Profile> {
     let mut p = std::ptr::null_mut();
     buf.Map(0, None, Some(&mut p)).ok()?;
     std::ptr::write_bytes(p.cast::<u8>(), 0, PAIRS * 16);
+    let mut md = desc;
+    md.Width = (PAIRS * 8) as u64;
+    let mut marks: Option<ID3D12Resource> = None;
+    if let Err(e) = dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut marks) {
+        crate::xlog_warn!("D3D12.X: XCL_GPU_PROFILE: no buffer for the marks ({e})");
+        return None;
+    }
+    let marks = marks?;
+    let mut mp = std::ptr::null_mut();
+    marks.Map(0, None, Some(&mut mp)).ok()?;
+    std::ptr::write_bytes(mp.cast::<u8>(), 0, PAIRS * 8);
+    let marks_va = marks.GetGPUVirtualAddress();
     let _ = std::thread::Builder::new().name("xcl-gpu-profile".into()).spawn(|| {
         let (mut last, mut windows) = (Instant::now(), 0u32);
         loop {
@@ -236,6 +254,10 @@ unsafe fn init(dev: &ID3D12Device) -> Option<Profile> {
         _heap: heap,
         _buf: buf,
         words: p as usize,
+        _marks: marks,
+        marks_va,
+        marks: mp as usize,
+        running: HashMap::new(),
         next: 0,
         ops: (0..PAIRS).map(|_| None).collect(),
         in_flight: 0,
@@ -264,6 +286,21 @@ impl Profile {
     fn word(&self, i: usize) -> &AtomicU64 {
         unsafe { &*(self.words as *const AtomicU64).add(i) }
     }
+
+    fn mark(&self, i: usize) -> &std::sync::atomic::AtomicU32 {
+        unsafe { &*(self.marks as *const std::sync::atomic::AtomicU32).add(i) }
+    }
+}
+
+type WriteImmediateFn = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
+
+/// The GPU writes 1 at `va` once everything recorded on `list` before this has finished.
+unsafe fn mark_done(list: *mut c_void, va: u64) {
+    const WRITE: usize = offset_of!(ID3D12GraphicsCommandList2_Vtbl, WriteBufferImmediate) / size_of::<usize>();
+    let f: WriteImmediateFn = transmute(pc_fn(list, WRITE));
+    let p = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: va, Value: 1 };
+    let m = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+    f(list, 1, &p, &m);
 }
 
 /// The PC method in `slot` of `obj` (an adopted object's own, not XCL's console-layout entry).
@@ -283,6 +320,7 @@ pub(super) struct Pair {
     k: u32,
     heap: usize,
     buf: usize,
+    marks_va: u64,
     end_query: EndQueryFn,
     resolve: ResolveFn,
 }
@@ -302,7 +340,7 @@ pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32
     }
     let (a, b) = real::pso_shaders(super::pso_async::resolve(pso)).unwrap_or((0, 0));
     let key = (kind, a, b);
-    let (k, heap, buf) = with_state(
+    let (k, heap, buf, marks_va) = with_state(
         || {
             let mut dev: Option<ID3D12Device> = None;
             ID3D12GraphicsCommandList::from_raw_borrowed(&list)?.GetDevice(&mut dev).ok()?;
@@ -318,11 +356,15 @@ pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32
             }
             s.word(2 * k).store(0, Ordering::Release);
             s.word(2 * k + 1).store(0, Ordering::Release);
+            s.mark(2 * k).store(0, Ordering::Release);
+            s.mark(2 * k + 1).store(0, Ordering::Release);
+            s.running.remove(&k);
             s.ops[k] = Some(Op { key, size });
-            (k as u32, s.heap, s.buf)
+            (k as u32, s.heap, s.buf, s.marks_va)
         },
     )?;
-    let pair = Pair { k, heap, buf, end_query: transmute(pc_fn(list, END_QUERY)), resolve: transmute(pc_fn(list, RESOLVE)) };
+    let pair = Pair { k, heap, buf, marks_va, end_query: transmute(pc_fn(list, END_QUERY)), resolve: transmute(pc_fn(list, RESOLVE)) };
+    mark_done(list, marks_va + 8 * k as u64);
     (pair.end_query)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
     Some(pair)
 }
@@ -331,6 +373,7 @@ pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32
 pub(super) unsafe fn end(list: *mut c_void, pair: Option<Pair>) {
     let Some(p) = pair else { return };
     (p.end_query)(list, p.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * p.k + 1);
+    mark_done(list, p.marks_va + 8 * p.k as u64 + 4);
     (p.resolve)(list, p.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * p.k, 2, p.buf, 16 * p.k as u64);
 }
 
@@ -346,7 +389,14 @@ fn poll() {
         let Some(op) = &s.ops[k] else { continue };
         left -= 1;
         let span = match stamps(s.word(2 * k).load(Ordering::Acquire), s.word(2 * k + 1).load(Ordering::Acquire)) {
-            Stamps::Pending => continue,
+            Stamps::Pending => {
+                if s.mark(2 * k).load(Ordering::Acquire) != 0 && s.mark(2 * k + 1).load(Ordering::Acquire) == 0 {
+                    s.running.entry(k).or_insert_with(Instant::now);
+                } else {
+                    s.running.remove(&k);
+                }
+                continue;
+            }
             Stamps::Bad => None,
             Stamps::Span(t) => Some(t),
         };
@@ -359,6 +409,7 @@ fn poll() {
             None => s.bad += 1,
         }
         s.ops[k] = None;
+        s.running.remove(&k);
         s.in_flight -= 1;
     }
 }
@@ -406,11 +457,19 @@ fn report(elapsed: Duration, since_start: bool) -> bool {
     if hz == 0 {
         return false;
     }
-    let (window, all, in_flight, lost, bad) = {
+    let (window, all, in_flight, lost, bad, running) = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return false };
         let all = since_start.then(|| (top(&s.since_start, TOP), sums(&s.since_start)));
-        (std::mem::take(&mut s.window), all, s.in_flight, s.lost, s.bad)
+        let mut running: Vec<(u128, Key, [u32; 3])> = s
+            .running
+            .iter()
+            .filter_map(|(&k, t)| s.ops[k].as_ref().map(|op| (t.elapsed().as_millis(), op.key, op.size)))
+            .filter(|r| r.0 >= 500)
+            .collect();
+        running.sort_by(|a, b| b.0.cmp(&a.0));
+        running.truncate(6);
+        (std::mem::take(&mut s.window), all, s.in_flight, s.lost, s.bad, running)
     };
     let ms = |ticks: u64| ticks as f64 * 1000.0 / hz as f64;
     let shapes = SHAPES.lock().unwrap().clone().unwrap_or_default();
@@ -434,6 +493,9 @@ fn report(elapsed: Duration, since_start: bool) -> bool {
     };
     if !window.is_empty() {
         lines(&format!("last {:.1} s", elapsed.as_secs_f64()), top(&window, TOP), sums(&window));
+    }
+    for (ms_running, key, size) in running {
+        crate::xlog_warn!("D3D12.X: XCL_GPU_PROFILE: RUNNING for {ms_running} ms and not finished: {} ({})", program(key, &shapes), size_text(key.0, size));
     }
     if let Some((all, sum)) = all {
         lines("since the start", all, sum);
