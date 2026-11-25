@@ -164,7 +164,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, heaps) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso, s.heaps)
     });
-    let (old, blocks) = with(to, |s| {
+    let (old, blocks, res_bufs) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.heap_bound = false;
@@ -175,9 +175,17 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.rs_gfx = rs_gfx;
         s.pso = pso;
         s.heaps = heaps;
-        (old, std::mem::take(&mut s.uma))
+        // the two-pass record buffers and argument scratch of `to`'s previous recording, as in
+        // `reset`: the GPU may still read them, so the new one takes fresh ones
+        (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
+        let mut res_bufs = std::mem::take(&mut s.res_retired);
+        if let Some(b) = s.res_buf.take() {
+            res_bufs.push(b);
+        }
+        (old, std::mem::take(&mut s.uma), res_bufs)
     });
     console_list::hold_until_reset(old, blocks);
+    hold_res_until_reset(old, res_bufs);
 }
 
 /// The title changed what descriptor heaps the list has: they are looked at again.
@@ -2150,6 +2158,47 @@ void main(uint t : SV_GroupIndex) {
         }
         let io = two_pass_io(None, &[], 0x4_1234_5600, true, base, [0; 2]);
         assert_eq!((io[8], io[9]), (0x1234_5600, 4));
+    }
+
+    /// A list a deferred split records into next (`inherit_for_split`) leaves the two-pass record
+    /// buffers and argument scratch of its previous recording to that recording's allocator, as
+    /// `reset` does: the GPU may still read them. (Buffers of a software device: no GPU work.)
+    #[test]
+    fn a_split_holds_the_previous_record_buffers_for_their_allocator() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let dev = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            dev.unwrap()
+        };
+        let (from, to) = (0x7600_0001usize as *mut c_void, 0x7600_0002usize as *mut c_void);
+        let (old, new) = (0x7600_0010usize, 0x7600_0020usize);
+        let buf = unsafe { default_uav_buffer(&dev, 1 << 16, "record buffer") }.unwrap();
+        let scratch = unsafe { default_uav_buffer(&dev, 1 << 16, "argument scratch") }.unwrap();
+        with(to, |s| {
+            s.allocator = old;
+            s.res_buf = Some((buf.clone(), 1 << 16, 0));
+            s.scratch = Some((scratch.clone(), 1 << 16, 0));
+            s.res_retired.push((scratch.clone(), 1 << 16, 0));
+            (s.scratch_used, s.scratch_taken) = (256, 1 << 16);
+        });
+        inherit_for_split(from, to, new);
+        with(to, |s| {
+            assert_eq!(s.allocator, new);
+            assert!(s.res_buf.is_none() && s.res_retired.is_empty() && s.scratch.is_none(), "fresh buffers for the new recording");
+            assert_eq!((s.scratch_used, s.scratch_taken), (0, 0));
+        });
+        let held: Vec<usize> = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&old)).unwrap_or_default().iter().map(|b| b.0.as_raw() as usize).collect();
+        assert_eq!(held.len(), 2, "the record buffer and the scratch block wait for the old allocator");
+        assert!(held.contains(&(buf.as_raw() as usize)) && held.contains(&(scratch.as_raw() as usize)));
+        forget(from);
+        forget(to);
     }
 
     /// Binds on XCL's ABI (`bind_abi`, both two-pass stages) take window 0 the same way: not
