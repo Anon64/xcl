@@ -479,8 +479,18 @@ fn enqueue(p: Arc<Pending>) {
     }));
 }
 
+/// This thread is a backlog worker whose build nobody waits for (yet).
+fn build_is_backlog_only() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| {
+        let d = p.demand.lock().unwrap();
+        d.preload_thread != 0 && !d.wanted()
+    }))
+}
+
 /// The caller also drains its batch. Multiple workers can therefore build
 /// different chains without ever waiting for a free worker to start a piece.
+/// A backlog worker's build nobody waits for keeps its pieces on its own thread: helpers would go
+/// to the workers whose builds binds wait for (`queue`), ahead of them.
 pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     let count = jobs.len();
     let jobs = Arc::new(Mutex::new(jobs.into_iter().enumerate().collect::<Vec<_>>()));
@@ -492,7 +502,8 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     };
     // the helpers build for this worker's pipeline: the title waiting for it waits for them too
     let parent = BUILDING.with(|b| b.borrow().clone());
-    for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
+    let width = if build_is_backlog_only() { 1 } else { count.min(crate::gpu::recomp::dxc::compile_threads()) };
+    for _ in 1..width {
         let (drain, parent) = (drain.clone(), parent.clone());
         let _ = queue().lock().unwrap().send(Box::new(move || {
             let before = BUILDING.with(|b| b.replace(parent));
@@ -1350,6 +1361,27 @@ mod used_tests {
     /// A compute pipeline for the backlog, never built.
     fn pending_compute(key: u64) -> Arc<Pending> {
         Arc::new(Pending::new(Box::new(|| 0), false, true, key, None, 0))
+    }
+
+    /// A backlog worker's build nobody waits for builds the pieces of its dispatch chain itself:
+    /// none of them goes to the workers whose builds binds wait for.
+    #[test]
+    fn a_build_ahead_keeps_its_pieces_on_its_own_thread() {
+        let p = pending_compute(0x5EED_C1A1);
+        p.demand.lock().unwrap().preload_thread = 1;
+        let before = BUILDING.with(|b| b.replace(Some(p.clone())));
+        let here = std::thread::current().id();
+        let jobs: Vec<Job> = (0..6)
+            .map(|_| {
+                Box::new(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    usize::from(std::thread::current().id() == here)
+                }) as Job
+            })
+            .collect();
+        let on_here = build_pieces(jobs);
+        BUILDING.with(|b| *b.borrow_mut() = before);
+        assert_eq!(on_here, vec![1; 6], "every piece on the backlog worker's thread");
     }
 
     /// Work from the backlog as its workers do (a translated one goes back for its build): the
