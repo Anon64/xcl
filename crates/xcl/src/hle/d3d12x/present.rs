@@ -1421,7 +1421,10 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
             let bright = last_frame_dump().unwrap();
             assert_eq!(bright.non_dark_samples, Some(bright.sampled_pixels));
-            write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
+            // (a format no dump decodes, at the footprint's 4 bytes a texel: shared-exponent
+            // RGB is no render target's)
+            assert_eq!(texel_rgb(DXGI_FORMAT_R9G9B9E5_SHAREDEXP, &[31, 0, 0, 255]), None);
+            write_frame(&buffer, &fp, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
         }
