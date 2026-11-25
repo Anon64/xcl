@@ -2128,6 +2128,7 @@ pub(super) fn forget_pso_for_test(pso: usize) {
 }
 
 fn forget_pso(pso: usize) {
+    super::dred::forget_pso(pso);
     TRANSLATED_COMPUTE.remove(pso);
     if let Some(s) = CONSOLE_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
@@ -3213,6 +3214,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("DrawInstanced", cl_draw_instanced as usize),
             ("DrawIndexedInstanced", cl_draw_indexed_instanced as usize),
             ("SetPipelineState", cl_set_pipeline_state as usize),
+            ("SetMarker", cl_set_marker as usize),
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
@@ -3311,6 +3313,10 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
+        super::dred::reset(this);
+        if !initial_state.is_null() {
+            super::dred::mark_pipeline(this, initial_state as usize, resolved as usize);
+        }
     }
     hr
 }
@@ -4852,6 +4858,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
         PSO_USER_SGPRS.insert(*ppv as usize, n);
     }
@@ -6011,6 +6018,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
     TRANSLATED_GRAPHICS.insert(*ppv as usize, ());
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::gpu_profile::on() && !super::present::trace_frame() {
@@ -7101,6 +7109,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         }
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
+    let console_ps = ps;
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
@@ -7154,7 +7163,11 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", riid, ppv))
+    let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", riid, ppv);
+    if hr >= 0 {
+        super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
+    }
+    Some(hr)
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -7225,7 +7238,11 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, &ps_samplers, "GS", riid, ppv)
+    let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "GS", riid, ppv);
+    if hr >= 0 {
+        super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("gs", Some(gs)), ("ps", shader_bytes(&d.PS))]);
+    }
+    hr
 }
 
 /// A console MS container in the stream's AS subobject and no MS subobject (`mesh_shader_slots`).
@@ -7951,14 +7968,28 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "SetPipelineState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    let bound = super::pso_async::resolve_for_bind(pso as usize);
+    f(this, bound as *mut c_void);
+    super::dred::mark_pipeline(this, pso as usize, bound);
     super::list_x::on_set_pipeline_state(this, pso as usize);
+}
+
+/// The title's markers are counted for `XCL_DRED=1`'s pipeline labels (`dred`).
+unsafe extern "system" fn cl_set_marker(this: *mut c_void, metadata: u32, data: *const c_void, size: u32) {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const c_void, u32);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetMarker")));
+    f(this, metadata, data, size);
+    super::dred::title_marker(this);
 }
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "ClearState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    let bound = super::pso_async::resolve_for_bind(pso as usize);
+    f(this, bound as *mut c_void);
+    if !pso.is_null() {
+        super::dred::mark_pipeline(this, pso as usize, bound);
+    }
     super::list_x::on_clear_state(this, pso as usize);
     super::bind::clear_state(this, pso as usize);
 }
@@ -7999,6 +8030,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     if n == 0 {
         super::list_x::on_release(this as usize);
         super::bind::forget(this);
+        super::dred::forget_list(this);
     }
     n
 }
@@ -8653,7 +8685,16 @@ pub fn log_device_removed() {
             report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
                 let count = node.BreadcrumbCount as usize;
                 let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
-                crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
+                let list = node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw());
+                let history: Vec<i32> = if node.pCommandHistory.is_null() { Vec::new() } else { std::slice::from_raw_parts(node.pCommandHistory, count).iter().map(|o| o.0).collect() };
+                let name = if node.pCommandListDebugNameW.is_null() { None } else { node.pCommandListDebugNameW.to_string().ok() };
+                let key = super::dred::node_list(list as usize, name.as_deref());
+                let mut bound = super::dred::bound_at(key, &history, done).map(|l| format!("; pipeline bound there: {l}")).unwrap_or_default();
+                let after = super::dred::bound_after(key, &history, done);
+                if !after.is_empty() {
+                    bound += &format!("; bound after it: {}", after.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
+                }
+                crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}{bound}", list, node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
             });
         }
     }
