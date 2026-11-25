@@ -2185,6 +2185,22 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     s.decommit_range(a, n);
 }
 
+/// `decommitted` around the caller's decommit `os` of `[a, a + n)` in a sparse window (its
+/// VirtualFree, called with no lock of XCL's held; its result is returned): a CPU view there (a
+/// title's reservation of 64 KiB pages that a GPU view shows) has its pages taken as holes by
+/// submits until Windows is done, as `source_decommit` does outside the windows. For a release,
+/// drop the pair and `forget_mirrors` inside `os`, after the VirtualFree.
+pub unsafe fn decommit<R>(a: usize, n: usize, os: impl FnOnce() -> R) -> R {
+    if n == 0 {
+        return os();
+    }
+    let (span, _) = freeing_begins(&SOURCES, a, n);
+    decommitted(a, n);
+    let r = os();
+    freeing_ends(&SOURCES, span);
+    r
+}
+
 /// Tiles wait for their mapping call (`State::pending`; read without the lock).
 static PENDING: AtomicBool = AtomicBool::new(false);
 static PENDING_WAKE: (Mutex<()>, std::sync::Condvar) = (Mutex::new(()), std::sync::Condvar::new());
@@ -2304,6 +2320,11 @@ impl State {
             if self.parked.len() >= PARKED_MAX && self.flush_parked() {
                 self.retire_free_pools();
             }
+        }
+        // a CPU view in a window (a title's reservation of 64 KiB pages a GPU view shows): the
+        // tiles over it have holes there too (below, only the entries of these addresses get them)
+        if !self.src_runs.is_empty() {
+            self.source_decommitted_in(a, n);
         }
         let mut t = a & !(TILE - 1);
         while t < end {
@@ -4924,6 +4945,52 @@ mod tests {
             });
             assert_ne!(r, 0);
             assert!(!under_way((a, a + TILE)));
+        }
+    }
+
+    /// A CPU view that lies in a sparse window itself (a title's reservation of 64 KiB pages)
+    /// decommitted there: the tiles over it get the holes too, and a tile with no page left gives
+    /// its video memory back; the pages are held as being freed while Windows frees them
+    /// (`decommit`). Before, only the view's own tiles got them, and copies back, immediates and
+    /// scans through the tiles over it touched the decommitted pages.
+    #[test]
+    fn a_decommit_of_a_cpu_view_in_a_window_makes_holes_in_the_tiles_over_it() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+        unsafe {
+            let Some(mut v) = Views::new(79) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let (w, c) = (v.w, v.c);
+            let mut own: Option<ID3D12Resource> = None;
+            v.dev.CreateReservedResource(&buffer_desc((79 * TILE) as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut own).expect("CreateReservedResource");
+            // (after the GPU view's window: a tile in both is the view's)
+            v.s.windows.push((c, own.expect("reserved buffer")));
+            v.commit(0, 1);
+            v.s.commit_range(c, TILE);
+            v.write(0, 1, 23);
+            v.s.asks.push(w);
+            v.submit(&[]);
+            assert_eq!((v.s.mapped[&c].src, v.s.mapped[&w].src, v.s.mapped[&w].holes), (0, c, 0));
+            v.s.decommit_range(c + 3 * PAGE, PAGE);
+            assert_ne!(VirtualFree((c + 3 * PAGE) as *mut c_void, PAGE, MEM_DECOMMIT), 0);
+            assert_eq!(v.s.mapped[&c].holes, 1 << 3);
+            assert_eq!(v.s.mapped[&w].holes, 1 << 3, "the tile over it has the hole too");
+            assert!(v.s.mapped[&w].sent[3].is_none() && v.s.to_zero.contains(&(w + 3 * PAGE, PAGE)));
+            v.s.decommit_range(c, TILE);
+            assert_ne!(VirtualFree(c as *mut c_void, TILE, MEM_DECOMMIT), 0);
+            assert!(!v.s.mapped.contains_key(&w) && v.s.parked.contains_key(&w), "no page left: its video memory goes back");
+            assert_eq!(v.s.mirrored, 0);
+            // (written before: the look reports it, and nothing reads it)
+            v.submit(&[c + 5 * PAGE]);
+            assert!(!v.s.mapped.contains_key(&w));
+
+            let a = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert!(a != 0);
+            let r = decommit(a, PAGE, || {
+                assert!(lock_sources(&SOURCES).freeing.contains(&(a, a + PAGE)), "being freed while Windows does it");
+                VirtualFree(a as *mut c_void, PAGE, MEM_DECOMMIT)
+            });
+            assert_ne!(r, 0);
+            assert!(!lock_sources(&SOURCES).freeing.contains(&(a, a + PAGE)));
+            assert_ne!(VirtualFree(a as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 }
