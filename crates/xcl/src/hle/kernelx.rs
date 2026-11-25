@@ -461,8 +461,8 @@ fn sparse_heaps_min() -> Option<usize> {
     *MIN.get_or_init(|| std::env::var("XCL_COHERENT_HEAPS").ok().and_then(|v| parse_sparse_heaps(&v)))
 }
 
-/// Which of the title's GPU heaps go to the coherent window, as `uma_coherent.txt` keeps a size
-/// for each (`uma::coherent_hint_for`).
+/// Which of the title's GPU heaps go to the coherent window, as the window's size is kept for
+/// each (`uma::coherent_hint_for`).
 pub(crate) fn coherent_heaps_route() -> String {
     heaps_route(std::env::var("XCL_COHERENT_HEAPS").ok().as_deref())
 }
@@ -2495,7 +2495,7 @@ mod tests {
         assert_eq!(parse_sparse_heaps(&format!("sparse:{}", usize::MAX)), None, "no overflow");
     }
 
-    /// The setting `uma_coherent.txt` keeps the coherent window's size for: what goes there
+    /// The setting the coherent window's size is kept for: what goes there
     /// differs between them, and the same heaps' setting is one name however it is written.
     #[test]
     fn coherent_heaps_routes() {

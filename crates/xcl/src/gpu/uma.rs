@@ -928,45 +928,38 @@ static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 
 /// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
 /// known only once it asks for it, and the window is committed when it is made: its size is
-/// what the title put in it in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
+/// what the title put in it in its last run (`<data>/cache/uma_coherent*.txt`) and XCL's own
 /// 512 MB, at most a window. `XCL_COHERENT_MB` chooses it.
 ///
 /// Which of the title's GPU heaps go there is `XCL_COHERENT_HEAPS`'s
-/// (`kernelx::coherent_heaps_route`), so the file keeps a size for each setting, a line
-/// `<bytes> <setting>` each: a size measured with every heap in the window does not apply to a
+/// (`kernelx::coherent_heaps_route`), so a size is kept for each setting, in a file of its own
+/// (`coherent_file_name`): a size measured with every heap in the window does not apply to a
 /// run that sends them to the sparse windows. A retail title's 4582 MB of heaps, stored once,
 /// made windows of 4095 + 998 MB in runs that put at most 105 MB in them, each shadowed by as
 /// much video memory with `XCL_UMA_SHADOW=1`.
-fn coherent_file() -> std::path::PathBuf {
-    crate::state::data_dir().join("cache").join("uma_coherent.txt")
+fn coherent_file(route: &str) -> std::path::PathBuf {
+    crate::state::data_dir().join("cache").join(coherent_file_name(route))
+}
+
+/// The file in `<data>/cache` that keeps the coherent window's size for `route`, one number:
+/// `uma_coherent.txt` for every heap in the window, the file and format builds before the
+/// per-setting sizes read and write in the same data folder (a text they cannot parse gave them
+/// a 512 MB window, too small for a retail title's heaps), and `uma_coherent_<setting>.txt`
+/// (`:` as `_`) for the other settings, which those builds never read.
+fn coherent_file_name(route: &str) -> String {
+    if route == ALL_HEAPS {
+        return "uma_coherent.txt".into();
+    }
+    format!("uma_coherent_{}.txt", route.replace(':', "_"))
 }
 
 /// The setting of `XCL_COHERENT_HEAPS` that puts every GPU heap in the coherent window (none),
-/// as `uma_coherent.txt` names it. The file of before held one number, measured with it.
+/// as `kernelx::coherent_heaps_route` names it.
 pub const ALL_HEAPS: &str = "all";
 
-/// The bytes `text` (`uma_coherent.txt`) keeps for `route` (0: none).
-fn stored_need(text: &str, route: &str) -> usize {
-    text.lines()
-        .find_map(|l| {
-            let mut w = l.split_whitespace();
-            let bytes = w.next()?.parse::<usize>().ok()?;
-            (w.next().unwrap_or(ALL_HEAPS) == route).then_some(bytes)
-        })
-        .unwrap_or(0)
-}
-
-/// `text` (`uma_coherent.txt`) with `bytes` for `route`; the other settings' lines stay.
-fn with_need(text: &str, route: &str, bytes: usize) -> String {
-    let mut out = String::new();
-    for l in text.lines() {
-        let mut w = l.split_whitespace();
-        if w.next().is_some_and(|b| b.parse::<usize>().is_ok()) && w.next().unwrap_or(ALL_HEAPS) != route {
-            out += l.trim();
-            out += "\n";
-        }
-    }
-    out + &format!("{bytes} {route}\n")
+/// The bytes a `coherent_file` keeps (0: none), read as builds before read `uma_coherent.txt`.
+fn stored_need(text: &str) -> usize {
+    text.trim().parse::<usize>().unwrap_or(0)
 }
 
 /// Bytes the coherent window(s) are made with for a runtime layout of `windows` windows.
@@ -976,7 +969,7 @@ pub fn coherent_hint_for(windows: usize) -> usize {
         return (mb << 20).clamp(GRAIN, cap);
     }
     let route = crate::hle::kernelx::coherent_heaps_route();
-    let title = std::fs::read_to_string(coherent_file()).map_or(0, |s| stored_need(&s, &route));
+    let title = std::fs::read_to_string(coherent_file(&route)).map_or(0, |s| stored_need(&s));
     // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
     // and textures (WDDM charges commit for each video-memory allocation too) and the window
     // itself – a retail game took ~18 GB; with less free it runs without (its GPU heaps outside
@@ -1012,7 +1005,7 @@ fn free_commit() -> usize {
 
 /// bytes of graphics memory the title asked the coherent window for in this run
 static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// `uma_coherent.txt` is read and written under it
+/// `coherent_file` is read and written under it
 static COHERENT_FILE: Mutex<()> = Mutex::new(());
 /// A run this long has made its GPU heaps (a retail title made all of them in its first 7 s):
 /// what it put in the coherent window by then stands for the next run, also when it is less
@@ -1037,13 +1030,12 @@ pub fn note_coherent_need(bytes: usize) {
     }
     let _g = COHERENT_FILE.lock().unwrap();
     let route = crate::hle::kernelx::coherent_heaps_route();
-    let f = coherent_file();
-    let text = std::fs::read_to_string(&f).unwrap_or_default();
-    if bytes > stored_need(&text, &route) {
+    let f = coherent_file(&route);
+    if bytes > std::fs::read_to_string(&f).map_or(0, |s| stored_need(&s)) {
         if let Some(d) = f.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(&f, with_need(&text, &route, bytes));
+        let _ = std::fs::write(&f, bytes.to_string());
         let cap = max_coherent_bytes(configured_runtime_windows());
         crate::xlog_info!("UMA: the title's graphics memory for the coherent window: {} MB (up to {} MB from the next run)", bytes >> 20, (bytes + RUNTIME_COMMITTED_CAP).min(cap) >> 20);
     }
@@ -1055,11 +1047,10 @@ fn settle_coherent_need() {
     let _g = COHERENT_FILE.lock().unwrap();
     let run = NOTED.load(std::sync::atomic::Ordering::Relaxed);
     let route = crate::hle::kernelx::coherent_heaps_route();
-    let f = coherent_file();
-    let text = std::fs::read_to_string(&f).unwrap_or_default();
-    let before = stored_need(&text, &route);
+    let f = coherent_file(&route);
+    let before = std::fs::read_to_string(&f).map_or(0, |s| stored_need(&s));
     if run < before {
-        let _ = std::fs::write(&f, with_need(&text, &route, run));
+        let _ = std::fs::write(&f, run.to_string());
         crate::xlog_info!(
             "UMA: this run put {} MB of the title's graphics memory in the coherent window, {} MB were stored for '{route}' (XCL_COHERENT_HEAPS): the next run makes it {} MB",
             run >> 20,
@@ -1489,7 +1480,7 @@ mod tests {
         }
         assert_eq!(coherent_window_sizes(20 << 30, 20 << 30, 8).len(), 5);
         assert_eq!(coherent_window_sizes(20 << 30, 20 << 30, MAX_HEAP_WINDOWS).len(), 6);
-        // a coherent need past 7 windows (as `uma_coherent.txt` may keep) stops at 7: windows
+        // a coherent need past 7 windows (as a `coherent_file` may keep) stops at 7: windows
         // 10..15 stay the views'
         assert_eq!(coherent_window_sizes(40 << 30, 40 << 30, MAX_HEAP_WINDOWS), vec![MAX_SIZE; 7]);
         assert_eq!(max_coherent_windows(MAX_WINDOWS), 1);
@@ -1505,28 +1496,27 @@ mod tests {
         assert!(u.free(a) && u.free(b));
     }
 
-    /// `uma_coherent.txt` keeps the coherent window's size per `XCL_COHERENT_HEAPS` setting: the
-    /// 4582 MB a run with every GPU heap in the window stored (one number, the file of before)
-    /// does not size the window of a run that sends them to the sparse windows, which stores its
-    /// own size beside it, and lowers it.
+    /// The coherent window's size is kept per `XCL_COHERENT_HEAPS` setting: the 4582 MB a run
+    /// with every GPU heap in the window stored in `uma_coherent.txt` does not size the window of
+    /// a run that sends them to the sparse windows, which has a file of its own. The file of every
+    /// heap stays one number, the only text builds before this one read in the same data folder.
     #[test]
     fn the_stored_coherent_need_is_the_one_of_the_heaps_setting() {
-        let old = format!("{}\n", 4582usize << 20);
-        assert_eq!(stored_need(&old, ALL_HEAPS), 4582 << 20);
-        assert_eq!(stored_need(&old, "sparse:16"), 0, "measured with the heaps in the window");
-        assert_eq!(stored_need(&old, "sparse"), 0);
-        assert_eq!(stored_need("", ALL_HEAPS), 0);
-        // one size per setting; writing one keeps the others, and may lower it
-        let both = with_need(&old, "sparse:16", 105 << 20);
-        assert_eq!(stored_need(&both, ALL_HEAPS), 4582 << 20, "kept for a run with every heap in the window");
-        assert_eq!(stored_need(&both, "sparse:16"), 105 << 20);
-        let lower = with_need(&both, "sparse:16", 0);
-        assert_eq!((stored_need(&lower, "sparse:16"), stored_need(&lower, ALL_HEAPS)), (0, 4582 << 20));
-        assert_eq!(lower.lines().count(), 2, "{lower:?}");
-        let all = with_need(&lower, ALL_HEAPS, 64 << 20);
-        assert_eq!((stored_need(&all, ALL_HEAPS), stored_need(&all, "sparse:16")), (64 << 20, 0));
-        assert_eq!(all.lines().count(), 2, "the number of before is replaced, not kept beside: {all:?}");
-        // lines that are no size are dropped
-        assert_eq!(with_need("junk\n\n7 off\n", "sparse", 1), "7 off\n1 sparse\n");
+        assert_eq!(coherent_file_name(ALL_HEAPS), "uma_coherent.txt", "the file builds before read and write");
+        assert_eq!(coherent_file_name("sparse:16"), "uma_coherent_sparse_16.txt", "no ':' in a Windows file name");
+        assert_eq!(coherent_file_name("sparse"), "uma_coherent_sparse.txt");
+        assert_eq!(coherent_file_name("off"), "uma_coherent_off.txt");
+        let names = [ALL_HEAPS, "off", "sparse", "sparse:16", "sparse:64"].map(coherent_file_name);
+        assert!(names.iter().enumerate().all(|(i, n)| !names[..i].contains(n)), "one file per setting: {names:?}");
+        // what is written is what builds before wrote (`bytes.to_string()`) and parse
+        // (`s.trim().parse::<usize>()`)
+        let stored = (4582usize << 20).to_string();
+        assert_eq!(stored.trim().parse::<usize>(), Ok(4582 << 20));
+        assert_eq!(stored_need(&stored), 4582 << 20);
+        assert_eq!(stored_need(&format!("{stored}\r\n")), 4582 << 20);
+        assert_eq!(stored_need(""), 0);
+        // a text that is no number reads as none, as builds before read it: it is written over
+        // with a number at the run's first GPU heap
+        assert_eq!(stored_need("4804575232 all\n105000000 sparse:16\n"), 0);
     }
 }
