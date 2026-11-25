@@ -606,6 +606,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             // unpaired before the address can be handed out again
             mirrors::released(a);
             u.sparse_release(a);
+            forget_title_mappings(a, n);
         }
         return 1;
     }
@@ -624,6 +625,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         if release {
             mirrors::released(a);
             u.view_release(a);
+            forget_title_mappings(a, n);
         }
         trace_mem(if release { "VirtualFree (GPU view, released)" } else { "VirtualFree (GPU view, decommitted)" }, a, n, t as u64, 0, 1);
         return 1;
@@ -651,10 +653,14 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         mirrors::released(addr as usize);
     }
     let ok = source_part_going(part, release, || mem::VirtualFree(addr, size, t));
-    if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
-        GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
-        if !graphics {
-            mirrors::released(addr as usize);
+    if ok != 0 && t & 0x8000 != 0 {
+        let released = GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize));
+        if let Some(len) = released {
+            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            if !graphics {
+                mirrors::released(addr as usize);
+            }
+            forget_title_mappings(addr as usize, len);
         }
     }
     ok
@@ -1176,8 +1182,21 @@ struct Away {
     gone: Vec<usize>,
     /// homes committed ahead of the pages the call in progress unmaps (`commit_homes_ahead`)
     ready: std::collections::HashSet<usize>,
+    /// address → the page the title mapped there last. `at` cannot serve: it holds an address
+    /// only while the page's bytes are kept there, and when the title maps the same page at a
+    /// second address XCL moves the bytes and `move_away` drops the first one – on the console
+    /// the page stays mapped there too, and that first address is the pool address the queue's
+    /// page-mapping method names.
+    title: std::collections::HashMap<usize, usize>,
 }
 static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
+
+/// The title released `[base, base + len)`: the pages it mapped there are mapped there no more.
+fn forget_title_mappings(base: usize, len: usize) {
+    if let Some(a) = AWAY.lock().unwrap().as_mut() {
+        a.title.retain(|&at, _| at < base || at >= base.saturating_add(len));
+    }
+}
 
 /// Whether a physical page is mapped at the page holding `va` away from its home – committed
 /// or not yet (`lazy`: a page never used is committed at its first access).
@@ -1707,6 +1726,11 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
                 pagelog::note("page freed while mapped (the address keeps its bytes)", at, 0, *arr.add(i));
             }
         }
+        // (page numbers are never handed out again: their entries go)
+        if !away.title.is_empty() {
+            let freed: std::collections::HashSet<usize> = (0..n).map(|i| *arr.add(i)).collect();
+            away.title.retain(|_, p| !freed.contains(p));
+        }
     }
     let mut g = PHYS_BLOCKS.lock().unwrap();
     for i in 0..n {
@@ -1774,6 +1798,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         // (pages this call moved away and back are home again, not given back)
         away.gone.retain(|&h| h < home || h >= home + n * PHYS_PAGE);
+        for (i, &p) in pages.iter().enumerate() {
+            away.title.insert(home + i * PHYS_PAGE, p);
+        }
         for &p in &pages {
             if let Some(&at) = away.page.get(&p) {
                 unmap_away(away, at, &(home..home + n * PHYS_PAGE));
@@ -1796,6 +1823,8 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     let mut sparse_run = SparseRun::new(crate::hle::d3d12x::sparse::committed);
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
+        // what was mapped at `at` goes; the new page is written down once it is in place
+        away.title.remove(&at);
         if unmap_away(away, at, &(0..0)) {
             (at_run, home_run) = Default::default();
         }
@@ -1812,6 +1841,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             match move_away(away, old, at, p, in_uma(at)) {
                 Ok(true) => {
                     (at_run, home_run) = Default::default();
+                    away.title.insert(at, p);
                     continue;
                 }
                 // a lazy page is only unmarked: memory is as it was, the runs stay
@@ -1832,6 +1862,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             lazy::mark(at);
             away.at.insert(at, p);
             away.page.insert(p, at);
+            away.title.insert(at, p);
             pagelog::note("page mapped (never used: zeros on first touch)", at, 0, p);
             continue;
         }
@@ -1866,6 +1897,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         away.at.insert(at, p);
         away.page.insert(p, at);
+        away.title.insert(at, p);
     }
     sparse_run.flush();
     va
@@ -3479,7 +3511,7 @@ mod tests {
             let at = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
             mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
             let page = 0x7E57_0000usize;
-            let mut away = Away { at: Default::default(), page: Default::default(), gone: Vec::new(), ready: Default::default() };
+            let mut away = Away { at: Default::default(), page: Default::default(), gone: Vec::new(), ready: Default::default(), ..Default::default() };
             away.at.insert(old, page);
             away.page.insert(page, old);
             assert!(move_away(&mut away, old, at, page, false).is_err());
@@ -3487,6 +3519,62 @@ mod tests {
             assert_eq!(away.at.get(&old), Some(&page));
             assert_eq!(*(old as *const u32), 7);
             mem::VirtualFree(old as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// The page the title mapped at `at` last (`Away::title`).
+    fn title_at(at: usize) -> Option<usize> {
+        AWAY.lock().unwrap().as_ref().and_then(|a| a.title.get(&at).copied())
+    }
+
+    /// An address keeps the page the title mapped there last, also once XCL moved the page's
+    /// bytes to another address the title mapped it at; an unmap, another page, a free, a failed
+    /// map and the release of the reservation each leave it right.
+    #[test]
+    fn an_address_keeps_the_page_the_title_mapped_there_last() {
+        let null = std::ptr::null_mut();
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
+            let (p, q) = (pages[0], pages[1]);
+            let h = page_home(p).unwrap();
+            // a graphics reservation of the test's own
+            let r = reserve_watched(4 * PHYS_PAGE, 0x2000, mem::PAGE_READWRITE) as usize;
+            assert!(r != 0);
+            let (r1, r2) = (r, r + PHYS_PAGE);
+            let (mut one_p, mut one_q, mut none) = ([p], [q], [0usize]);
+            assert_eq!(MapTitlePhysicalPages(r1 as *mut c_void, 1, 0, 4, one_p.as_mut_ptr()) as usize, r1);
+            *(r1 as *mut u32) = 5;
+            assert_eq!(title_at(r1), Some(p));
+            // mapped at a second address: its bytes move there, the first address still names it
+            assert_eq!(MapTitlePhysicalPages(r2 as *mut c_void, 1, 0, 4, one_p.as_mut_ptr()) as usize, r2);
+            assert_eq!(*(r2 as *const u32), 5);
+            assert!(AWAY.lock().unwrap().as_ref().is_some_and(|a| a.page.get(&p) == Some(&r2) && !a.at.contains_key(&r1)), "the bytes moved");
+            assert_eq!((title_at(r1), title_at(r2)), (Some(p), Some(p)));
+            // unmapped at the first
+            assert_eq!(MapTitlePhysicalPages(r1 as *mut c_void, 1, 0, 4, none.as_mut_ptr()) as usize, r1);
+            assert_eq!((title_at(r1), title_at(r2)), (None, Some(p)));
+            // another page at the second: replaced (p goes home with its bytes)
+            assert_eq!(MapTitlePhysicalPages(r2 as *mut c_void, 1, 0, 4, one_q.as_mut_ptr()) as usize, r2);
+            assert_eq!(title_at(r2), Some(q));
+            // a map that fails (nothing reserved there, and p's home holds bytes) leaves no entry
+            let bad = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            mem::VirtualFree(bad as *mut c_void, 0, mem::MEM_RELEASE);
+            assert!(MapTitlePhysicalPages(bad as *mut c_void, 1, 0, 4, one_p.as_mut_ptr()).is_null());
+            assert_eq!(title_at(bad), None);
+            // both at their home: their homes name them
+            assert_eq!(MapTitlePhysicalPages(null, 2, 0, 4, pages.as_mut_ptr()) as usize, h);
+            assert_eq!(*(h as *const u32), 5);
+            assert_eq!((title_at(h), title_at(h + PHYS_PAGE)), (Some(p), Some(q)));
+            // the release of the reservation forgets what was mapped in it
+            assert_eq!(VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert_eq!((title_at(r1), title_at(r2)), (None, None));
+            assert_eq!(title_at(h), Some(p), "outside the reservation");
+            // freed: no address names them
+            assert_eq!(FreeTitlePhysicalPages(null, 2, pages.as_mut_ptr()), 1);
+            assert!(AWAY.lock().unwrap().as_ref().is_some_and(|a| a.title.values().all(|&v| v != p && v != q)));
         }
     }
 
