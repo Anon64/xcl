@@ -2664,6 +2664,17 @@ pub fn remapped(tiles: &[usize]) {
     REMAPPING.store(true, Ordering::Release);
 }
 
+/// The tiles of `q` (`REMAPS`) join those waiting to be linked again (`State::remaps`). Past
+/// `MIRROR_ASKS_MAX` the queue is sorted and each tile kept once: a page changed at every frame,
+/// or by several calls, waits once, and the queue holds no more than the tiles asked for.
+fn take_remaps(remaps: &mut Vec<usize>, q: &mut Vec<usize>) {
+    remaps.append(q);
+    if remaps.len() > MIRROR_ASKS_MAX {
+        remaps.sort_unstable();
+        remaps.dedup();
+    }
+}
+
 /// The physical page the GPU-view tiles `tiles` show moved from `from` to `to` (both 64 KiB
 /// aligned; `whole`: its bytes were copied there): the tiles linked over `from` follow it now,
 /// with their video memory (`State::retarget`). Called on the moving thread (kernelx, AWAY held)
@@ -3513,7 +3524,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         s.asks.append(&mut MIRROR_ASKS.lock().unwrap());
     }
     if REMAPPING.swap(false, Ordering::AcqRel) {
-        s.remaps.append(&mut REMAPS.lock().unwrap());
+        take_remaps(&mut s.remaps, &mut REMAPS.lock().unwrap());
     }
     let waited = t0.elapsed().as_micros() as u64;
     PHASES[0].fetch_add(waited, Ordering::Relaxed);
@@ -3918,6 +3929,25 @@ mod tests {
             }
         }
         runs.into_iter().collect()
+    }
+
+    /// The tiles waiting to be linked again keep their order while few; past `MIRROR_ASKS_MAX` each
+    /// waits once, however often its page changed.
+    #[test]
+    fn a_tile_remapped_again_and_again_waits_once() {
+        let (mut remaps, mut q) = (Vec::new(), vec![3 * TILE, TILE, 3 * TILE]);
+        take_remaps(&mut remaps, &mut q);
+        assert!(q.is_empty());
+        assert_eq!(remaps, vec![3 * TILE, TILE, 3 * TILE], "few: as they came");
+        // the same 100 tiles changed at each of 100 submits, none taken meanwhile
+        for _ in 0..100 {
+            let mut q: Vec<usize> = (0..100).map(|k| k * TILE).collect();
+            take_remaps(&mut remaps, &mut q);
+            assert!(remaps.len() <= MIRROR_ASKS_MAX + 100);
+        }
+        remaps.sort_unstable();
+        remaps.dedup();
+        assert_eq!(remaps, (0..100).map(|k| k * TILE).collect::<Vec<_>>());
     }
 
     /// XCL's own writes in a look: a slot counts as scanned when its CPU page is one of them, and
