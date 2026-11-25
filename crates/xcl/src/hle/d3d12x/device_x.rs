@@ -1084,6 +1084,9 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
         );
     }
     if hr >= 0 && !ppv.is_null() {
+        // noted at every creation, so a signature made at a freed one's address does not keep
+        // its companion
+        super::bind::forget_dispatch_mesh_signature(*ppv as usize);
         if needs_root {
             super::bind::note_root_changing_signature(*ppv as usize);
         } else if let Some(idx) = list.iter().position(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32) {

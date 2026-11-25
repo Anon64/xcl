@@ -350,6 +350,14 @@ pub(super) fn note_dispatch_mesh_signature(sig: usize, companion_dispatch: usize
         .insert(sig, DispatchMeshSig { companion_dispatch, byte_stride, mesh_offset });
 }
 
+/// A command signature was made at `sig`: what a freed one there was noted as goes (a mesh
+/// dispatch signature is noted again after this).
+pub(super) fn forget_dispatch_mesh_signature(sig: usize) {
+    if let Some(m) = DISPATCH_MESH_SIGS.lock().unwrap().as_mut() {
+        m.remove(&sig);
+    }
+}
+
 fn dispatch_mesh_sig_of(sig: usize) -> Option<DispatchMeshSig> {
     DISPATCH_MESH_SIGS.lock().unwrap().as_ref()?.get(&sig).copied()
 }
@@ -2145,6 +2153,19 @@ void main(uint t : SV_GroupIndex) {
         );
         DISPATCH_MESH_SIGS.lock().unwrap().as_mut().unwrap().remove(&sig);
         assert_eq!(dispatch_mesh_sig_of(sig), None);
+    }
+
+    /// A signature made at a freed mesh dispatch signature's address (`create_command_signature_x`
+    /// forgets every new one first) is not taken for a mesh dispatch with the old companion.
+    #[test]
+    fn a_signature_at_a_freed_mesh_signatures_address_has_no_companion() {
+        let sig = 0x7400_0011usize;
+        note_dispatch_mesh_signature(sig, 0x7400_0012, 16, 0);
+        assert!(dispatch_mesh_sig_of(sig).is_some());
+        forget_dispatch_mesh_signature(sig);
+        assert_eq!(dispatch_mesh_sig_of(sig), None);
+        // nothing noted: nothing to forget
+        forget_dispatch_mesh_signature(0x7400_0013);
     }
 
     #[test]
