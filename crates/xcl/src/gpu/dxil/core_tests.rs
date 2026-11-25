@@ -15,8 +15,8 @@ fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
 }
 
 /// One console wave in two hardware halves (33 to 64 threads a group): the halves of a compute
-/// group exchange through the bounded counters, as those of larger groups do, and meet at no
-/// group barrier after the one at the program's start. A barrier at every exchange hung NVIDIA
+/// or mesh group exchange through the bounded counters, as those of larger groups do, and meet
+/// at no group barrier after the one at the program's start. A barrier at every exchange hung NVIDIA
 /// GPUs when several such programs ran at once (#1727; the change is #1741's).
 #[test]
 fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
@@ -45,6 +45,30 @@ fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
         assert!(d.matches("atomicrmw").count() >= 3, "{threads} threads: the exchange's counters:
 {d}");
     }
+    // the text before the start's barrier, and after it
+    let at_start = |d: &str| d.split_at(d.find("@dx.op.barrier(i32 80, i32 9)").expect("the start's barrier")).0.to_string();
+    // without LDS: slots and counters of their own (one console wave: 4 slot words, 2 counters),
+    // the counters zeroed before the start's barrier
+    let d = dis(64, &code).unwrap();
+    assert!(d.contains("@xcl_xs = external addrspace(3) global [4 x i32]") && d.contains("@xcl_xc = external addrspace(3) global [2 x i32]"), "the spin storage:
+{d}");
+    let pre = at_start(&d);
+    let zero = pre.find("addrspace(3)* @xcl_xc, i32 0, i32 %").map(|i| &pre[i..]);
+    assert!(zero.is_some_and(|z| z.contains("store i32 0,")), "the counters zeroed before the start's barrier:
+{d}");
+    // a mesh program's compute pass of one console wave (48 or 64 threads) exchanges the same way
+    for threads in [48, 64] {
+        let ms = crate::gpu::recomp::MsInterface { outputs: vec![], threads, max_vertices: 64, max_primitives: 64 };
+        let d = super::validate::disassemble(&super::kernel::translate_mesh(&code, o, &ms).unwrap_or_else(|e| panic!("mesh, {threads} threads: {e}")).dxil).unwrap();
+        assert_eq!(syncs(&d), 1, "mesh, {threads} threads: a group barrier at the exchange:
+{d}");
+        assert!(d.contains("@xcl_xc = external addrspace(3) global [2 x i32]") && d.matches("atomicrmw").count() >= 3, "mesh, {threads} threads: the exchange's counters:
+{d}");
+        let pre = at_start(&d);
+        let zero = pre.find("addrspace(3)* @xcl_xc, i32 0, i32 %").map(|i| &pre[i..]);
+        assert!(zero.is_some_and(|z| z.contains("store i32 0,")), "mesh, {threads} threads: the counters zeroed before the start's barrier:
+{d}");
+    }
     // with the program's LDS the counters live in its top words
     let with_lds = prog(&[
         ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None),
@@ -54,6 +78,19 @@ fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
     assert_eq!(syncs(&d), 1, "a group barrier at the exchange (LDS):
 {d}");
     assert!(d.matches("atomicrmw").count() >= 3, "the exchange's counters (LDS):
+{d}");
+    // the HLSL layout: the thread counter in the top word (8191), the two counters below it
+    // (8189, 8190: zeroed before the start's barrier), the 4 slot words below them (from
+    // 8192 - 4 - 2 - 1 = 8185), and the program's LDS clamped below the slots (8184)
+    let pre = at_start(&d);
+    let rest = &d[pre.len()..];
+    assert!(pre.contains("@xcl_lds, i32 0, i32 8191") && pre.contains(", 8189") && pre[pre.find(", 8189").unwrap()..].contains("store i32 0,"), "the top word and the counters zeroed before the start's barrier:
+{d}");
+    assert!(rest.contains(", 8185"), "the slots from word 8185:
+{d}");
+    assert_eq!(rest.matches(", 8189").count(), 2, "this half's and the partner's counter:
+{d}");
+    assert!(rest.contains("i32 8184)"), "the program's LDS below the exchange:
 {d}");
 }
 

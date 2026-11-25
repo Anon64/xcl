@@ -866,7 +866,8 @@ mod tests {
             ("S_ENDPGM", "ENC_SOPP", &[]),
         ];
         // Case B: `S_CSELECT_B32` directly consumes the SCC written by `S_AND_SAVEEXEC_B64`
-        // -> split-exchange ballot MUST be emitted (+2 GROUP_SYNC barriers).
+        // -> split-exchange ballot MUST be emitted (one console wave: the spin exchange, +2
+        // groupshared fences and no group barrier).
         let live_scc = [
             ("V_CMP_LE_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)][..]),
             ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
@@ -888,9 +889,14 @@ mod tests {
             crate::gpu::dxil::validate::disassemble(&dxil_dead),
             crate::gpu::dxil::validate::disassemble(&dxil_live),
         ) {
-            let b_dead = dis_dead.matches("@dx.op.barrier(").count();
-            let b_live = dis_live.matches("@dx.op.barrier(").count();
-            assert_eq!(b_live, b_dead + 2, "live SCC should emit one split-exchange (+2 barriers); dead={b_dead}, live={b_live}");
+            // barrier mode 9: the group barrier with sync (`ops::barrier::GROUP_SYNC`); mode 8:
+            // the spin exchange's groupshared fences (`TGSM_FENCE`)
+            let syncs = |d: &str| d.matches("@dx.op.barrier(i32 80, i32 9)").count();
+            let fences = |d: &str| d.matches("@dx.op.barrier(i32 80, i32 8)").count();
+            let (s_dead, s_live) = (syncs(&dis_dead), syncs(&dis_live));
+            assert_eq!((s_dead, s_live), (1, 1), "only the start's group barrier; dead={s_dead}, live={s_live}");
+            let (f_dead, f_live) = (fences(&dis_dead), fences(&dis_live));
+            assert_eq!(f_live, f_dead + 2, "live SCC should emit one split-exchange (+2 fences); dead={f_dead}, live={f_live}");
         }
         if gpu() {
             for dxil in [&dxil_dead, &dxil_live] {

@@ -98,6 +98,10 @@ fn translation_is_byte_identical_across_runs_and_threads() {
 /// path has the barrier that counts the waves still there.
 #[test]
 fn a_group_barrier_of_several_hardware_waves_is_left_to_the_hlsl_path() {
+    // (`XCL_SAFE_BARRIER=0`: the plain group barrier in both translators)
+    if !crate::gpu::recomp::emit::safe_barrier_wanted() {
+        return;
+    }
     let code = prog(&[("S_BARRIER", "ENC_SOPP", &[], None)]);
     let o = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
     let cs = |threads| CsInterface { threads, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };

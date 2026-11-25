@@ -3545,6 +3545,18 @@ fn gpu_mesh_mode_exports_stay_inside_the_record() {
     let count = |what: &str| hlsl.hlsl.matches(what).count();
     assert_eq!((count("res.Store((xcl_vtx"), count("res.Store(xcl_prm")), (4, 1), "{}", hlsl.hlsl);
     assert_eq!((count("if (xcl_vok) res.Store((xcl_vtx"), count("if (xcl_pok) res.Store(xcl_prm")), (4, 1), "an export without its bound:\n{}", hlsl.hlsl);
+    // a title's layout on a 32-lane GPU: split wave64, 16 memory windows from the descriptor
+    // heap (the direct translator leaves this s_barrier of two console waves to the HLSL path)
+    let split = translate(&code, &Options { mode: Mode::Mesh(ms.clone()), wave64: true, split_wave64: true, mem_windows: super::HEAP_WINDOWS | 16, ..Default::default() }).unwrap();
+    assert!(split.complete(), "split, 16 heap windows: {:?}", split.unsupported_why);
+    if std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0") {
+        assert!(split.hlsl.contains("xcl_s_barrier();"), "split, 16 heap windows: expected xcl_s_barrier()");
+    }
+    if dxc::location().is_ok() {
+        dxc::compile(&split.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("split, 16 heap windows: {e}\n{}", split.hlsl));
+    } else {
+        runner::skip_test("no DXC");
+    }
     if !gpu_ready() || !mesh_ready() {
         return;
     }
