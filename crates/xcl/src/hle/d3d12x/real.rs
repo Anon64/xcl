@@ -5702,6 +5702,11 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    // (a compute pipeline's console program, as `translated_compute_pso` names it in the log)
+    let record = match &owned {
+        OwnedDesc::Compute(_, blobs) => blobs.first().map_or(0, |cs| crate::gpu::shader::fnv64(cs)),
+        _ => 0,
+    };
     let owned = std::sync::Arc::new(owned);
     let warm: Option<super::pso_async::Warm> = matches!(*owned, OwnedDesc::Graphics(..)).then(|| {
         let owned = owned.clone();
@@ -5716,7 +5721,7 @@ unsafe fn go_background(
         }
     });
     if super::pso_async::lazy() {
-        super::pso_async::submit_lazy_with(*ppv as usize, compute, job, key, warm);
+        super::pso_async::submit_lazy_with(*ppv as usize, compute, job, key, warm, record);
     } else {
         super::pso_async::submit(*ppv as usize, compute, job);
     }
