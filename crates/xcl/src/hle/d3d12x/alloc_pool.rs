@@ -173,14 +173,19 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
 /// allocator may get its address, and must not go on with this one's PC allocators. The ones
 /// made here go with it (those lists still record on are left alone: not freed, not tracked).
+/// What ended recordings on `alloc` itself used goes back when the GPU is done with it, as at a
+/// Reset: nothing else would give it back (only a Reset of a later allocator at its address).
 pub unsafe fn forget(alloc: usize) {
-    let made: Vec<usize> = {
+    let (own, made): (bool, Vec<usize>) = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
         s.types.remove(&alloc);
         let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
         mine.extend(s.cur.remove(&alloc));
         mine.push(alloc);
+        // (before the loop: `alloc` may be in `mine` more than once, and its backing goes at the
+        // first)
+        let own = s.backings.get(&alloc).is_none_or(|x| x.free());
         let mut made = Vec::new();
         for b in mine {
             let free = s.backings.get(&b).is_none_or(|x| x.free());
@@ -193,9 +198,12 @@ pub unsafe fn forget(alloc: usize) {
                 made.push(b);
             }
         }
-        made
+        (own, made)
     };
     // (outside the lock: their Release comes back here)
+    if own {
+        super::console_list::allocator_reset(alloc as *mut c_void);
+    }
     for b in made {
         // what ended recordings on it used goes with it
         super::console_list::allocator_reset(b as *mut c_void);
