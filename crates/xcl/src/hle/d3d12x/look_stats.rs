@@ -8,6 +8,7 @@
 //! a slow submit path.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -75,6 +76,47 @@ fn add_call(acc: &mut [u64; 8], ns: u64, bytes: u64, pages: u64) {
     acc[k + 3] += 1;
 }
 
+/// Sums of a `deep` line, added from any thread with relaxed adds (no lock: some are added with
+/// the sparse state's held); `take` gives them and starts again (an add made while they are taken
+/// may go to the next line's).
+pub(super) struct Sums<const N: usize>([AtomicU64; N]);
+
+impl<const N: usize> Sums<N> {
+    pub(super) const fn new() -> Self {
+        Sums([const { AtomicU64::new(0) }; N])
+    }
+
+    pub(super) fn add(&self, k: usize, v: u64) {
+        self.0[k].fetch_add(v, Ordering::Relaxed);
+    }
+
+    pub(super) fn take(&self) -> [u64; N] {
+        std::array::from_fn(|k| self.0[k].swap(0, Ordering::Relaxed))
+    }
+}
+
+/// The scans (`scan_split`): [submits, ns gathering, ns scanning, jobs shared, their items, those
+/// the caller did, ns until a job's first worker began, jobs a worker began]
+static SCAN: Sums<8> = Sums::new();
+
+/// A submit's scan (`deep` only): `gather` building its pages' slots, `scan` the scan of them,
+/// and how that was shared with the workers (None: too few pages to share).
+pub(super) fn scan_split(gather: Duration, scan: Duration, shares: Option<super::worker_pool::Shares>) {
+    SCAN.add(0, 1);
+    SCAN.add(1, gather.as_nanos() as u64);
+    SCAN.add(2, scan.as_nanos() as u64);
+    if let Some(s) = shares {
+        SCAN.add(3, 1);
+        // (the items done: all of the job's)
+        SCAN.add(4, (s.by_caller + s.by_workers) as u64);
+        SCAN.add(5, s.by_caller as u64);
+        if let Some(d) = s.first {
+            SCAN.add(6, d.as_nanos() as u64);
+            SCAN.add(7, 1);
+        }
+    }
+}
+
 /// A write-watch call of a look (`deep` only) covered `bytes`, took `took` and returned `pages`.
 pub(super) fn watch_call(took: Duration, bytes: usize, pages: usize) {
     CALLS.with(|c| {
@@ -140,6 +182,19 @@ pub(super) fn look(pages: &[usize], ahead: usize, took: Duration, closed: Option
             x[7] as f64 / 256.0,
             (x[5] / 256) >> 20,
             x[6] / 256
+        );
+        let c = SCAN.take();
+        let per = |v: u64, of: u64| v as f64 / of.max(1) as f64;
+        crate::xlog_info!(
+            "D3D12.X: scan split (256 looks): gather {:.2} ms, scan {:.2} ms a submit; of {:.0} items a job the caller did {:.0} %, the first worker began after {:.0} µs ({} jobs in {} submits, {} with a worker)",
+            per(c[1], c[0]) / 1e6,
+            per(c[2], c[0]) / 1e6,
+            per(c[4], c[3]),
+            per(c[5] * 100, c[4]),
+            per(c[6], c[7]) / 1e3,
+            c[3],
+            c[0],
+            c[7]
         );
     }
     if s.looks % 256 == 0 {
@@ -221,5 +276,22 @@ mod tests {
         watch_call(Duration::from_micros(3), 8192, 2);
         std::thread::spawn(|| watch_call(Duration::from_micros(5), 4096, 0)).join().unwrap();
         assert_eq!(CALLS.with(|c| c.replace([0; 8])), [0, 0, 0, 0, 3_000, 8192, 2, 1]);
+    }
+
+    #[test]
+    fn sums_from_threads_are_taken_once() {
+        static S: Sums<3> = Sums::new();
+        std::thread::scope(|t| {
+            for k in 0..4u64 {
+                t.spawn(move || {
+                    for _ in 0..1000 {
+                        S.add(0, 1);
+                        S.add(2, k);
+                    }
+                });
+            }
+        });
+        assert_eq!(S.take(), [4000, 0, 6000]);
+        assert_eq!(S.take(), [0, 0, 0]);
     }
 }

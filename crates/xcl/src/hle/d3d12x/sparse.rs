@@ -3067,8 +3067,8 @@ struct SharedPages<'a>(&'a [PageSlot]);
 unsafe impl Sync for SharedPages<'_> {}
 
 /// Scan `pages` (`scan_page` on each, the bytes at their CPU address); the changed runs go to
-/// `out` as window addresses, in their order.
-unsafe fn scan_pages(pages: &[PageSlot], out: &mut Vec<(usize, usize)>) {
+/// `out` as window addresses, in their order. How the work was shared with the workers, if it was.
+unsafe fn scan_pages(pages: &[PageSlot], out: &mut Vec<(usize, usize)>) -> Option<super::worker_pool::Shares> {
     /// pages a worker takes at a time, and the number from which the work is shared
     const PIECE: usize = 64;
     const SHARE_FROM: usize = 256;
@@ -3078,7 +3078,7 @@ unsafe fn scan_pages(pages: &[PageSlot], out: &mut Vec<(usize, usize)>) {
     };
     if pages.len() < SHARE_FROM {
         pages.iter().for_each(|p| scan(p, out));
-        return;
+        return None;
     }
     let pieces = pages.len().div_ceil(PIECE);
     let outs: Vec<Mutex<Vec<(usize, usize)>>> = (0..pieces).map(|_| Mutex::new(Vec::new())).collect();
@@ -3092,12 +3092,13 @@ unsafe fn scan_pages(pages: &[PageSlot], out: &mut Vec<(usize, usize)>) {
         }
         *outs[k].lock().unwrap_or_else(|e| e.into_inner()) = mine;
     };
-    super::worker_pool::run(pieces, &work);
+    let shares = super::worker_pool::run(pieces, &work);
     for o in outs {
         for (addr, len) in o.into_inner().unwrap_or_else(|e| e.into_inner()) {
             push_run(out, addr, len);
         }
     }
+    Some(shares)
 }
 
 /// Copies from the title's memory into the staging ring: shared with the worker threads when
@@ -3251,9 +3252,14 @@ impl State {
         }
         fill.clear();
         s.fill = fill;
-        scan_pages(&pages, &mut dirty_runs);
+        // (`XCL_LOOK_STATS=2`: the gather of the pages apart from their scan)
+        let t_gathered = super::look_stats::deep().then(std::time::Instant::now);
+        let shares = scan_pages(&pages, &mut dirty_runs);
         let t_scanned = std::time::Instant::now();
         super::look_stats::scan(pages.len(), &dirty_runs);
+        if let Some(t_gathered) = t_gathered {
+            super::look_stats::scan_split(t_gathered - t_locked, t_scanned - t_gathered, shares);
+        }
         PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
         PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
         // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
