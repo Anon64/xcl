@@ -2490,7 +2490,10 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
             static N: AtomicU64 = AtomicU64::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 64 {
                 let (vf, flags) = copy.as_ref().map_or((0, 0), |c| (c.Format.0, c.Flags.0));
-                crate::xlog_info!("frame trace: CreateDepthStencilView {cpu:#x} → {res:p} {}x{} PC format {}, view format {vf}, flags {flags:#x}", d.Width, d.Height, d.Format.0);
+                // (the buffer's title address: two buffers at one address are one memory on
+                // the console – a D16 buffer over the depth plane of a D16S8 one)
+                let at = title_address(res as usize).or_else(|| super::title_textures::address(res as usize)).map_or(String::new(), |a| format!(", the buffer at {a:#x}"));
+                crate::xlog_info!("frame trace: CreateDepthStencilView {cpu:#x} → {res:p} {}x{} PC format {}, view format {vf}, flags {flags:#x}{at}", d.Width, d.Height, d.Format.0);
             }
         }
     }
@@ -6146,8 +6149,10 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         // (with `XCL_TRACE_FORMATS`, only pipelines that draw into a target of those formats: a
         // title's menus make the first 400 long before the ones looked for)
         let formats = super::bind::trace_formats();
-        let wanted = formats.is_empty() || d.RTVFormats[..d.NumRenderTargets.min(8) as usize].iter().any(|f| formats.contains(&f.0));
-        if wanted && N.fetch_add(1, Ordering::Relaxed) < 400 {
+        let wanted = formats.is_empty()
+            || d.RTVFormats[..d.NumRenderTargets.min(8) as usize].iter().any(|f| formats.contains(&f.0))
+            || super::bind::trace_dsv_formats().contains(&d.DSVFormat.0);
+        if wanted && N.fetch_add(1, Ordering::Relaxed) < 1500 {
             let b = &d.BlendState.RenderTarget[0];
             let z = &d.DepthStencilState;
             crate::xlog_info!(

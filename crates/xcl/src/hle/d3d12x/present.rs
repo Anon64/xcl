@@ -1218,12 +1218,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     if due && trace_frame() {
         let busiest = busiest_rt();
         let followed = FOLLOWED.lock().unwrap();
+        // (a followed target is an address too: taken only while an RTV still holds it)
         let targets = busiest
             .into_iter()
-            .chain(followed.iter().copied())
-            .filter_map(|r| {
-                let rr = r as *mut c_void;
-                let res = ID3D12Resource::from_raw_borrowed(&rr)?.clone();
+            .chain(followed.iter().filter_map(|&r| view_resource(r)))
+            .filter_map(|res| {
                 let d = res.GetDesc();
                 if d.SampleDesc.Count > 1 {
                     return None;
@@ -1482,13 +1481,19 @@ pub unsafe fn watch_rt(rt: usize) {
 }
 
 /// the single-sampled resource bound as a render target most often (`XCL_TRACE_FRAME`; a
-/// multisampled one cannot be copied to a buffer – the present list would not close)
-fn busiest_rt() -> Option<usize> {
+/// multisampled one cannot be copied to a buffer – the present list would not close).
+///
+/// `USES` and the watched target are addresses, not references. A target is taken only while an
+/// RTV still names it, which holds it (`view_resource`): a retail title's world releases
+/// transient targets all the time, and GetDesc on one of those addresses ended the process (an
+/// access violation under `present_now`, in every trace run that also dumped frames or targets).
+unsafe fn busiest_rt() -> Option<ID3D12Resource> {
     if let Some(r) = *WATCHED_RT.lock().unwrap() {
-        return Some(r);
+        return view_resource(r);
     }
-    let single = |r: usize| unsafe { ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| x.GetDesc().SampleDesc.Count <= 1) };
-    USES.lock().unwrap().as_ref()?.iter().filter(|(&r, u)| u[USE_RT] > 0 && single(r)).max_by_key(|(_, u)| u[USE_RT]).map(|(&r, _)| r)
+    let mut bound: Vec<(usize, u64)> = USES.lock().unwrap().as_ref()?.iter().filter(|(_, u)| u[USE_RT] > 0).map(|(&r, u)| (r, u[USE_RT])).collect();
+    bound.sort_by_key(|&(_, binds)| std::cmp::Reverse(binds));
+    bound.into_iter().find_map(|(r, _)| view_resource(r).filter(|x| x.GetDesc().SampleDesc.Count <= 1))
 }
 
 /// an 11- / 10-bit unsigned float (5-bit exponent) -> f32

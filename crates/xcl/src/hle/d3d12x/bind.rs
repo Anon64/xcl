@@ -1709,7 +1709,15 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize, indirect: bool) {
     // the first 160 kinds of a busy frame are its first passes, and the ones looked for (a
     // lighting target's) never got a line
     let formats = trace_formats();
-    if !formats.is_empty() && !desc(rt).is_some_and(|d| formats.contains(&d.2)) {
+    // (`XCL_TRACE_DSV_FORMATS`: or draws whose depth buffer, at least 2560 wide, has one of those
+    // PC formats – the passes that write or test a depth buffer and draw into no target of the
+    // formats above; known while `XCL_DUMP_TARGETS` keeps what a DSV names)
+    let depth_wanted = || {
+        let dsv = trace_dsv_formats();
+        !dsv.is_empty()
+            && super::list_x::bound_dsv(this).and_then(super::present::rtv_resource).and_then(desc).is_some_and(|d| d.0 >= 2560 && dsv.contains(&d.2))
+    };
+    if !formats.is_empty() && !desc(rt).is_some_and(|d| formats.contains(&d.2)) && !depth_wanted() {
         return;
     }
     // `XCL_TRACE_AFTER_S=110`: no kind is listed before that many seconds of the run (a title's
@@ -1768,6 +1776,14 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize, indirect: bool) {
 pub(super) fn trace_formats() -> &'static [i32] {
     static FORMATS: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
     FORMATS.get_or_init(|| std::env::var("XCL_TRACE_FORMATS").unwrap_or_default().split(',').filter_map(|f| f.trim().parse().ok()).collect())
+}
+
+/// `XCL_TRACE_DSV_FORMATS=53,55` (DXGI format numbers): depth buffer formats the frame trace
+/// also keeps to – draws whose bound depth buffer has one of them as its PC format (53: a D16
+/// buffer), and pipelines whose DSV format is one of them (55). Empty: none.
+pub(super) fn trace_dsv_formats() -> &'static [i32] {
+    static FORMATS: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+    FORMATS.get_or_init(|| std::env::var("XCL_TRACE_DSV_FORMATS").unwrap_or_default().split(',').filter_map(|f| f.trim().parse().ok()).collect())
 }
 
 /// `XCL_TRACE_SHADERS=hash,…` (dump hashes, hex): the draws traced with their root arguments
