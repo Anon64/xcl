@@ -685,26 +685,26 @@ pub mod mirrors {
     /// it there): the GPU-view pages that show it follow. A move is no change of what they show
     /// (their call and their place in the log stay), but a page that gets its first place, or
     /// loses it, is: its bytes appear or go. `None` when no page shows it elsewhere (one atomic
-    /// load while nothing is recorded); else where it was kept and the pages that followed.
+    /// load while nothing is recorded); else the pages that followed, each with where it was kept
+    /// and whether a tile could show it there (`Shown::at`, `Shown::tile`).
     /// Called on the moving thread with AWAY held, before the memory it left can go.
-    pub(super) fn page_at(page: usize, at: usize, tile: bool) -> Option<(usize, Vec<usize>)> {
+    pub(super) fn page_at(page: usize, at: usize, tile: bool) -> Option<Vec<(usize, usize, bool)>> {
         if MAPPED.load(Ordering::Acquire) == 0 || !read_pages().by_page.contains_key(&page) {
             return None;
         }
         let mut p = write_pages();
-        let moving: Vec<(usize, usize)> =
-            p.by_page.get(&page)?.iter().filter_map(|&g| p.shown.get(&g).filter(|e| e.at != at || e.tile != tile).map(|e| (g, e.at))).collect();
+        let moving: Vec<(usize, usize, bool)> =
+            p.by_page.get(&page)?.iter().filter_map(|&g| p.shown.get(&g).filter(|e| e.at != at || e.tile != tile).map(|e| (g, e.at, e.tile))).collect();
         if moving.is_empty() {
             return None;
         }
         let call = calls();
-        let from = moving.iter().map(|&(_, f)| f).find(|&f| f != 0).unwrap_or(0);
-        for &(g, was) in &moving {
+        for &(g, was, _) in &moving {
             p.place(g, at, tile, ((was == 0) != (at == 0)).then_some(call));
         }
         drop(p);
         MOVED.fetch_add(moving.len() as u64, Ordering::Relaxed);
-        Some((from, moving.into_iter().map(|(g, _)| g).collect()))
+        Some(moving)
     }
 
     /// Physical page `page` was freed: the GPU-view pages that showed it show nothing from here
@@ -846,14 +846,24 @@ unsafe fn page_placed(page: usize, at: usize, home: bool, whole: bool) {
         return;
     }
     let tile = at != 0 && (home || freeing_is_seen(at));
-    let Some((from, shown)) = mirrors::page_at(page, at, tile) else { return };
-    // (its bytes appear or go: a change of what the tiles over it show; and a place no tile may
-    // show: they are linked again, to nothing)
-    if from == 0 || at == 0 || !tile {
-        crate::hle::d3d12x::sparse::remapped(&shown);
-    } else {
-        // (the tiles over the place it left follow it, before that memory can go)
-        crate::hle::d3d12x::sparse::moved(&shown, from, at, whole);
+    let Some(moving) = mirrors::page_at(page, at, tile) else { return };
+    // the tiles linked over the place it left follow it, before that memory can go: those of
+    // the view pages kept where a tile could show them, and now kept where one may. The others
+    // are linked again (to nothing, or to the new place): their bytes appear or go, or no tile
+    // was linked where they were – a page that leaves plain memory for memory a tile may show
+    let from = if tile { moving.iter().find(|m| m.1 != 0 && m.2).map_or(0, |m| m.1) } else { 0 };
+    let (mut follow, mut relink): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+    for &(g, was, could) in &moving {
+        let to = if from != 0 && was == from && could { &mut follow } else { &mut relink };
+        to.push(g);
+    }
+    #[cfg(test)]
+    tests::PLACED.with(|s| s.borrow_mut().push((page, from, at, follow.clone(), relink.clone())));
+    if !relink.is_empty() {
+        crate::hle::d3d12x::sparse::remapped(&relink);
+    }
+    if !follow.is_empty() {
+        crate::hle::d3d12x::sparse::moved(&follow, from, at, whole);
     }
     if whole {
         crate::hle::d3d12x::title_textures::note_known_write(at, PHYS_PAGE);
@@ -3879,6 +3889,10 @@ mod tests {
         /// shown (`mirrors::any_mapped`): (start, bytes, whether the first page was still
         /// committed then)
         pub(super) static KEPT_GOING: std::cell::RefCell<Vec<(usize, usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// what `page_placed` told sparse on this thread: (page, the place the tiles follow it
+        /// from – 0: none, its new place, the GPU-view pages whose tiles follow it, those linked
+        /// again)
+        pub(super) static PLACED: std::cell::RefCell<Vec<(usize, usize, usize, Vec<usize>, Vec<usize>)>> = const { std::cell::RefCell::new(Vec::new()) };
         /// the ranges `mirrors::released` had sparse forget on this thread
         pub(super) static FORGOTTEN: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
@@ -4417,6 +4431,65 @@ mod tests {
             for q in [pool, r] {
                 assert_eq!(VirtualFree(q as *mut c_void, 0, mem::MEM_RELEASE), 1);
             }
+        }
+    }
+
+    /// When a shown page moves, the tiles of its GPU-view pages follow it from a place a tile
+    /// could show to another such place (`sparse::moved`, from the place it left). They are linked
+    /// again when it goes to plain memory (no tile may show it there), and when it comes back
+    /// from there: no tile was linked over plain memory, so none can follow it.
+    #[test]
+    fn a_page_leaving_plain_memory_has_the_tiles_over_it_linked_again() {
+        use mirrors::{apply_batches, shows, Shows, PAGE};
+        const SIZE: usize = 223 * PAGE;
+        let g = 0x72D0_0000_0000usize;
+        let null = std::ptr::null_mut();
+        let placed = || PLACED.with(|s| s.take());
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
+            let mut n = 1usize;
+            let mut pages = [0usize; 1];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
+            let a = pages[0];
+            let home = page_home(a).unwrap();
+            let cv = cpu_view(SIZE, g);
+            // the pool and another address, graphics reservations both; and plain memory
+            let pool = reserve_watched(PAGE, 0x2000, mem::PAGE_READWRITE) as usize;
+            let r = reserve_watched(2 * PAGE, 0x2000, mem::PAGE_READWRITE) as usize;
+            let plain = mem::VirtualAlloc(std::ptr::null(), PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert!(pool != 0 && r != 0 && plain != 0);
+            let (mut one, mut none) = ([a], [0usize]);
+            assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, pool);
+            *(pool as *mut u32) = 0xA;
+            // a at view pages 1 and 2
+            let ranges = [[1, 0, 2]];
+            assert!(apply_batches(1, [batch(g + PAGE, &ranges)].as_ptr() as usize, pool, 1).is_some());
+            assert_eq!(shows(g + PAGE), Shows::Page { at: pool, tile: true });
+            let views = vec![g + PAGE, g + 2 * PAGE];
+            placed();
+
+            // mapped in plain memory: linked again (to nothing there)
+            assert_eq!(MapTitlePhysicalPages(plain as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, plain);
+            assert_eq!(shows(g + 2 * PAGE), Shows::Page { at: plain, tile: false });
+            assert_eq!(placed(), vec![(a, 0, plain, vec![], views.clone())]);
+            // from there to a graphics reservation: linked again, to the new place
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, r);
+            assert_eq!(*(r as *const u32), 0xA);
+            assert_eq!(shows(g + PAGE), Shows::Page { at: r, tile: true });
+            assert_eq!(placed(), vec![(a, 0, r, vec![], views.clone())]);
+            // from there to another: they follow it from the place it left
+            assert_eq!(MapTitlePhysicalPages((r + PAGE) as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, r + PAGE);
+            assert_eq!(placed(), vec![(a, r, r + PAGE, views.clone(), vec![])]);
+            // unmapped: home, with its bytes; they follow it there
+            assert_eq!(MapTitlePhysicalPages((r + PAGE) as *mut c_void, 1, 0, 4, none.as_mut_ptr()) as usize, r + PAGE);
+            assert_eq!(shows(g + PAGE), Shows::Page { at: home, tile: true });
+            assert_eq!(placed(), vec![(a, r + PAGE, home, views.clone(), vec![])]);
+
+            assert_eq!(FreeTitlePhysicalPages(null, 1, pages.as_mut_ptr()), 1);
+            for q in [cv, pool, r] {
+                assert_eq!(VirtualFree(q as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            }
+            mem::VirtualFree(plain as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
 
