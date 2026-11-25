@@ -564,7 +564,10 @@ struct Preload {
 /// time up to 150 s later: each such bind waited 7 – 15 s for its pipeline, one after another,
 /// and no frame came for 156 s. A compute pipeline is waited for at its first dispatch (or its
 /// dispatches are skipped: `XCL_CS_PSO_WAIT_MS`), and one no earlier run used was built only
-/// then: a retail title's thread spent 57 s in the driver on one. A pipeline a bind wants is
+/// then: a retail title's thread spent 57 s in the driver on one. Those are built by one worker
+/// at a time (`compute_out`): a title has ~1 600 of them, some a minute each in the driver, and
+/// with every worker on them the known graphics pipelines would wait for all of them and be
+/// built at their first draws instead. A pipeline a bind wants is
 /// not taken from here (`unclaimed`): the workers build it at once, and a huge driver compile
 /// ahead of its use gives its turn to any other (`real::big_compile_turn`).
 #[derive(Default)]
@@ -572,6 +575,8 @@ struct Backlog {
     known_compute: std::collections::VecDeque<Arc<Pending>>,
     /// compute pipelines no earlier run used
     compute: std::collections::VecDeque<Arc<Pending>>,
+    /// a worker builds one of `compute` (`next` hands out no other until `built`)
+    compute_out: bool,
     known: std::collections::VecDeque<Arc<Pending>>,
     warm: std::collections::VecDeque<Arc<Pending>>,
     cold: std::collections::VecDeque<Arc<Pending>>,
@@ -579,8 +584,9 @@ struct Backlog {
 
 /// What a backlog worker does with a pipeline.
 enum Step {
-    /// its build (`ahead`: of a pipeline no earlier run used – counts against `ahead_cap`)
-    Build { ahead: bool },
+    /// its build (`ahead`: of a pipeline no earlier run used – counts against `ahead_cap`;
+    /// `new_compute`: from `Backlog::compute`, `Backlog::built` after it)
+    Build { ahead: bool, new_compute: bool },
     /// its translation and DXC compile; then back to the backlog for its build
     Warm(Warm),
 }
@@ -610,19 +616,20 @@ impl Backlog {
     fn next(&mut self, ahead: bool, builds: bool) -> Option<(Arc<Pending>, Step)> {
         while let Some(p) = self.known_compute.pop_front() {
             if p.unclaimed() {
-                return Some((p, Step::Build { ahead: false }));
+                return Some((p, Step::Build { ahead: false, new_compute: false }));
             }
         }
-        if ahead && builds {
+        if ahead && builds && !self.compute_out {
             while let Some(p) = self.compute.pop_front() {
                 if p.unclaimed() {
-                    return Some((p, Step::Build { ahead: true }));
+                    self.compute_out = true;
+                    return Some((p, Step::Build { ahead: true, new_compute: true }));
                 }
             }
         }
         while let Some(p) = self.known.pop_front() {
             if p.unclaimed() {
-                return Some((p, Step::Build { ahead: false }));
+                return Some((p, Step::Build { ahead: false, new_compute: false }));
             }
         }
         if !ahead {
@@ -643,10 +650,17 @@ impl Backlog {
         }
         while let Some(p) = self.cold.pop_front() {
             if p.unclaimed() {
-                return Some((p, Step::Build { ahead: true }));
+                return Some((p, Step::Build { ahead: true, new_compute: false }));
             }
         }
         None
+    }
+
+    /// The build `next` handed out as `Step::Build` is over (built, or taken by a bind).
+    fn built(&mut self, new_compute: bool) {
+        if new_compute {
+            self.compute_out = false;
+        }
     }
 }
 
@@ -711,7 +725,7 @@ fn preload() -> Option<&'static Preload> {
                             g = q.cv.wait_timeout(g, std::time::Duration::from_secs(1)).unwrap().0;
                         }
                     };
-                    let ahead = match step {
+                    let (ahead, new_compute) = match step {
                         Step::Warm(warm) => {
                             warm();
                             WARMED.fetch_add(1, Ordering::Relaxed);
@@ -720,7 +734,7 @@ fn preload() -> Option<&'static Preload> {
                             }
                             continue;
                         }
-                        Step::Build { ahead } => ahead,
+                        Step::Build { ahead, new_compute } => (ahead, new_compute),
                     };
                     // (None: a bind took it and builds it itself)
                     let job = p.job.lock().unwrap().take();
@@ -734,6 +748,7 @@ fn preload() -> Option<&'static Preload> {
                             crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
                         }
                     }
+                    q.list.lock().unwrap().built(new_compute);
                 }
             });
         }
@@ -1059,9 +1074,10 @@ mod used_tests {
                     done.push((p.key, "warm"));
                     b.cold.push_back(p);
                 }
-                Step::Build { ahead } => {
+                Step::Build { ahead, new_compute } => {
                     p.job.lock().unwrap().take();
                     done.push((p.key, if ahead { "build ahead" } else { "build" }));
+                    b.built(new_compute);
                 }
             }
         }
@@ -1128,6 +1144,26 @@ mod used_tests {
         assert!(drain(&mut b, true, false).is_empty());
         assert_eq!(b.len(), 1, "past the cap: it waits");
         assert_eq!(drain(&mut b, true, true), [(3, "build ahead")]);
+    }
+
+    /// While a worker builds a compute pipeline no earlier run used, the other workers get the
+    /// known graphics ones (and the rest), not the next new compute one.
+    #[test]
+    fn one_worker_at_a_time_builds_new_compute_pipelines() {
+        let mut b = Backlog::default();
+        b.push(pending_compute(3), false);
+        b.push(pending_compute(4), false);
+        b.push(pending(2, false), true);
+        b.push(pending(1, false), false);
+        let take = |b: &mut Backlog| b.next(true, true).map(|(p, step)| (p.key, matches!(step, Step::Build { new_compute: true, .. })));
+        assert_eq!(take(&mut b), Some((3, true)));
+        assert_eq!(take(&mut b), Some((2, false)), "a known graphics one while the new compute one is built");
+        assert_eq!(take(&mut b), Some((1, false)));
+        assert_eq!(take(&mut b), None, "the next new compute one waits for the one being built");
+        b.built(false);
+        assert_eq!(take(&mut b), None);
+        b.built(true);
+        assert_eq!(take(&mut b), Some((4, true)));
     }
 
     /// A lazy compute pipeline of shaders no run used yet is built with no bind – when commit is
