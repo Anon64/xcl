@@ -186,14 +186,21 @@ pub unsafe fn to_dump(n: u64, f: &Frame) -> Vec<(String, ID3D12Resource, D3D12_R
     let dumped = config().map_or(DUMPED, |c| c.targets);
     crate::xlog_info!("D3D12.X: target dump of frame {n}: {} draws and dispatches, {} render targets drawn into", f.work, ranked.len());
     let mut out = Vec::new();
+    let (mut sizes, mut left) = (Vec::new(), Vec::new());
     let depth = f.depth().map(|(r, c)| (usize::MAX, r, c));
     for (k, r, c) in ranked.into_iter().enumerate().map(|(k, (r, c))| (k, r, c)).chain(depth) {
         let res = super::present::view_resource(r);
         let d = res.as_ref().map(|x| x.GetDesc());
         let what = d.map_or("released".into(), |d| format!("{}x{} format {}", d.Width, d.Height, d.Format.0));
         let copyable = d.is_some_and(|d| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count <= 1);
+        // past the readback cap: this target and every later one are left out
+        let capped = k < dumped && copyable && {
+            sizes.push(d.map_or(0, |d| readback_bytes(&d)));
+            dumped_within(&sizes, DUMP_BYTES_MOST) < sizes.len()
+        };
         let tag = match (k, copyable) {
             (usize::MAX, _) => " (not dumped: its state is not known)".into(),
+            (k, true) if k < dumped && capped => format!(" (not dumped: target{k} is past the readback cap)"),
             (k, true) if k < dumped => format!(" → target{k}"),
             (_, false) if d.is_some() => " (not dumped)".into(),
             _ => String::new(),
@@ -208,14 +215,15 @@ pub unsafe fn to_dump(n: u64, f: &Frame) -> Vec<(String, ID3D12Resource, D3D12_R
             c[SKIPPED]
         );
         if let (true, Some(res), Some(d)) = (k < dumped && copyable, res, d) {
-            out.push((format!("target{k}"), res, d));
+            if capped {
+                left.push(format!("target{k}"));
+            } else {
+                out.push((format!("target{k}"), res, d));
+            }
         }
     }
-    let kept = dumped_within(&out.iter().map(|(_, _, d)| readback_bytes(d)).collect::<Vec<_>>(), DUMP_BYTES_MOST);
-    if kept < out.len() {
-        let left: Vec<&str> = out[kept..].iter().map(|(tag, _, _)| tag.as_str()).collect();
-        crate::xlog_warn!("D3D12.X: target dump of frame {n}: {} of {} targets left out, past {} MiB of readback: {}", left.len(), out.len(), DUMP_BYTES_MOST >> 20, left.join(" "));
-        out.truncate(kept);
+    if !left.is_empty() {
+        crate::xlog_warn!("D3D12.X: target dump of frame {n}: {} of {} targets left out, past {} MiB of readback: {}", left.len(), out.len() + left.len(), DUMP_BYTES_MOST >> 20, left.join(" "));
     }
     out
 }
@@ -406,6 +414,10 @@ mod tests {
         assert_eq!(hdr, 2560 * 1440 * 16);
         // 64 of them: 3.8 GB; 18 fit in 1 GiB
         assert_eq!(dumped_within(&[hdr; 64], DUMP_BYTES_MOST), 18);
+        // to_dump asks once per target, with the sizes so far: a target cut stays cut
+        for n in 1..=64 {
+            assert_eq!(dumped_within(&vec![hdr; n], DUMP_BYTES_MOST), n.min(18), "{n} targets");
+        }
         let small = readback_bytes(&desc(1920, 1080, DXGI_FORMAT_R8_UNORM));
         assert_eq!(small, 1920 * 1080);
         assert_eq!(dumped_within(&[small; 64], DUMP_BYTES_MOST), 64, "under the cap: all");
