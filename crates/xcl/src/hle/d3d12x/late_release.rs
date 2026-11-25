@@ -10,6 +10,7 @@
 //! signalled on every queue with work on it; the batch goes once all of them have passed it.
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -94,6 +95,26 @@ pub fn enabled() -> bool {
 
 /// how long a last `Release` itself waits for queues with nothing to do to say so
 const IDLE_WAIT: Duration = Duration::from_micros(300);
+/// how long queues that had work then are taken to have some: the next releases leave theirs to the
+/// thread at once (a title that streams releases many at a time, each with a `Signal` on every queue
+/// and `IDLE_WAIT` of its own)
+const BUSY_FOR: Duration = Duration::from_millis(5);
+
+/// Whether queues that were found busy are still taken to be.
+#[derive(Default)]
+struct Busy(Mutex<Option<Instant>>);
+
+impl Busy {
+    fn is(&self, now: Instant) -> bool {
+        self.0.lock().unwrap().is_some_and(|until| now < until)
+    }
+
+    fn found(&self, now: Instant) {
+        *self.0.lock().unwrap() = Some(now + BUSY_FOR);
+    }
+}
+
+static BUSY: Busy = Busy(Mutex::new(None));
 
 /// `res` (an adopted resource) holds one reference that is now this module's. With no work in
 /// flight it goes before this returns (the queues pass a fence value at once): a title that
@@ -102,13 +123,25 @@ const IDLE_WAIT: Duration = Duration::from_micros(300);
 pub unsafe fn hold(res: usize) {
     HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
     let start = Instant::now();
-    drain_known(true);
-    while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
-        std::hint::spin_loop();
-        drain_known(false);
+    let busy = BUSY.is(start);
+    if !busy {
+        drain_known(true);
+        while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
+            std::hint::spin_loop();
+            drain_known(false);
+        }
+        if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
+            return;
+        }
+        BUSY.found(Instant::now());
     }
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
-        return;
+    {
+        static N: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        let n = N[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let left = N[1].fetch_add(busy as u64, Ordering::Relaxed) + busy as u64;
+        if n.is_power_of_two() && n >= 1024 {
+            crate::xlog_info!("D3D12.X: {n} last releases with work in flight so far, {left} of them left to the thread without a look at the queues");
+        }
     }
     // A thread of its own lets the held ones go: the title may release a resource and then
     // wait for its memory without another submit (an imported heap pins the pages under its
@@ -198,6 +231,19 @@ mod tests {
             assert!(held.is_empty());
             drop(ID3D12Resource::from_raw(raw as *mut c_void));
         }
+    }
+
+    /// Queues found busy are taken to be for a moment, and looked at again after it.
+    #[test]
+    fn busy_queues_are_looked_at_again_after_a_moment() {
+        let busy = Busy::default();
+        let t = Instant::now();
+        assert!(!busy.is(t), "never looked at");
+        busy.found(t);
+        assert!(busy.is(t) && busy.is(t + BUSY_FOR / 2));
+        assert!(!busy.is(t + BUSY_FOR));
+        busy.found(t + BUSY_FOR);
+        assert!(busy.is(t + BUSY_FOR + BUSY_FOR / 2));
     }
 
     /// With no queue at all nothing can be in flight: the next drain lets the batch go.
