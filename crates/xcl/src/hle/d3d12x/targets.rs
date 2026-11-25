@@ -211,7 +211,35 @@ pub unsafe fn to_dump(n: u64, f: &Frame) -> Vec<(String, ID3D12Resource, D3D12_R
             out.push((format!("target{k}"), res, d));
         }
     }
+    let kept = dumped_within(&out.iter().map(|(_, _, d)| readback_bytes(d)).collect::<Vec<_>>(), DUMP_BYTES_MOST);
+    if kept < out.len() {
+        let left: Vec<&str> = out[kept..].iter().map(|(tag, _, _)| tag.as_str()).collect();
+        crate::xlog_warn!("D3D12.X: target dump of frame {n}: {} of {} targets left out, past {} MiB of readback: {}", left.len(), out.len(), DUMP_BYTES_MOST >> 20, left.join(" "));
+        out.truncate(kept);
+    }
     out
+}
+
+/// readback bytes of one present's target dump at most: 64 targets of 2560x1440 RGBA32F are
+/// about 3.8 GB, at once, on a card that may be full already
+const DUMP_BYTES_MOST: u64 = 1 << 30;
+
+/// bytes a copy of `d`'s subresource 0 reads back (row padding aside)
+fn readback_bytes(d: &D3D12_RESOURCE_DESC) -> u64 {
+    d.Width.saturating_mul(d.Height as u64).saturating_mul(texel_bytes(d.Format) as u64)
+}
+
+/// Of targets of `sizes` bytes, in the order they are dumped: how many go before `most` bytes
+/// are passed (the rest are left out). The first goes however large it is.
+fn dumped_within(sizes: &[u64], most: u64) -> usize {
+    let mut total = 0u64;
+    for (k, &b) in sizes.iter().enumerate() {
+        total = total.saturating_add(b);
+        if k > 0 && total > most {
+            return k;
+        }
+    }
+    sizes.len()
 }
 
 /// Of the texels sampled in `data` (every 4th of every 4th row, as the dumps do): how many are not
@@ -367,6 +395,31 @@ mod tests {
         assert_eq!(texel_bytes(DXGI_FORMAT_D32_FLOAT_S8X24_UINT), 8);
         assert_eq!(texel_bytes(DXGI_FORMAT_R32G8X24_TYPELESS), 8);
         assert_eq!(texel_bytes(DXGI_FORMAT_D16_UNORM), 2);
+    }
+
+    /// One present's target dump reads back 1 GiB at most: the targets past it, in the order
+    /// dumped, are left out; a first target larger than that still goes.
+    #[test]
+    fn a_target_dump_stops_at_a_gib_of_readback() {
+        let desc = |w: u64, h: u32, f: DXGI_FORMAT| D3D12_RESOURCE_DESC { Width: w, Height: h, Format: f, ..Default::default() };
+        let hdr = readback_bytes(&desc(2560, 1440, DXGI_FORMAT_R32G32B32A32_FLOAT));
+        assert_eq!(hdr, 2560 * 1440 * 16);
+        // 64 of them: 3.8 GB; 18 fit in 1 GiB
+        assert_eq!(dumped_within(&[hdr; 64], DUMP_BYTES_MOST), 18);
+        let small = readback_bytes(&desc(1920, 1080, DXGI_FORMAT_R8_UNORM));
+        assert_eq!(small, 1920 * 1080);
+        assert_eq!(dumped_within(&[small; 64], DUMP_BYTES_MOST), 64, "under the cap: all");
+        assert_eq!(dumped_within(&[], DUMP_BYTES_MOST), 0);
+        // the order stays: a small target after the one past the cap is left out too
+        let half = readback_bytes(&desc(16384, 16384, DXGI_FORMAT_R8G8_UNORM));
+        assert_eq!(half, 512 << 20);
+        assert_eq!(dumped_within(&[half, half, small], DUMP_BYTES_MOST), 2, "exactly 1 GiB");
+        assert_eq!(dumped_within(&[half, half + 1, small], DUMP_BYTES_MOST), 1);
+        // a first target larger than the cap goes alone
+        let huge = readback_bytes(&desc(16384, 16384, DXGI_FORMAT_R32G32B32A32_FLOAT));
+        assert!(huge > DUMP_BYTES_MOST);
+        assert_eq!(dumped_within(&[huge], DUMP_BYTES_MOST), 1);
+        assert_eq!(dumped_within(&[huge, small], DUMP_BYTES_MOST), 1);
     }
 
     #[test]
