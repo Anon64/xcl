@@ -462,6 +462,12 @@ struct State {
     fill: Vec<usize>,
     /// window tiles asked for (`map_mirror`) and not handled yet
     asks: Vec<usize>,
+    /// window tiles linked over their CPU tiles (`mirror_src`) that wait for their video memory
+    /// and fill, oldest first (`fill_later`)
+    later: VecDeque<(usize, usize)>,
+    /// committed pages filled at a submit at most, for tiles given video memory there
+    /// (`XCL_MIRROR_FILL_MB`): the rest wait for the next
+    fill_pages: usize,
     /// tiles over a CPU view with video memory now, and the most there may be (`XCL_MIRROR_MB`)
     mirrored: usize,
     mirror_cap: usize,
@@ -491,9 +497,20 @@ struct MirrorCounts {
     rechecks: u64,
 }
 
-/// tiles over CPU views handled at a submit at most (`State::map_mirrors`); the rest wait for the
-/// next one
+/// tiles over CPU views asked for taken in at a time, and refused ones tried again at a submit at
+/// most (`State::map_mirrors`); the rest wait for the next one
 const MIRROR_ASKS_MAX: usize = 4096;
+
+/// Committed pages of the CPU views filled into tiles given video memory at a submit at most
+/// (`XCL_MIRROR_FILL_MB`, 16 MB by default; at least a page): the fills are hashed and go
+/// through the staging ring on the title's submitting thread, with the state's lock held.
+fn fill_pages() -> usize {
+    static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGES.get_or_init(|| {
+        let mb = std::env::var("XCL_MIRROR_FILL_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(16);
+        (mb.saturating_mul(1 << 20) / PAGE).max(1)
+    })
+}
 
 /// Video memory for tiles over CPU views at most, in tiles (`XCL_MIRROR_MB`, 4096 MB by default):
 /// a GPU view covers the whole of a 24 GB CPU reservation, and the card is mostly in use already.
@@ -830,6 +847,8 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         sources: &SOURCES,
         fill: Vec::new(),
         asks: Vec::new(),
+        later: VecDeque::new(),
+        fill_pages: fill_pages(),
         mirrored: 0,
         mirror_cap: mirror_cap(),
         refused: FxHashSet::default(),
@@ -2700,11 +2719,10 @@ impl State {
         self.no_memory.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1))
     }
 
-    /// Tiles refused (`refused`) get video memory once there is room again, as much as there is
-    /// and `MIRROR_ASKS_MAX` at most a submit: what their CPU view held goes up then (written
-    /// once before, it may never be written again). One whose CPU tile has no committed page
-    /// leaves `refused` (a write there brings it back, `mirror_writes`), as does one no longer
-    /// linked or with video memory.
+    /// Tiles refused (`refused`) wait for video memory again (`later`) once there is room, as
+    /// many as there is room for and `MIRROR_ASKS_MAX` at most: what their CPU view held goes up
+    /// then (written once before, it may never be written again). One no longer linked or with
+    /// video memory leaves `refused`.
     unsafe fn retry_refused(&mut self) {
         if self.refused.is_empty() || self.mirrored >= self.mirror_cap || self.short_of_memory() {
             return;
@@ -2724,33 +2742,67 @@ impl State {
         for w in gone {
             self.refused.remove(&w);
         }
-        if take.is_empty() {
-            return;
-        }
         // (in the order of their CPU tiles: a query for each region of them)
         take.sort_unstable_by_key(|t| t.1);
-        let holes = self.holes_now(&take.iter().map(|t| t.1).collect::<Vec<_>>());
-        for (&(w, c), h) in take.iter().zip(holes) {
-            if h == 0xFFFF {
-                self.refused.remove(&w);
-            } else if !self.new_mirror(w, c, h, false) {
-                // (no video memory after all: the rest wait too)
-                break;
+        self.later.extend(take);
+    }
+
+    /// At the top of a submit: tiles shown over their CPU views get video memory and are filled
+    /// from them (`fill_later`), the committed pages of `fill_pages` at most (a burst of asks
+    /// hashed up to 256 MiB and pushed it through the staging ring with the state's lock held,
+    /// on the title's submitting thread). The tiles waiting from submits before go first, in
+    /// their order; then the tiles refused before, when there is room again (`retry_refused`);
+    /// then the tiles asked for since (`take_asks`).
+    unsafe fn map_mirrors(&mut self) {
+        let mut budget = self.fill_pages;
+        if self.later.is_empty() {
+            self.retry_refused();
+        }
+        loop {
+            self.fill_later(&mut budget);
+            if budget == 0 || !self.later.is_empty() || self.asks.is_empty() {
+                return;
+            }
+            self.take_asks();
+        }
+    }
+
+    /// The tiles waiting in `later` (linked, oldest first) get video memory and are filled while
+    /// `budget` (committed pages) lasts; one whose CPU tile has no committed page leaves it (and
+    /// `refused`: a write there gives it video memory, `mirror_writes`). One refused for want of
+    /// room or video memory goes to `refused` (`new_mirror`).
+    unsafe fn fill_later(&mut self, budget: &mut usize) {
+        /// tiles asked about at a time
+        const BATCH: usize = 256;
+        while *budget > 0 && !self.later.is_empty() {
+            let batch: Vec<(usize, usize)> = self.later.iter().take(BATCH).copied().collect();
+            let holes = self.holes_now(&batch.iter().map(|b| b.1).collect::<Vec<_>>());
+            let mut done = 0;
+            for (&(w, c), h) in batch.iter().zip(holes) {
+                if *budget == 0 {
+                    break;
+                }
+                done += 1;
+                if self.mirror_src.get(&w) != Some(&c) || self.mapped.contains_key(&w) {
+                    continue;
+                }
+                if h == 0xFFFF {
+                    self.refused.remove(&w);
+                } else if self.new_mirror(w, c, h, false) {
+                    *budget = budget.saturating_sub(PAGES_PER_TILE - h.count_ones() as usize);
+                }
+            }
+            self.later.drain(..done);
+            if done < batch.len() {
+                return;
             }
         }
     }
 
-    /// At the top of a submit: the tiles asked for shown over their CPU views (`take_asks`), and
-    /// the tiles refused before given video memory if there is room again (`retry_refused`).
-    unsafe fn map_mirrors(&mut self) {
-        self.take_asks();
-        self.retry_refused();
-    }
-
-    /// The tiles asked for (`asks`, `MIRROR_ASKS_MAX` at most a submit) shown over their CPU
-    /// views: a tile of a sparse window in a GPU view gets video memory, unless its CPU tile has
-    /// no committed page (it waits in `mirrors` for the CPU to write there). Others are left out,
-    /// and may be asked for again.
+    /// The tiles asked for (`asks`, `MIRROR_ASKS_MAX` at most at a time) linked over their CPU
+    /// views, to wait for their video memory in `later`: a tile of a sparse window in a GPU view
+    /// gets it unless its CPU tile has no committed page (it waits in `mirrors` for the CPU to
+    /// write there). Others are left out, and may be asked for again.
     unsafe fn take_asks(&mut self) {
         if self.asks.is_empty() {
             return;
@@ -2785,12 +2837,7 @@ impl State {
         // (a pair dropped since it was looked up: its `forget_mirrors` may have found nothing
         // linked, and the CPU tile may be given out anew)
         want.retain(|&(g, c)| mirror_source_tile(g) == Some(c) || !self.unlink_mirror(g));
-        let holes = self.holes_now(&want.iter().map(|w| w.1).collect::<Vec<_>>());
-        for (&(g, c), h) in want.iter().zip(holes) {
-            if h != 0xFFFF {
-                self.new_mirror(g, c, h, false);
-            }
-        }
+        self.later.extend(want);
     }
 
     /// The hole masks of CPU tiles `tiles` (`source_holes`), with the pages of decommits under way
@@ -3569,6 +3616,8 @@ mod tests {
                 sources: &SOURCES,
                 fill: Vec::new(),
                 asks: Vec::new(),
+                later: VecDeque::new(),
+                fill_pages: fill_pages(),
                 mirrored: 0,
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
@@ -3850,6 +3899,8 @@ mod tests {
                 sources: &SOURCES,
                 fill: Vec::new(),
                 asks: Vec::new(),
+                later: VecDeque::new(),
+                fill_pages: fill_pages(),
                 mirrored: 0,
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
@@ -4076,6 +4127,8 @@ mod tests {
                 sources: &SOURCES,
                 fill: Vec::new(),
                 asks: Vec::new(),
+                later: VecDeque::new(),
+                fill_pages: fill_pages(),
                 mirrored: 0,
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
@@ -4191,6 +4244,8 @@ mod tests {
                 sources: &SOURCES,
                 fill: Vec::new(),
                 asks: Vec::new(),
+                later: VecDeque::new(),
+                fill_pages: fill_pages(),
                 mirrored: 0,
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
@@ -5254,6 +5309,41 @@ mod tests {
             v.submit(&[]);
             assert!(v.s.mapped.contains_key(&w) && v.s.refused.is_empty());
             assert!(v.s.mapped[&w].sent.iter().all(|p| p.is_some()), "what the CPU view held went up");
+        }
+    }
+
+    /// A submit fills tiles from their CPU views up to `fill_pages` committed pages (not tiles):
+    /// the rest wait for the next submits in their order, and tiles asked for later wait behind
+    /// them. Before, a submit took 4096 tiles at once (256 MiB hashed and uploaded on the title's
+    /// thread with the state's lock held).
+    #[test]
+    fn a_submit_fills_a_bounded_amount_of_committed_memory_in_order() {
+        unsafe {
+            let Some(mut v) = Views::new(109) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let (w, c) = (v.w, v.c);
+            v.commit(0, 6);
+            v.write(0, 6, 53);
+            // four CPU tiles with one committed page each
+            for k in 6..10 {
+                assert!(!VirtualAlloc((c + k * TILE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                *((c + k * TILE) as *mut u64) = k as u64;
+            }
+            v.s.fill_pages = 2 * PAGES_PER_TILE;
+            let shown = |s: &State| (0..10).filter(|&k| s.mapped.contains_key(&(w + k * TILE))).collect::<Vec<_>>();
+            v.s.asks.extend((0..6).map(|k| w + k * TILE));
+            v.submit(&[]);
+            assert_eq!(shown(&v.s), vec![0, 1], "two whole tiles a submit");
+            assert_eq!(v.s.mirror_src.len(), 6, "the rest are linked: their CPU tiles' writes are watched");
+            // asked for after: behind the first ones
+            v.s.asks.extend((6..10).map(|k| w + k * TILE));
+            v.submit(&[]);
+            assert_eq!(shown(&v.s), vec![0, 1, 2, 3]);
+            v.submit(&[]);
+            assert_eq!(shown(&v.s), vec![0, 1, 2, 3, 4, 5]);
+            v.submit(&[]);
+            assert_eq!(shown(&v.s), (0..10).collect::<Vec<_>>(), "four pages: in one submit");
+            assert!(v.s.later.is_empty() && v.s.asks.is_empty());
+            assert_eq!(v.s.counts.fill_bytes, (6 * PAGES_PER_TILE + 4) as u64 * PAGE as u64);
         }
     }
 
