@@ -5463,6 +5463,8 @@ mod tests {
             // 1. Untranslated (PC) PSO: routes through bind::draw_indexed_instanced -> DrawIndexedInstanced,
             // records DRAW_ARGS, binds temp IB, then restores orig_ib.
             super::super::bind::reset(list_ptr, 0x7400_0100, 0);
+            // (a draw with a PC pipeline needs the title's root signature on the list)
+            super::super::bind::set_graphics_root_signature(list_ptr, 0x7400_0200 as *mut c_void);
             let before = super::super::bind::counts_snapshot();
             draw_indexed_x(list_ptr, ib(2), DXGI_FORMAT_R16_UINT, 6, 0);
             let after = super::super::bind::counts_snapshot();

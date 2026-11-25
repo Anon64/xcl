@@ -5777,8 +5777,20 @@ static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mut
 
 /// The compute pass of a pipeline state XCL built from console MS / GS code.
 pub fn two_pass_of(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
-    let pso = super::pso_async::resolve(pso);
+    two_pass_entry(super::pso_async::resolve(pso))
+}
+
+/// `two_pass_of` of exactly `pso`, not resolved again: a draw that resolved its pipeline once
+/// (`pso_async::resolve_wait`) records its passes with what that gave. (Resolved again, a build
+/// that finished in between gave the two-pass entry while the draw held the stand-in.)
+pub fn two_pass_entry(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
     TWO_PASS.lock().unwrap().as_ref()?.get(&pso).cloned()
+}
+
+#[cfg(test)]
+pub(super) fn register_two_pass_for_test(pso: usize) {
+    let tp = TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" };
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, std::sync::Arc::new(tp));
 }
 
 pub fn two_pass_count() -> usize {
