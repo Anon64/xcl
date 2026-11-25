@@ -2270,7 +2270,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         // in a GPU view: its tiles are asked for from the root's on (the size is not known; the
         // build wrote the nodes through views that asked for theirs, and a buffer placed there
         // has all its tiles)
-        let view = super::view_want::want(super::view_want::Path::ViewAt, va, 0x1_0000);
+        let view = super::view_want::want(super::view_want::Path::Bvh, va, 0x1_0000);
         let in_uma = va != 0 && (view || crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize)));
         if in_uma {
             let w = crate::gpu::desc::bvh_words(va, true);

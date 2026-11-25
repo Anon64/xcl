@@ -10,6 +10,7 @@
 //! Every path that takes such an address from the title calls `want` with what it knows of the
 //! range. The counters say which paths a title uses and how much of the view each asks for.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The paths a GPU-view address reaches the GPU by.
@@ -39,9 +40,11 @@ pub enum Path {
     CopyInto,
     /// a root view of a two-pass mesh stage
     MeshStage,
+    /// an acceleration-structure view (asked for from its root on: its size is not known)
+    Bvh,
 }
 
-const PATHS: usize = 12;
+const PATHS: usize = 13;
 const NAMES: [&str; PATHS] = [
     "views by address",
     "constant buffer views",
@@ -55,12 +58,41 @@ const NAMES: [&str; PATHS] = [
     "maps",
     "copies into it",
     "mesh stage views",
+    "acceleration-structure views",
 ];
 
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);
 static CALLS: [AtomicU64; PATHS] = [ZERO; PATHS];
 static BYTES: [AtomicU64; PATHS] = [ZERO; PATHS];
+
+/// Ranges a thread remembers having asked for (`asked_lately`).
+const LATELY: usize = 8;
+
+thread_local! {
+    /// The ranges this thread asked for last, the generation of the GPU views they were asked
+    /// in (`kernelx::gpu_view_map_gen`) and where the next one goes. A title binds the same
+    /// vertex buffers and root views for draw after draw, on the thread that records the list;
+    /// asking again walks every tile of the range (`sparse::map_mirror`: a shared set).
+    static ASKED: Cell<([(u64, u64); LATELY], u64, usize)> = const { Cell::new(([(0, 0); LATELY], 0, 0)) };
+}
+
+/// Whether this thread asked for exactly `[va, va + len)` among its last `LATELY` ranges while
+/// the GPU views were as they are now (`generation`); it is remembered if not. A view that went
+/// or came since (its tiles are forgotten with it) empties the memory.
+fn asked_lately(va: u64, len: u64, generation: u64) -> bool {
+    ASKED.with(|a| {
+        let (mut ranges, asked_in, mut next) = a.get();
+        if asked_in != generation {
+            (ranges, next) = ([(0, 0); LATELY], 0);
+        } else if ranges.contains(&(va, len)) {
+            return true;
+        }
+        ranges[next] = (va, len);
+        a.set((ranges, generation, (next + 1) % LATELY));
+        false
+    })
+}
 
 /// Whether `va` lies in a view window (false without the 16-window layout).
 pub fn is_view(va: u64) -> bool {
@@ -74,22 +106,23 @@ pub fn want(path: Path, va: u64, len: u64) -> bool {
     if va == 0 || len == 0 || !is_view(va) {
         return false;
     }
-    note(path, len);
-    super::sparse::map_mirror(va as usize, len as usize);
+    CALLS[path as usize].fetch_add(1, Ordering::Relaxed);
+    if !asked_lately(va, len, crate::hle::kernelx::gpu_view_map_gen()) {
+        BYTES[path as usize].fetch_add(len, Ordering::Relaxed);
+        super::sparse::map_mirror(va as usize, len as usize);
+    }
     true
 }
 
-fn note(path: Path, len: u64) {
-    CALLS[path as usize].fetch_add(1, Ordering::Relaxed);
-    BYTES[path as usize].fetch_add(len, Ordering::Relaxed);
-}
-
-/// The CPU address behind `va` (itself unless `va` lies in a GPU view).
+/// The CPU address behind `va` (itself unless `va` lies in a GPU view of the title's memory,
+/// in a view window or not: `sparse::cpu_of` asks `kernelx::mirrors`, a lock). Callers on a hot
+/// path ask `is_view` first.
 pub fn cpu(va: u64) -> u64 {
     super::sparse::cpu_of(va as usize) as u64
 }
 
-/// (calls, bytes) of each path so far.
+/// (calls, bytes asked for) of each path so far. The bytes of a range a thread asks for again
+/// and again count once (`asked_lately`).
 pub fn totals() -> [(u64, u64); PATHS] {
     std::array::from_fn(|i| (CALLS[i].load(Ordering::Relaxed), BYTES[i].load(Ordering::Relaxed)))
 }
@@ -98,7 +131,7 @@ pub fn totals() -> [(u64, u64); PATHS] {
 pub fn line(now: &[(u64, u64); PATHS], before: &[(u64, u64); PATHS]) -> Option<String> {
     let parts: Vec<String> = (0..PATHS)
         .filter(|&i| now[i].0 > before[i].0)
-        .map(|i| format!("{} {} ({} KB)", now[i].0 - before[i].0, NAMES[i], (now[i].1 - before[i].1) >> 10))
+        .map(|i| format!("{} {} ({} KB new)", now[i].0 - before[i].0, NAMES[i], (now[i].1 - before[i].1) >> 10))
         .collect();
     (!parts.is_empty()).then(|| parts.join(", "))
 }
@@ -107,7 +140,7 @@ pub fn line(now: &[(u64, u64); PATHS], before: &[(u64, u64); PATHS]) -> Option<S
 mod tests {
     use super::*;
 
-    /// The line names only the paths used since the totals before, with their bytes.
+    /// The line names only the paths used since the totals before, with their new bytes.
     #[test]
     fn the_line_names_the_paths_used_since() {
         let mut before = [(0u64, 0u64); PATHS];
@@ -115,10 +148,11 @@ mod tests {
         assert_eq!(line(&now, &before), None, "nothing asked for: no line");
         now[Path::ViewAt as usize] = (3, 3 << 20);
         now[Path::RootView as usize] = (1, 65536);
-        assert_eq!(line(&now, &before).as_deref(), Some("3 views by address (3072 KB), 1 root views (64 KB)"));
+        assert_eq!(line(&now, &before).as_deref(), Some("3 views by address (3072 KB new), 1 root views (64 KB new)"));
         before = now;
-        now[Path::RootView as usize] = (2, 131072);
-        assert_eq!(line(&now, &before).as_deref(), Some("1 root views (64 KB)"));
+        now[Path::RootView as usize] = (2, 65536);
+        assert_eq!(line(&now, &before).as_deref(), Some("1 root views (0 KB new)"), "a range asked for again adds a call, no bytes");
+        assert_eq!(NAMES[Path::Bvh as usize], "acceleration-structure views");
     }
 
     /// An address outside a view window (every address without the 16-window layout, and null)
@@ -129,5 +163,26 @@ mod tests {
         assert!(!want(Path::Cbv, 0, 256));
         assert!(!want(Path::Cbv, 0x1000, 0));
         assert_eq!(totals(), before);
+    }
+
+    /// A thread that asks for the same range again (a vertex buffer bound for every draw) does
+    /// not walk its tiles again; another range, a ninth range that pushes the first out, and
+    /// GPU views that changed since make it ask again.
+    #[test]
+    fn a_range_asked_for_lately_is_not_asked_for_again() {
+        std::thread::spawn(|| {
+            assert!(!asked_lately(0x14_0000_1000, 0x2000, 7), "the first time");
+            assert!(asked_lately(0x14_0000_1000, 0x2000, 7), "again: remembered");
+            assert!(!asked_lately(0x14_0000_1000, 0x4000, 7), "another length is another range");
+            for k in 0..LATELY as u64 - 1 {
+                assert!(!asked_lately(0x15_0000_0000 + (k << 16), 0x1000, 7));
+            }
+            assert!(!asked_lately(0x14_0000_1000, 0x2000, 7), "pushed out by {LATELY} later ranges");
+            assert!(asked_lately(0x14_0000_1000, 0x2000, 7));
+            assert!(!asked_lately(0x14_0000_1000, 0x2000, 8), "the views changed: asked again");
+            assert!(asked_lately(0x14_0000_1000, 0x2000, 8));
+        })
+        .join()
+        .unwrap();
     }
 }
