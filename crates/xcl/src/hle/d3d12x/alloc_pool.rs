@@ -96,6 +96,19 @@ pub(super) fn forget_list(list: usize) {
     let Some(s) = g.as_mut() else { return };
     s.last_submit.remove(&list);
     s.recordings.remove(&list);
+    unpin(s, list);
+}
+
+/// The PC list's recording ended but the list stays (a split segment moved to the spares): its
+/// allocator is no longer held for it. Its last submit stays known, so it is not handed out
+/// again while the GPU still runs that submit (`in_flight`).
+pub(super) fn unpin_list(list: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    unpin(s, list);
+}
+
+fn unpin(s: &mut State, list: usize) {
     if let Some(backing) = s.of_list.remove(&list) {
         if let Some(b) = s.backings.get_mut(&backing) {
             b.users.remove(&list);

@@ -958,7 +958,7 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
-    super::alloc_pool::forget_list(list);
+    super::alloc_pool::unpin_list(list);
     super::title_textures::list_reset(list);
     if let Some(s) = recording(list).lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
@@ -7323,7 +7323,8 @@ mod tests {
     /// #1452: the title Resets its list and submits the new recording while the GPU still runs
     /// the previous one (held here by a queue Wait on a fence not yet signalled). The new
     /// recording must be on another PC list (the PC forbids submitting one again before its last
-    /// submit is done, debug layer id 553), also one more time; once the GPU is done, the list
+    /// submit is done, debug layer id 553), also the times after (not on a stand-in moved to the
+    /// spares while its submit runs); once the GPU is done, the list
     /// records on its own PC list again. Both ways a title Resets: the list's #10, and the newer
     /// console layout's #139, which goes through the list's thunk to the PC list it records on
     /// (`reset_x` on that one) – the retail title's way, which the stand-in did not see at first.
@@ -7376,10 +7377,13 @@ mod tests {
             let (second, again) = submit();
             assert_eq!(reset(w, a, 0, second[0]), 0);
             let (third, again3) = submit();
+            // the first stand-in is a spare now, its submit still on the GPU
+            assert_eq!(reset(w, a, 0, third[0]), 0);
+            let (more, again4) = submit();
             gate.Signal(1).unwrap();
             q.Signal(&done, 1).unwrap();
             crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("the queue finishes");
-            assert_eq!(reset(w, a, 0, third[0]), 0);
+            assert_eq!(reset(w, a, 0, more[0]), 0);
             let (fourth, _) = submit();
             q.Signal(&done, 2).unwrap();
             crate::gpu::fence::wait(&done, 2, &dev, None, 5000).expect("the queue finishes");
@@ -7393,6 +7397,9 @@ mod tests {
             assert_eq!(third.len(), 1);
             assert!(third[0] != primary && third[0] != second[0], "{how}: nor on the one standing in, also still on the GPU");
             assert_eq!(again3, 0, "{how}");
+            assert_eq!(more.len(), 1);
+            assert!(![primary, second[0], third[0]].contains(&more[0]), "{how}: nor on a spare whose submit is still on the GPU");
+            assert_eq!(again4, 0, "{how}");
             assert_eq!(fourth, vec![primary], "{how}: once the GPU is done the list records on its own PC list");
             assert!(removed.is_ok());
         }
@@ -7549,6 +7556,68 @@ mod tests {
                 gr.cells.remove(&va_b);
                 gr.cells.remove(&va_c);
             }
+        }
+    }
+
+    /// #1452: `KickoffX` on a split list submits its segments and moves them to the spares; the
+    /// GPU still runs them (held here by a queue Wait on a fence not yet signalled). The next
+    /// split of the recording that goes on must not record on the segment just submitted (the PC
+    /// forbids submitting it again before that submit is done, debug layer id 553).
+    #[test]
+    fn a_split_after_kickoff_does_not_take_the_segment_just_submitted() {
+        let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        unsafe {
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            // (`KickoffX` submits through the queue's original ExecuteCommandLists)
+            real::adopt(q.as_raw(), real::Kind::CommandQueue);
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let a = alloc.as_raw() as usize;
+            let primary = dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, &alloc, None).unwrap().into_raw();
+            real::adopt(primary, real::Kind::CommandList);
+            on_create(primary, a, 0, ty);
+            super::super::bind::reset(primary, a, 0);
+            let w = super::super::title_list::wrap(primary);
+            note_queue_for_lists(q.as_raw() as usize, &[primary]);
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            // a write, then a wait on another cell, splits the list; the waited-for memory holds
+            // the value already, so the waits pass on the CPU
+            let cell_a = Box::new(AtomicU64::new(0));
+            let cell_b = Box::new(AtomicU64::new(5));
+            let (va_a, va_b) = (&*cell_a as *const AtomicU64 as u64, &*cell_b as *const AtomicU64 as u64);
+            let split = |list: *mut c_void, frame: u64| {
+                note_write64_recorded(list, va_a, frame);
+                wait64_x(list, va_b, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, frame, 0, 0);
+                let mut segs = Vec::new();
+                assert!(super::super::title_list::push_segments(w, &mut segs));
+                segs
+            };
+
+            q.Wait(&gate, 1).unwrap();
+            let first = split(primary, 1);
+            kickoff_x(first[first.len() - 1]);
+            let second = split(primary, 2);
+            gate.Signal(1).unwrap();
+            q.Signal(&done, 1).unwrap();
+            let ran = crate::gpu::fence::wait(&done, 1, &dev, None, 5000).is_ok();
+            let removed = dev.GetDeviceRemovedReason();
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+            assert_eq!(release(w), 0);
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                gr.cells.remove(&cpu_at(va_a));
+                gr.cells.remove(&cpu_at(va_b));
+            }
+
+            assert_eq!(first.len(), 2, "the wait after the write splits the list");
+            assert_eq!(first[0], primary);
+            assert_eq!(second.len(), 2, "the recording after KickoffX splits again");
+            assert_eq!(second[0], primary, "after KickoffX the recording goes on on the primary PC list");
+            assert_ne!(second[1], first[1], "the segment KickoffX just submitted is still on the GPU");
+            assert!(ran, "the queue finishes");
+            assert!(removed.is_ok());
         }
     }
 
