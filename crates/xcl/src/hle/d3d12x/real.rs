@@ -4326,7 +4326,7 @@ impl Slots {
     }
 }
 
-struct SlotGuard(&'static Slots);
+pub(super) struct SlotGuard(&'static Slots);
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
@@ -4336,7 +4336,7 @@ impl Drop for SlotGuard {
 }
 
 static BIG_COMPILES: Slots = Slots::new(0, 0);
-const GIANT_DRIVER_COMPILE: usize = 4 << 20;
+pub(super) const GIANT_DRIVER_COMPILE: usize = 4 << 20;
 /// One giant driver compile at a time, a wanted one too, and none of a pipeline nobody has used
 /// yet: such a compile takes minutes, and one made ahead of its use held the only slot while a
 /// bind waited for another giant one.
@@ -4469,7 +4469,7 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
 /// `big_compile_turn` of a huge driver compile of `bytes` on a worker. A build ahead of its
 /// pipeline's first use in a lane closed to it waits there until the pipeline is used; on a
 /// backlog worker another worker takes its place meanwhile (`pso_async::build_parks`).
-fn huge_compile_turn(bytes: usize) -> SlotGuard {
+pub(super) fn huge_compile_turn(bytes: usize) -> SlotGuard {
     let slots = compile_slots(bytes);
     if !slots.ahead && super::pso_async::build_is_ahead() {
         super::pso_async::build_parks();
