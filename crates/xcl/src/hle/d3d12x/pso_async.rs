@@ -6,7 +6,8 @@
 //! as it is there. A lazy pipeline (`lazy`) is built at its first use or ahead of it
 //! (`Backlog`: every graphics one, at the lowest priority). A draw or dispatch with a pipeline
 //! still being built waits for it (`resolve_wait`): a dispatch always (a skipped one would
-//! corrupt what it computes), a draw for at most `XCL_GFX_PSO_WAIT_MS` when set – then it and
+//! corrupt what it computes), a draw only while its thread has waited less than
+//! `XCL_GFX_PSO_WAIT_MS` in the last second when that is set (`gfx_wait_left`) – then it and
 //! the later draws of that pipeline draw nothing until it is built. An ExecuteIndirect whose
 //! pipeline is still being built after that is skipped.
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
@@ -871,6 +872,33 @@ mod used_tests {
         })
     }
 
+    /// The budget for graphics pipelines is a thread's for a second, not one for each pipeline:
+    /// once it is spent the next pipeline is not waited for at all, it comes back with time
+    /// (half of it in half a second) and never grows past itself. With a budget for each
+    /// pipeline a title's thread stood still that long for every one of hundreds of pipelines
+    /// it used for the first time.
+    #[test]
+    fn the_graphics_budget_is_a_threads_for_a_second() {
+        use std::time::{Duration, Instant};
+        std::thread::spawn(|| {
+            let budget = Duration::from_millis(100);
+            let t0 = Instant::now();
+            assert_eq!(gfx_wait_left(budget, t0), budget, "all of it at first");
+            gfx_wait_spent(Duration::from_millis(100));
+            assert_eq!(gfx_wait_left(budget, t0), Duration::ZERO, "spent: the next pipeline is not waited for");
+            let half = gfx_wait_left(budget, t0 + Duration::from_millis(500));
+            assert!((half.as_secs_f64() - 0.050).abs() < 0.001, "half a second later half of it is back: {half:?}");
+            assert_eq!(gfx_wait_left(budget, t0 + Duration::from_secs(5)), budget, "never more than the budget");
+            gfx_wait_spent(Duration::from_millis(30));
+            let left = gfx_wait_left(budget, t0 + Duration::from_secs(5));
+            assert!((left.as_secs_f64() - 0.070).abs() < 0.001, "what was waited is taken off: {left:?}");
+            gfx_wait_spent(Duration::from_secs(9));
+            assert_eq!(gfx_wait_left(budget, t0 + Duration::from_secs(5)), Duration::ZERO, "a long wait leaves nothing, not a debt");
+        })
+        .join()
+        .unwrap();
+    }
+
     /// With a budget for graphics pipelines a draw waits no longer than it and later draws of
     /// that pipeline do not wait; a dispatch waits for its compute pipeline however long it takes.
     #[test]
@@ -1076,7 +1104,53 @@ pub fn resolve_wait(pso: usize) -> usize {
 /// pipelines (`XCL_GFX_PSO_WAIT_MS`).
 fn resolve_wait_budgets(pso: usize, all: Option<std::time::Duration>, gfx: Option<std::time::Duration>) -> usize {
     let Some(compute) = entry(pso).map(|p| p.compute) else { return pso };
-    resolve_wait_for(pso, budget_for(compute, all, gfx))
+    match gfx.filter(|_| !compute) {
+        // the graphics budget is a thread's for a second, not one for each pipeline
+        Some(budget) => {
+            let start = std::time::Instant::now();
+            let r = resolve_wait_for(pso, Some(gfx_wait_left(budget, start)));
+            gfx_wait_spent(start.elapsed());
+            r
+        }
+        None => resolve_wait_for(pso, budget_for(compute, all, gfx)),
+    }
+}
+
+thread_local! {
+    /// What this thread may still wait for graphics pipelines (`gfx_wait_left`): the
+    /// milliseconds left, and when they were last counted.
+    static GFX_WAIT: std::cell::Cell<(f64, Option<std::time::Instant>)> = const { std::cell::Cell::new((0.0, None)) };
+}
+
+/// How long this thread may wait for a graphics pipeline at `now`, with `budget` to spend in a
+/// second: what is left of it (it fills again at `budget` a second, to `budget` at most).
+///
+/// The budget is not one for each pipeline: the first frames of a title's world bind hundreds
+/// of pipelines never used before, one draw after another on one thread. With 500 ms for each,
+/// a retail title's thread stood still 500 ms more than 500 times in a row on a cold cache and
+/// showed no frame for minutes, although every one of those pipelines was being built
+/// meanwhile. With a share of the thread's time instead, the wait is spent on the first ones
+/// (and on any that is built within milliseconds: a pipeline made from a kept blob), the
+/// thread goes on, and the rest draw once they are built.
+fn gfx_wait_left(budget: std::time::Duration, now: std::time::Instant) -> std::time::Duration {
+    GFX_WAIT.with(|w| {
+        let (left, at) = w.get();
+        let full = budget.as_secs_f64() * 1000.0;
+        let left = match at {
+            None => full,
+            Some(at) => (left + now.saturating_duration_since(at).as_secs_f64() * full).min(full),
+        };
+        w.set((left, Some(now)));
+        std::time::Duration::from_secs_f64(left / 1000.0)
+    })
+}
+
+/// This thread waited `waited` for a graphics pipeline (`gfx_wait_left`).
+fn gfx_wait_spent(waited: std::time::Duration) {
+    GFX_WAIT.with(|w| {
+        let (left, at) = w.get();
+        w.set(((left - waited.as_secs_f64() * 1000.0).max(0.0), at));
+    })
 }
 
 /// How long a bind waits for a pipeline of this kind: a compute one by `all` alone (its
@@ -1199,8 +1273,9 @@ fn wait_budget() -> Option<std::time::Duration> {
     *B.get_or_init(|| budget_of(std::env::var("XCL_PSO_WAIT_MS").ok().as_deref()))
 }
 
-/// How long a draw waits for its graphics pipeline still being built (`XCL_GFX_PSO_WAIT_MS`;
-/// unset or 0: as `wait_budget`). After it the draw goes on with the stand-in, which draws
+/// How long a thread's draws wait in a second for graphics pipelines still being built
+/// (`XCL_GFX_PSO_WAIT_MS`; unset or 0: as `wait_budget`, for each pipeline; `gfx_wait_left` has
+/// why it is a share of the thread's time). A draw past it goes on with the stand-in, which draws
 /// nothing, and so do the later draws of that pipeline until it is built. On a retail title the
 /// draws of its world waited 7 – 15 s each for pipelines built one after another: no frame for
 /// 156 s. Off by default: on a cold cache a logo and UI text drawn once and kept were missing
