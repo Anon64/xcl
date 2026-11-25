@@ -663,6 +663,24 @@ pub mod mirrors {
         CALLS.load(Ordering::Acquire)
     }
 
+    /// Whether the queue's page-mapping method is applied (`apply_batches`). Off
+    /// (XCL_PAGE_MAPPINGS=0) its queue slot is the stub it was and the record stays empty.
+    pub fn page_mappings() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = page_mappings_on(std::env::var("XCL_PAGE_MAPPINGS").ok().as_deref());
+            if !on {
+                crate::xlog_info!("kernelx: XCL_PAGE_MAPPINGS=0 – the queue's page mappings (CopyPageMappingsBatchX) are left out: a GPU-view page shows the CPU view at the same offset");
+            }
+            on
+        })
+    }
+
+    /// XCL_PAGE_MAPPINGS `v`: on unless it is 0.
+    pub fn page_mappings_on(v: Option<&str>) -> bool {
+        v.map_or(true, |v| v.trim() != "0")
+    }
+
     /// XCL keeps physical page `page`'s bytes at `at` now (0: nowhere; `tile`: a tile may show
     /// it there): the GPU-view pages that show it follow. A move is no change of what they show
     /// (their call and their place in the log stay), but a page that gets its first place, or
