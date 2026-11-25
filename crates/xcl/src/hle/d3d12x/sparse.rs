@@ -385,6 +385,25 @@ fn push_run(out: &mut Vec<(usize, usize)>, addr: usize, len: usize) {
     }
 }
 
+/// Copy `len` bytes from `src` to offset `at` of the title's page `pg`, 64-byte chunk by chunk:
+/// a chunk the CPU wrote since it was last sent keeps its (newer) bytes and goes up with the next
+/// look; a chunk as it was sent gets what the GPU copied back, and its hash with it.
+unsafe fn land_page(slot: &mut Option<Box<[u64; CHUNKS]>>, pg: usize, at: usize, src: *const u8, len: usize) {
+    let sent = slot.get_or_insert_with(|| Box::new(ZERO_HASHES));
+    let end = at + len;
+    let mut o = at;
+    while o < end {
+        let k = o / CHUNK;
+        let chunk_end = ((k + 1) * CHUNK).min(end);
+        let chunk = std::slice::from_raw_parts((pg + k * CHUNK) as *const u8, CHUNK);
+        if chunk_hash(chunk) == sent[k] {
+            std::ptr::copy_nonoverlapping(src.add(o - at), (pg + o) as *mut u8, chunk_end - o);
+            sent[k] = chunk_hash(std::slice::from_raw_parts((pg + k * CHUNK) as *const u8, CHUNK));
+        }
+        o = chunk_end;
+    }
+}
+
 /// Scan a 4 KiB page at `pg`, appending any changed 64-byte chunk runs directly to `out`
 /// (zero per-page heap allocation; skips allocating `slot` completely when a fresh zero page
 /// is still all zeros).
@@ -1132,6 +1151,22 @@ impl State {
         }
     }
 
+    /// Whether nobody wrote the 64-byte chunk holding `va` since it was last sent to the GPU (its
+    /// page has video memory and its hash is the one known).
+    unsafe fn chunk_clean(&self, va: usize) -> bool {
+        let pg = va & !(PAGE - 1);
+        let t = pg & !(TILE - 1);
+        let idx = (pg - t) / PAGE;
+        let Some(entry) = self.mapped.get(&t) else { return false };
+        if entry.holes & (1u16 << idx) != 0 {
+            return false;
+        }
+        let page = std::slice::from_raw_parts(pg as *const u8, PAGE);
+        let k = (va - pg) / CHUNK;
+        let h = chunk_hash(&page[k * CHUNK..(k + 1) * CHUNK]);
+        entry.sent[idx].as_deref().map_or(h == ZERO_HASH, |sent| h == sent[k])
+    }
+
     /// `len` bytes from readback memory `p + off` into the title's `dst` (committed pages only)
     unsafe fn copy_back(&mut self, p: *mut u8, dst: usize, off: usize, len: usize) {
         let mut at = dst;
@@ -1142,13 +1177,14 @@ impl State {
             let t = pg & !(TILE - 1);
             let idx = (pg - t) / PAGE;
             let step = (pg + PAGE).min(end) - at;
-            if self.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
-                std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+            if let Some(entry) = self.mapped.get_mut(&t) {
+                if entry.holes & (1u16 << idx) == 0 {
+                    land_page(&mut entry.sent[idx], pg, at - pg, p.add(src_off), step);
+                }
             }
             at += step;
             src_off += step;
         }
-        self.sync_sent_range(dst, len);
     }
 
     /// An immediate the GPU wrote at `va` (`bytes`: 4 or 8), into the title's memory there
@@ -1158,6 +1194,9 @@ impl State {
         if !self.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << ((pg - t) / PAGE)) == 0) {
             return;
         }
+        // (a chunk the title's CPU wrote since it was last sent keeps its state: it goes up with the
+        // next look, with this value in it)
+        let clean = self.chunk_clean(va);
         match bytes & 0x7f {
             4 => (*(va as *const std::sync::atomic::AtomicU32)).store(value as u32, Ordering::Release),
             8 if bytes & IMM_KEEP_MAX != 0 => {
@@ -1173,7 +1212,9 @@ impl State {
             8 => (*(va as *const AtomicU64)).store(value, Ordering::Release),
             _ => return,
         }
-        self.sync_sent_range(va, (bytes & 0x7f) as usize);
+        if clean {
+            self.sync_sent_range(va, (bytes & 0x7f) as usize);
+        }
     }
 
     /// A copy back's list and a readback buffer of at least `need` bytes (reused when one fits)
@@ -1202,6 +1243,11 @@ impl State {
     /// done, a queue's own in their order (a job of a queue that waits does not hold back the
     /// other queues' jobs).
     unsafe fn drain_readbacks(&mut self, how: Drain) {
+        self.drain_readbacks_spin(how, 2000);
+    }
+
+    /// `drain_readbacks`, waiting for a finished list's copy for `spin_us` at most.
+    unsafe fn drain_readbacks_spin(&mut self, how: Drain, spin_us: u128) {
         let rbq_done = self.rbq.as_ref().map(|(_, f)| f.clone());
         let mut i = 0;
         let mut k = 0;
@@ -1242,7 +1288,7 @@ impl State {
                 // that stands behind something else on its queue lands when it is done)
                 // (no event: `self.event` is the tile queue's, see `wait_for`)
                 let t0 = std::time::Instant::now();
-                while super::real::fence_completed(&done_f) < done_v && t0.elapsed().as_micros() < 2000 {
+                while super::real::fence_completed(&done_f) < done_v && t0.elapsed().as_micros() < spin_us {
                     std::thread::yield_now();
                 }
                 if super::real::fence_completed(&done_f) < done_v {
@@ -1263,7 +1309,11 @@ impl State {
             RB_PENDING.fetch_sub(1, Ordering::Release);
             job.copies = copies;
             job.copies.clear();
-            self.rb_pool.push(job);
+            // (a burst of copies back does not keep its buffers for good: each is up to 16 MiB of
+            // host memory)
+            if self.rb_pool.len() < 32 {
+                self.rb_pool.push(job);
+            }
         }
     }
 
@@ -1301,7 +1351,8 @@ impl State {
             let need = batch.iter().map(|c| c.2).sum::<usize>();
             let Some(mut job) = self.rb_job(need, ty) else {
                 crate::xlog_warn!("sparse: no readback buffer for a copy back of {need} bytes – left out");
-                return;
+                // (the Signal after the loop still goes out: what was recorded for it stands)
+                break;
             };
             let _ = job.alloc.Reset();
             let _ = job.list.Reset(&job.alloc, None);
@@ -1588,19 +1639,25 @@ pub unsafe fn settle_readbacks() {
 /// `settle_readbacks` from a fence observation: the state's lock is only tried (for ~2 ms), as
 /// XCL may be waiting on a fence of its own with the lock held.
 pub unsafe fn settle_readbacks_try() {
+    settle_readbacks_within(5);
+}
+
+/// `settle_readbacks` with the state's lock waited for `ms` ms at most (false: it was not had:
+/// what is pending stays pending). A copy back whose title work is done is waited for 0.3 ms.
+pub unsafe fn settle_readbacks_within(ms: u64) -> bool {
     if RB_PENDING.load(Ordering::Acquire) == 0 {
-        return;
+        return true;
     }
     let t0 = std::time::Instant::now();
     loop {
         if let Ok(mut g) = STATE.try_lock() {
             if let Some(s) = g.as_mut() {
-                s.drain_readbacks(Drain::TitleDone);
+                s.drain_readbacks_spin(Drain::TitleDone, 300);
             }
-            return;
+            return true;
         }
-        if t0.elapsed() >= std::time::Duration::from_millis(2) {
-            return;
+        if t0.elapsed().as_millis() as u64 >= ms {
+            return false;
         }
         std::thread::yield_now();
     }
@@ -1742,6 +1799,7 @@ pub unsafe fn committed(a: usize, n: usize) {
     if n == 0 {
         return;
     }
+    super::title_textures::mark_hot(a, n);
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
@@ -2234,12 +2292,17 @@ mod tests {
 
             // the title's queue goes on: the copy back lands once it is done
             gate.Signal(1).expect("gate signal");
-            // as the title would: wait for its own work (here the fence its queue signalled)
-            if s.rb_fence.GetCompletedValue() < s.rb_value {
-                s.rb_fence.SetEventOnCompletion(s.rb_value, s.event).expect("SetEventOnCompletion");
-                windows::Win32::System::Threading::WaitForSingleObject(s.event, 5000);
+            // as the title would: wait for its own work (here the fences its queue signals: the
+            // first once its lists are done, the second once the copy behind them is)
+            let t = std::time::Instant::now();
+            loop {
+                s.drain_readbacks(Drain::TitleDone);
+                if *(base as *const u32) == 0xC0DE_0000 {
+                    break;
+                }
+                assert!(t.elapsed() < std::time::Duration::from_secs(5), "the copy back did not land");
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            s.drain_readbacks(Drain::TitleDone);
             for i in 0..64u32 {
                 assert_eq!(*(base as *const u32).add(i as usize), 0xC0DE_0000 | i, "dword {i} after the copy back");
             }

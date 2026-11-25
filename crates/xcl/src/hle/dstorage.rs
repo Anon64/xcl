@@ -812,6 +812,26 @@ unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
     at != 0 && ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out as *mut c_void, len, &mut done) != 0 && done == len
 }
 
+/// Whether `[p, p + n)` lies in XCL's sparse windows: memory the title's GPU heaps are in. XCL
+/// commits their allocations whole; a part of one that the title gave back is found by the write
+/// (`write_title`), not by a query of the pages (a VirtualQuery there walks to the end of the
+/// committed run: 3-5 ms each for a 1-2 GB heap).
+fn in_sparse_memory(p: usize, n: usize) -> bool {
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    n > 0 && u.is_sparse(p) && p.checked_add(n - 1).is_some_and(|e| u.is_sparse(e))
+}
+
+/// The bytes into the title's memory; false when the memory is not there (a write that faults).
+unsafe fn write_title(p: usize, bytes: &[u8]) -> bool {
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    extern "system" {
+        fn NtWriteVirtualMemory(process: HANDLE, at: *mut c_void, data: *const c_void, len: usize, done: *mut usize) -> i32;
+    }
+    let mut done = 0usize;
+    let st = NtWriteVirtualMemory(windows_sys::Win32::System::Threading::GetCurrentProcess(), p as *mut c_void, bytes.as_ptr().cast(), bytes.len(), &mut done);
+    st >= 0 && done == bytes.len()
+}
+
 /// Whether `n` bytes at `p` are committed, writable memory.
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
@@ -882,7 +902,8 @@ fn note_request(r: &Request) {
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     note_request(r);
-    if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
+    let sparse_dest = !r.dest_physical_pages() && in_sparse_memory(r.destination as usize, n);
+    if !r.dest_physical_pages() && !sparse_dest && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
     let src: Vec<u8> = if r.memory_source() {
@@ -972,7 +993,13 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         }
     } else if n > 0 {
         crate::hle::kernelx::pagelog::note("DirectStorage write", r.destination as usize, 0, n);
-        std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        if sparse_dest {
+            if !write_title(r.destination as usize, &payload[..n]) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+        } else {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        }
         crate::hle::d3d12x::title_textures::note_known_write(r.destination as usize, n);
     }
     Ok(())

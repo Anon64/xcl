@@ -94,7 +94,16 @@ struct Table {
     src_pieces: BTreeMap<usize, Vec<usize>>,
     /// textures whose first upload is still to come (`Entry::pending`; may name ones that went)
     pending_res: std::collections::BTreeSet<usize>,
+    /// 16 MiB blocks of the textures' sources -> how many active ones cover it: the part of the
+    /// watched ranges that textures make (cheap to rebuild from, unlike all textures)
+    coarse: BTreeMap<usize, u32>,
 }
+
+/// the size of `Table::coarse`'s blocks
+const SRC_COARSE_SHIFT: usize = 24;
+
+/// goes up whenever a block of `Table::coarse` becomes used or unused
+static COARSE_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// the piece (1 MiB) of an address, for `Table::src_pieces`
 const SRC_PIECE_SHIFT: usize = 20;
@@ -110,12 +119,20 @@ impl Table {
             next_seq: 0,
             src_pieces: BTreeMap::new(),
             pending_res: std::collections::BTreeSet::new(),
+            coarse: BTreeMap::new(),
         }
     }
 
     fn link_src(&mut self, res: usize, src: usize, size: usize) {
         for p in (src >> SRC_PIECE_SHIFT)..=((src + size.max(1) - 1) >> SRC_PIECE_SHIFT) {
             self.src_pieces.entry(p).or_default().push(res);
+        }
+        for b in (src >> SRC_COARSE_SHIFT)..=((src + size.max(1) - 1) >> SRC_COARSE_SHIFT) {
+            let c = self.coarse.entry(b).or_insert(0);
+            *c += 1;
+            if *c == 1 {
+                COARSE_GEN.fetch_add(1, Ordering::Release);
+            }
         }
     }
 
@@ -126,6 +143,20 @@ impl Table {
                 if v.is_empty() {
                     self.src_pieces.remove(&p);
                 }
+            }
+        }
+        for b in (src >> SRC_COARSE_SHIFT)..=((src + size.max(1) - 1) >> SRC_COARSE_SHIFT) {
+            let gone = match self.coarse.get_mut(&b) {
+                Some(c) if *c > 1 => {
+                    *c -= 1;
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            };
+            if gone {
+                self.coarse.remove(&b);
+                COARSE_GEN.fetch_add(1, Ordering::Release);
             }
         }
     }
@@ -439,6 +470,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         unmapped: false,
         seq: 0,
     };
+    let (hot_src, hot_bytes) = (e.src, e.tex.size() as usize);
     let to_unmap = {
         let mut t = TEXTURES.lock().unwrap();
         let (delta, unmap_ptrs) = t.insert(res as usize, e);
@@ -450,6 +482,8 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         super::vram::unmap_superseded(r);
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    // the data the title is about to write there is for the next submit
+    mark_hot(hot_src, hot_bytes);
     Ok(())
 }
 
@@ -719,7 +753,7 @@ thread_local! {
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     let key = (
         super::sparse::mapped_gen(),
-        TEXTURES_GEN.load(Ordering::Acquire),
+        COARSE_GEN.load(Ordering::Acquire),
         crate::hle::kernelx::graphics_reservations_gen(),
     );
     {
@@ -734,7 +768,9 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    // (by 16 MiB blocks, not by texture: a title has tens of thousands, and their sources change
+    // every submit while it loads)
+    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().coarse.keys().map(|&b| (b << SRC_COARSE_SHIFT, (b + 1) << SRC_COARSE_SHIFT)).collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
@@ -1089,6 +1125,24 @@ fn take_known(dirty: &mut Vec<usize>) {
     }
 }
 
+/// Memory the title just committed or placed something in: the looks take its blocks for a
+/// while, as they do a block new to the ranges (a write made right after the commit is there
+/// for the next submit).
+pub(super) fn mark_hot(at: usize, len: usize) {
+    if len == 0 || !hot_looks() {
+        return;
+    }
+    let mut g = HOT.lock().unwrap_or_else(|e| e.into_inner());
+    // (nothing looked yet: blocks new to the ranges start hot)
+    let Some(h) = g.as_mut() else { return };
+    let now = std::time::Instant::now();
+    let mut b = at & !(HOT_BLOCK - 1);
+    while b < at + len {
+        h.hot.insert(b, now);
+        b += HOT_BLOCK;
+    }
+}
+
 /// Diagnostic: where the written pages of the looks are, in 64 MiB pieces. The 12 with the most
 /// pages are logged every 4096 looks, each with its UMA window and that window's kind.
 fn note_dirty_regions(u: &crate::gpu::uma::Uma) {
@@ -1150,10 +1204,14 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) {
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
         return;
     }
+    let t_recheck = std::time::Instant::now();
     recheck_gpu_view_sources();
-    let watch_t0 = std::time::Instant::now();
+    super::submit_cost::recheck(t_recheck.elapsed());
     let mut page = 0x1000u32;
+    let t_ranges = std::time::Instant::now();
     let ranges = cached_watch_ranges(u);
+    super::submit_cost::ranges(t_ranges.elapsed());
+    let watch_t0 = std::time::Instant::now();
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
@@ -1253,7 +1311,9 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) {
             })
             .collect()
     });
+    let t_tex = std::time::Instant::now();
     upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
+    super::submit_cost::textures(t_tex.elapsed());
 }
 
 /// texture → `content_hash` of its memory at its last upload

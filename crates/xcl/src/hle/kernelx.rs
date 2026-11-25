@@ -874,7 +874,8 @@ pub mod pagelog {
 
     /// The events so far by kind.
     pub fn counts() -> String {
-        let c = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        // (called from the exception filter, perhaps with the lock held by the thread that faulted)
+        let Ok(c) = COUNTS.try_lock() else { return "(busy)".into() };
         c.iter().map(|(w, n)| format!("{n} {w}")).collect::<Vec<_>>().join(", ")
     }
 
