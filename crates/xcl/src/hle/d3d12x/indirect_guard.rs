@@ -362,6 +362,18 @@ impl Checked {
         op(out, self.slot as u64 * SLOT as u64);
         super::list_x::transition(list, out, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
     }
+
+    /// Where the checked counts are (buffer, offset), for a pass that reads them as a UAV in place
+    /// of `run` (`clamp::before`); `read` after it.
+    pub(super) fn arguments(&self) -> (usize, u64) {
+        (self.guard.out.as_raw() as usize, self.slot as u64 * SLOT as u64)
+    }
+
+    /// After a pass read the counts at `arguments`: the buffer back to COMMON (its write and that
+    /// read left it in UNORDERED_ACCESS).
+    pub(super) unsafe fn read(&self, list: *mut c_void) {
+        super::list_x::transition(list, self.guard.out.as_raw() as usize, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    }
 }
 
 /// The counts slot `slot`'s ExecuteIndirect was asked to run (groups; vertices or indices,

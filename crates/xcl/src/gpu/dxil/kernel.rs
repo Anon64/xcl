@@ -38,7 +38,7 @@ pub struct KernelOptions {
 /// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
 /// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 10;
+pub const TRANSLATOR_VERSION: u32 = 11;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -151,8 +151,13 @@ pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Res
 
 /// `translate_compute` for a GPU: one that runs only 32-lane waves takes larger compact tables.
 pub fn translate_compute_on(code: &[u8], o: KernelOptions, cs: &CsInterface, wave32_only: bool) -> Result<Kernel, String> {
+    translate_compute_rodata(code, o, cs, wave32_only, &[])
+}
+
+/// `translate_compute_on` with the constant data after the program (`translate_entry_rodata`).
+pub fn translate_compute_rodata(code: &[u8], o: KernelOptions, cs: &CsInterface, wave32_only: bool, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
     let tables = if wave32_only { super::compact::TABLE_WORDS_WAVE32 } else { super::compact::TABLE_WORDS };
-    translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode(), None, tables)
+    translate_entry_with(code, o, Entry::Compute(cs.clone()), compact_mode(), None, tables, rodata.to_vec())
 }
 
 fn translate_entry(
@@ -163,13 +168,36 @@ fn translate_entry(
     nest: Option<super::compact::Nest>,
     tables: usize,
 ) -> Result<Kernel, String> {
+    translate_entry_with(code, o, entry, compact, nest, tables, Vec::new())
+}
+
+/// A program at `entry` with the constant data the console compiler put after it in the code
+/// region (`xbox::Fssm::rodata`, the recompiler's `Options::rodata`): `s_getpc_b64` plus the
+/// compiler's offset is its address, and dword loads at such an address read the table the
+/// module carries (`Lw::rodata_loads`). The compact tables as `translate_full` /
+/// `translate_compute` take them (a compute program for a GPU with 64-lane waves:
+/// `translate_compute_rodata`).
+pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
+    let (compact, tables) = if matches!(entry, Entry::Kernel | Entry::Compute(_)) { (compact_mode(), super::compact::TABLE_WORDS_WAVE32) } else { (None, 0) };
+    translate_entry_with(code, o, entry, compact, None, tables, rodata.to_vec())
+}
+
+fn translate_entry_with(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    tables: usize,
+    rodata: Vec<(u32, Vec<u32>)>,
+) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables))
+        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables, rodata))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -200,6 +228,7 @@ fn translate_on_this_thread(
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
     tables: usize,
+    rodata: Vec<(u32, Vec<u32>)>,
 ) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
@@ -216,10 +245,13 @@ fn translate_on_this_thread(
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    lw.rodata = rodata;
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
     let mut split_tid = None;
+    // a compute program: whether this group runs (`compute_init`: not past a folded dispatch's count)
+    let mut group_runs = None;
     let numthreads = match &entry {
         Entry::Kernel => {
             lw.setup_lanes();
@@ -233,7 +265,7 @@ fn translate_on_this_thread(
         Entry::Compute(cs) => {
             let (tid, gtid) = lw.setup_lanes_compute(cs.threads, uses_lds);
             if split && !uses_lds && cs.threads == [64, 1, 1] { split_tid = Some(tid); }
-            compute_init(&mut lw, cs, tid, gtid);
+            group_runs = Some(compute_init(&mut lw, cs, tid, gtid));
             cs.threads
         }
         Entry::Mesh(ms) => {
@@ -325,6 +357,8 @@ fn translate_on_this_thread(
     }
     let h0 = if plan.is_some() { lw.block(None) } else { head(&mut lw, entry) };
     let exit = lw.block(None);
+    // where `Block(0)` goes
+    let mut first = h0;
     if gs_only {
         // the GS alone: in the lower hardware wave only
         let gate = lw.block(Some(1));
@@ -332,6 +366,14 @@ fn translate_on_this_thread(
         lw.s.m.set_block(gate);
         let up = lw.upper;
         lw.cond_br(up, exit, h0);
+    } else if let Some(runs) = group_runs {
+        // a folded dispatch's groups past the console's count leave at once (the whole group:
+        // no barrier waits on them)
+        let gate = lw.block(Some(1));
+        lw.edge(Block(0), gate);
+        lw.s.m.set_block(gate);
+        lw.cond_br(runs, h0, exit);
+        first = gate;
     } else {
         lw.edge(Block(0), h0);
     }
@@ -466,7 +508,7 @@ fn translate_on_this_thread(
     }
     lw.s.m.ret();
     lw.s.m.set_block(Block(0));
-    lw.s.m.br(h0);
+    lw.s.m.br(first);
     let hw = if split || !o.wave64 { 32 } else { 64 };
     let limit = if compute && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
     lw.finish_dispatch(numthreads, hw, limit, split_tid)
@@ -544,6 +586,8 @@ impl Lw {
             heap_mem,
             res,
             fmt_table: None,
+            rodata: Vec::new(),
+            rodata_table: None,
             fmt_desc_cache: HashMap::new(),
             fmt_comp1_cache: HashMap::new(),
             reload: None,
@@ -808,12 +852,28 @@ fn store_registers(lw: &mut Lw, res: super::shader::RawUav) {
 
 /// The compute entry's fixed registers (the HLSL compute mode's prologue): group ids
 /// after the user SGPRs, TG_SIZE, SCC = 0, EXEC = the wave's threads, v0..v2 = thread id.
-pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3]) {
+/// Returns whether this group runs: a dispatch folded into Y (`recomp::IO_GROUP_LIMIT` in `io`
+/// not 0, the console's group count in X) takes its group in X from both ids, and the groups
+/// past that count do not run.
+pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3]) -> Value {
+    let io = lw.init.io.expect("the I/O buffer");
+    let o = lw.c((crate::gpu::recomp::IO_GROUP_LIMIT * 4) as u32);
+    let limit = lw.s.raw_load(io, o, 1)[0];
+    let (gx, gy) = (lw.s.group_id(0), lw.s.group_id(1));
+    let k = lw.c(crate::gpu::recomp::FOLD_X);
+    let rows = lw.mul(gy, k);
+    let flat = lw.add(gx, rows);
+    let folded = lw.cmpc(Pred::Ne, limit, 0);
+    let zero = lw.c(0);
+    let ids = [lw.sel(folded, flat, gx), lw.sel(folded, zero, gy)];
+    let inside = lw.cmp(Pred::ULt, flat, limit);
+    let t = lw.b(true);
+    let runs = lw.sel(folded, inside, t);
     let mut sgpr = HashMap::new();
     let mut next = cs.user_sgprs;
     for k in 0..3 {
         if cs.tgid[k] {
-            let g = lw.s.group_id(k as u32);
+            let g = if k < 2 { ids[k] } else { lw.s.group_id(2) };
             sgpr.insert(next, g);
             next += 1;
         }
@@ -841,6 +901,7 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
         }
     }
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
+    runs
 }
 
 /// A compute program's count of passes for each entry of a loop (the HLSL compute mode's

@@ -888,9 +888,13 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         };
                         io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
                         io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+                        // (the console's counts: the groups that run, also when folded below)
                         if super::bind::dispatch_loop_budget_wanted() {
                             io[crate::gpu::recomp::IO_LOOP_BUDGET] = crate::gpu::recomp::dispatch_loop_budget([x, y, z]);
                         }
+                        // more groups in X than D3D12 takes: folded (`recomp::IO_GROUP_LIMIT`)
+                        let (limit, folded) = super::bind::fold(x, y, z);
+                        io[crate::gpu::recomp::IO_GROUP_LIMIT] = limit;
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
                         // the pipeline's own root signature when it has static samplers
@@ -913,8 +917,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
+                        // (the span names the console's groups, the chain dispatches the folded ones)
                         let t = super::gpu_profile::begin(list.as_raw(), real, super::gpu_profile::Kind::Dispatch, [x, y, z]);
-                        let ran = super::real::dispatch_chain::dispatch(&list, real, st.allocator, [x, y, z]);
+                        let ran = super::real::dispatch_chain::dispatch(&list, real, st.allocator, folded);
                         super::gpu_profile::end(list.as_raw(), t);
                         ran?;
                         out.dispatches += 1;
