@@ -787,6 +787,9 @@ impl State {
             Alignment: 0,
             Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
         };
+        // (a heap takes its time, with the state locked: what waits for its mapping goes first, a
+        // CPU signal that asks meanwhile gives up after 2 ms)
+        self.flush_pending();
         let mut heap: Option<ID3D12Heap> = None;
         if let Err(e) = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)) {
             crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
@@ -2047,18 +2050,19 @@ fn pending_soon() {
 /// The mappings put off go to the GPU now: the CPU is about to signal a fence, and work submitted
 /// before the title committed the memory may run because of it.
 pub fn send_pending() {
-    if !PENDING.load(Ordering::Acquire) {
-        return;
-    }
     // (a signal under the state's lock must not wait for it; the thread sends them then)
     let t0 = std::time::Instant::now();
     loop {
+        // (asked each time: another thread may be sending them, and has sent them when the flag goes)
+        if !PENDING.load(Ordering::Acquire) {
+            return;
+        }
         match STATE.try_lock() {
             Ok(mut g) => {
-                PENDING.store(false, Ordering::Release);
                 if let Some(s) = g.as_mut() {
                     unsafe { s.flush_pending() };
                 }
+                PENDING.store(false, Ordering::Release);
                 return;
             }
             Err(std::sync::TryLockError::Poisoned(_)) => return PENDING.store(false, Ordering::Release),
@@ -2286,8 +2290,8 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let Some(s) = g.as_mut() else { return };
     s.drain_readbacks(Drain::Finished);
     // the title's work sees what was committed mapped …
-    PENDING.store(false, Ordering::Release);
     s.flush_pending();
+    PENDING.store(false, Ordering::Release);
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
         s.retire_free_pools();
@@ -2464,6 +2468,14 @@ mod tests {
         dev.expect("D3D12 device")
     }
 
+    /// Whether `dev` is a software device (WARP).
+    unsafe fn software(dev: &ID3D12Device) -> bool {
+        use windows::Win32::Graphics::Dxgi::*;
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else { return false };
+        let adapter: windows::core::Result<IDXGIAdapter1> = factory.EnumAdapterByLuid(dev.GetAdapterLuid());
+        adapter.and_then(|a| a.GetDesc1()).is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+    }
+
     /// The small ones of an upload's runs go up in dispatches: each lands where it belongs (far
     /// into the window too, next to runs that go up with a copy), and what lies between them keeps
     /// what the GPU has there.
@@ -2473,6 +2485,11 @@ mod tests {
         const SIZE: usize = 3 << 30;
         unsafe {
             let dev = test_device();
+            // (the software device makes a reserved buffer of 3 GiB and is removed by the first copies
+            // into it, 0x887a0020 – and a process has one device an adapter: every test after it failed)
+            if software(&dev) {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
             let mut reserved: Option<ID3D12Resource> = None;
             if dev.CreateReservedResource(&buffer_desc(SIZE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).is_err() {
                 return crate::gpu::recomp::runner::skip_test("no GPU");
@@ -2749,6 +2766,10 @@ mod tests {
         }
         unsafe {
             let _ = super::super::real::device_raw();
+            // (a device without sparse windows: commits wait for one, nothing is put off)
+            if STATE.lock().unwrap().is_none() {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
             let Some((at, len)) = alloc(64 * TILE, TILE) else { return };
             let put_off = || STATE.lock().unwrap().as_ref().is_some_and(|s| s.pending.iter().any(|t| (at..at + len).contains(t)));
             let mapped = || STATE.lock().unwrap().as_ref().is_some_and(|s| (at..at + len).step_by(TILE).all(|t| s.mapped.contains_key(&t)));

@@ -862,9 +862,16 @@ fn look_skip() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_LOOK_SKIP").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// when the walk last made a block hot (`now_us`): no look before that took the block
+static WALK_FOUND: AtomicU64 = AtomicU64::new(0);
+
 fn closed_before_last_look(lists: &[*mut c_void]) -> bool {
     let began = LOOK_BEGAN.load(Ordering::Acquire);
     if began == 0 || lists.is_empty() {
+        return false;
+    }
+    // (a block the walk found written since: the look that began then did not take it)
+    if WALK_FOUND.load(Ordering::Acquire) >= began {
         return false;
     }
     let g = CLOSED.lock().unwrap();
@@ -1222,6 +1229,7 @@ unsafe fn walk() {
                         if let std::collections::btree_map::Entry::Vacant(v) = h.hot.entry(b) {
                             v.insert(now);
                             HOT_STATS[3].fetch_add(1, Ordering::Relaxed);
+                            WALK_FOUND.fetch_max(now_us(), Ordering::Release);
                         }
                     }
                 }
@@ -1380,6 +1388,10 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
     // (before the ranges are asked for: memory that is new after that is not in this look)
     let began = now_us();
     let ranges = cached_watch_ranges(u);
+    // (also of a submit without a look: memory that is new is walked from now on)
+    if hot_looks() {
+        start_walk(&ranges);
+    }
     super::submit_cost::ranges(t_ranges.elapsed());
     let watch_t0 = std::time::Instant::now();
     let mut ahead = 0usize;
@@ -2572,6 +2584,25 @@ pub(super) mod tests {
             assert!(written_pages(plain, 0x1000).is_empty(), "memory that is not watched");
             VirtualFree(plain as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    /// A submit whose lists were closed before the last look began goes without a look of its own
+    /// (`XCL_LOOK_SKIP`) – not once the walk has found a written block since: no look took that one.
+    #[test]
+    fn a_block_the_walk_found_since_ends_the_skip() {
+        let list = 0x7E57_1157usize as *mut c_void;
+        note_list_closed(list as usize);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // (other tests' submits only raise the time of the last look)
+        LOOK_BEGAN.fetch_max(now_us(), Ordering::AcqRel);
+        if WALK_FOUND.load(Ordering::Acquire) < LOOK_BEGAN.load(Ordering::Acquire) {
+            assert!(closed_before_last_look(&[list]));
+        }
+        WALK_FOUND.store(u64::MAX, Ordering::Release);
+        assert!(!closed_before_last_look(&[list]), "the look before did not take the block the walk found");
+        // (the next submit of the process looks for itself: nothing is lost by this)
+        WALK_FOUND.store(now_us(), Ordering::Release);
+        CLOSED.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
     }
 
     /// Pages found ahead of a submit are kept until one takes them, are not reported again, and a
