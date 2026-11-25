@@ -4098,7 +4098,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 /// again. A blob whose build took `KEEP` or longer is written under the hash of its DXIL and
 /// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
 /// driver refuses the blob of another driver, adapter or root signature (the file is dropped
-/// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
+/// and the program compiled as before). A translated graphics pipeline's blob goes under
+/// `graphics_file_hash`, the passes of a two-pass one under `TwoPassBlob`'s names.
+/// `XCL_PSO_DISK_CACHE=0`: off.
 pub(crate) mod driver_cache {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4132,7 +4134,26 @@ pub(crate) mod driver_cache {
         enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(graphics_name(hash, bytes)))
     }
 
-    pub(super) fn two_pass_threshold() -> std::time::Duration {
+    /// The layout of `graphics_file_hash`'s input: a change names every graphics file anew.
+    const GRAPHICS_FILE_SCHEMA: u32 = 2;
+
+    /// The hash a translated graphics pipeline's file is named after: its key in memory
+    /// (`graphics_blob_key`: the description's state, the DXIL of each stage, the static samplers)
+    /// with the adapter and driver it is made on (`driver_identity`) and the memory windows of its
+    /// root signature (`pso::mem_windows`), which the description does not hold. A file named
+    /// after the description alone was the blob of whichever adapter wrote it last.
+    pub fn graphics_file_hash(key: (u64, usize), driver: u64, windows: u32) -> u64 {
+        let mut b = Vec::with_capacity(32);
+        b.extend_from_slice(&GRAPHICS_FILE_SCHEMA.to_le_bytes());
+        b.extend_from_slice(&key.0.to_le_bytes());
+        b.extend_from_slice(&(key.1 as u64).to_le_bytes());
+        b.extend_from_slice(&driver.to_le_bytes());
+        b.extend_from_slice(&windows.to_le_bytes());
+        crate::gpu::shader::fnv64(&b)
+    }
+
+    /// Builds shorter than this keep no file (`KEEP`; `XCL_PSO_DISK_CACHE_MIN_MS` to choose).
+    pub(super) fn keep_threshold() -> std::time::Duration {
         static MIN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
         *MIN.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE_MIN_MS").ok()
             .and_then(|v| v.trim().parse().ok()).map_or(KEEP, std::time::Duration::from_millis))
@@ -4229,6 +4250,20 @@ pub(crate) mod driver_cache {
             assert_ne!(name(b"abc", 0), name(b"abc", 1));
             // (the length is in the name: two programs of one hash and different lengths differ)
             assert!(name(&[0u8; 0x1234], 2).ends_with("-1234-2.pso"));
+        }
+
+        /// A graphics pipeline's file follows its description's key, the adapter and driver and
+        /// the window count, and the same inputs name the same file in every run (a fixed hash,
+        /// none seeded per process).
+        #[test]
+        fn a_graphics_file_follows_its_key_adapter_driver_and_windows() {
+            let (key, driver) = ((0x0123_4567_89ab_cdef, 0x4_0000), 0x10de_2b85);
+            let h = graphics_file_hash(key, driver, 16);
+            assert_eq!(h, 0x366d_c4de_0ace_48bd, "the hash of a run before");
+            assert_ne!(h, graphics_file_hash((key.0 ^ 1, key.1), driver, 16), "another description or DXIL");
+            assert_ne!(h, graphics_file_hash((key.0, key.1 + 1), driver, 16), "another DXIL size");
+            assert_ne!(h, graphics_file_hash(key, driver + 1, 16), "another adapter or driver");
+            assert_ne!(h, graphics_file_hash(key, driver, 4), "another window count");
         }
 
         #[test]
@@ -4755,6 +4790,182 @@ mod graphics_blob_tests {
         assert!(!build.cache_eligible);
         assert!(!copy.GS.pShaderBytecode.is_null());
     }
+
+    /// Where the description's parts are (shaders, input layout, semantic names, root signature,
+    /// a cached blob) never enters the key, only what is there.
+    #[test]
+    fn graphics_blob_key_reads_no_pointer() {
+        let names = [std::ffi::CString::new("TEXCOORD").unwrap(), std::ffi::CString::new("TEXCOORD").unwrap()];
+        let elem = |n: &std::ffi::CStr| D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(n.as_ptr() as *const u8),
+            SemanticIndex: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT,
+            ..Default::default()
+        };
+        let layouts = [[elem(&names[0])], [elem(&names[1])]];
+        let (vs, ps) = ([b"vs-a".to_vec(), b"vs-a".to_vec()], [b"ps-a".to_vec(), b"ps-a".to_vec()]);
+        let blob = [7u8; 8];
+        let desc = |k: usize| {
+            let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            // (never dereferenced: the root signature is not read)
+            d.pRootSignature = unsafe { std::mem::transmute::<usize, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(0x1000 * (k + 1)) };
+            d.VS = bytecode(&vs[k]);
+            d.PS = bytecode(&ps[k]);
+            d.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: layouts[k].as_ptr(), NumElements: 1 };
+            if k == 1 {
+                d.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: blob.as_ptr().cast(), CachedBlobSizeInBytes: blob.len() };
+            }
+            d.NumRenderTargets = 1;
+            d.SampleDesc.Count = 1;
+            d
+        };
+        let (a, b) = (desc(0), desc(1));
+        assert_ne!(a.VS.pShaderBytecode, b.VS.pShaderBytecode);
+        assert_ne!(a.InputLayout.pInputElementDescs, b.InputLayout.pInputElementDescs);
+        unsafe {
+            assert_eq!(graphics_blob_key(&a, &vs[0], Some(&ps[0]), None, &[]), graphics_blob_key(&b, &vs[1], Some(&ps[1]), None, &[]));
+        }
+    }
+
+    /// A kept blob the driver refuses – of another adapter, of another driver, or one it cannot
+    /// read – is dropped from the disk and the pipeline compiled; the compile's blob takes its
+    /// place, and the next build is made from it without a compile.
+    #[test]
+    fn a_refused_graphics_blob_is_dropped_and_the_pipeline_compiled() {
+        let dir = std::env::temp_dir().join(format!("xcl-graphics-refused-{}", std::process::id()));
+        use windows::Win32::Foundation::{D3D12_ERROR_ADAPTER_NOT_FOUND, D3D12_ERROR_DRIVER_VERSION_MISMATCH};
+        let refusals = [D3D12_ERROR_ADAPTER_NOT_FOUND.0, D3D12_ERROR_DRIVER_VERSION_MISMATCH.0, E_INVALIDARG];
+        for (i, refusal) in refusals.into_iter().enumerate() {
+            let p = dir.join(format!("gfx-refused-{i}.pso"));
+            assert!(driver_cache::write(&p, b"another driver's blob"));
+            let gkey = (0x6766_7800 + i as u64, 7);
+            let fresh = b"this driver's blob".to_vec();
+            let mut copy = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            let mut compiles = 0;
+            let build = unsafe {
+                graphics_pso_through_cache(
+                    gkey,
+                    Some(&p),
+                    std::time::Duration::ZERO,
+                    &mut copy,
+                    false,
+                    0,
+                    |c| {
+                        if c.CachedPSO.pCachedBlob.is_null() {
+                            compiles += 1;
+                            0
+                        } else {
+                            refusal
+                        }
+                    },
+                    || Some(std::sync::Arc::new(fresh.clone())),
+                )
+            };
+            assert_eq!((build.hr, build.reused, compiles), (0, false, 1), "refused with {refusal:#x}: compiled");
+            assert_eq!(driver_cache::load(&p).as_deref(), Some(fresh.as_slice()), "and its blob kept in the refused one's place");
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            let build = unsafe {
+                graphics_pso_through_cache(
+                    gkey,
+                    Some(&p),
+                    std::time::Duration::ZERO,
+                    &mut copy,
+                    false,
+                    0,
+                    |c| {
+                        assert!(!c.CachedPSO.pCachedBlob.is_null(), "the kept blob goes to the driver");
+                        assert_eq!(std::slice::from_raw_parts(c.CachedPSO.pCachedBlob as *const u8, c.CachedPSO.CachedBlobSizeInBytes), fresh.as_slice());
+                        0
+                    },
+                    || panic!("a build made from a kept blob keeps nothing"),
+                )
+            };
+            assert!(build.hr == 0 && build.reused, "the next build is made from it");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On the device (the software one in tests): a pipeline made twice is compiled once and
+    /// made from the blob kept on disk the second time; a damaged file is dropped and the
+    /// pipeline compiled again.
+    #[test]
+    fn a_graphics_pipeline_made_again_gets_its_kept_blob_on_the_device() {
+        use crate::gpu::recomp::runner::skip_test;
+        if super::super::backend() != super::super::Backend::Real {
+            return skip_test("no GPU");
+        }
+        let stand_in = dummy();
+        if stand_in.vs.is_empty() || stand_in.ps.is_empty() {
+            return skip_test("no stand-in shaders");
+        }
+        let dir = std::env::temp_dir().join(format!("xcl-graphics-device-{}", std::process::id()));
+        let p = dir.join("gfx-device.pso");
+        let _ = std::fs::remove_file(&p);
+        unsafe {
+            let raw = device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap();
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            desc.pRootSignature = std::mem::transmute_copy(&rs);
+            desc.VS = bytecode(&stand_in.vs);
+            desc.PS = bytecode(&stand_in.ps);
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            desc.SampleMask = u32::MAX;
+            desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            desc.RasterizerState.DepthClipEnable = true.into();
+            desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            desc.NumRenderTargets = 1;
+            desc.RTVFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            let f: PsoFn = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreateGraphicsPipelineState")));
+            let iid = pc_iid(Kind::PipelineState);
+            // (a key of this test's own: nothing in memory under it)
+            let gkey = (graphics_blob_key(&desc, &stand_in.vs, Some(&stand_in.ps), None, &[]).0 ^ 0x7e57, 1);
+            let make = |desc: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC| {
+                desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+                let mut out: *mut c_void = std::ptr::null_mut();
+                let o = &mut out as *mut *mut c_void;
+                let build = graphics_pso_through_cache(
+                    gkey,
+                    Some(&p),
+                    std::time::Duration::ZERO,
+                    desc,
+                    false,
+                    0,
+                    |c| finish_pso(raw, f, c as *const _ as *const c_void, &iid, o),
+                    || read_pso_cached_blob(*o).filter(|b| !b.is_empty()).map(std::sync::Arc::new),
+                );
+                if !out.is_null() {
+                    drop(ID3D12PipelineState::from_raw(out));
+                }
+                (build.hr, build.reused)
+            };
+            // (a device that gives no blob of its pipelines has nothing to keep)
+            let mut probe: *mut c_void = std::ptr::null_mut();
+            assert!(finish_pso(raw, f, &desc as *const _ as *const c_void, &iid, &mut probe) >= 0, "the pipeline is made");
+            let gives_blobs = read_pso_cached_blob(probe).is_some_and(|b| !b.is_empty());
+            drop(ID3D12PipelineState::from_raw(probe));
+            if !gives_blobs {
+                return skip_test("the device gives no blob of its pipelines");
+            }
+            let (hr, reused) = make(&mut desc);
+            assert!(hr >= 0 && !reused, "the first build compiles ({hr:#x})");
+            assert!(driver_cache::load(&p).is_some(), "and keeps its blob");
+            let (hr, reused) = make(&mut desc);
+            assert!(hr >= 0 && reused, "the second is made from the kept blob ({hr:#x})");
+            assert!(driver_cache::write(&p, b"damaged"));
+            let (hr, reused) = make(&mut desc);
+            assert!(hr >= 0 && !reused, "a damaged blob: compiled ({hr:#x})");
+            assert!(driver_cache::load(&p).is_some_and(|b| b != b"damaged"), "and the compile's blob kept in its place");
+            let (hr, reused) = make(&mut desc);
+            assert!(hr >= 0 && reused, "made from it again ({hr:#x})");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 struct GraphicsPsoBuild {
@@ -4799,6 +5010,54 @@ fn create_graphics_pso_cached(
         reused: false,
         cache_eligible: hr >= 0 && !dropped_rect_gs,
     }
+}
+
+/// Make translated graphics pipeline `gkey` (`copy`) through the driver's blob of an earlier
+/// build: the one kept in memory, else the one kept on disk at `disk`, goes to the driver with
+/// the description (`create`); one it refuses – another adapter, driver or root signature
+/// (D3D12_ERROR_ADAPTER_NOT_FOUND, D3D12_ERROR_DRIVER_VERSION_MISMATCH, E_INVALIDARG), a damaged
+/// file – is dropped and the pipeline compiled. The blob of a compile (`blob_of`, asked only
+/// then) that took `keep_min` or longer is kept on disk for the next run. A draw waits for its
+/// pipeline: a retail title showed no frame for 156 s while the driver compiled 14 of them one
+/// after another, ~5 s each, in every run.
+#[allow(clippy::too_many_arguments)]
+unsafe fn graphics_pso_through_cache(
+    gkey: (u64, usize),
+    disk: Option<&std::path::Path>,
+    keep_min: std::time::Duration,
+    copy: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    rect_gs: bool,
+    record: u64,
+    create: impl FnMut(&D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> HRESULT,
+    blob_of: impl FnOnce() -> Option<std::sync::Arc<Vec<u8>>>,
+) -> GraphicsPsoBuild {
+    let bytes = gkey.1;
+    let mut cached = graphics_blob(gkey);
+    let from_disk = cached.is_none();
+    if from_disk {
+        cached = disk.and_then(driver_cache::load).map(std::sync::Arc::new);
+    }
+    let build = create_graphics_pso_cached(
+        copy,
+        cached.as_deref().map(Vec::as_slice),
+        rect_gs,
+        || {
+            forget_graphics_blob(gkey);
+            if from_disk {
+                driver_cache::note(false, disk);
+            }
+        },
+        |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((record, has_cached)), f),
+        create,
+    );
+    if build.cache_eligible {
+        if let (Some(b), Some(p)) = (blob_of(), disk) {
+            driver_cache::keep_at(p, &b, build.in_driver, keep_min);
+        }
+    } else if build.reused && from_disk {
+        driver_cache::note(true, None);
+    }
+    build
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -4880,33 +5139,20 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
-    let mut cached = graphics_blob(gkey);
-    let disk = driver_cache::graphics_path(gkey.0, gkey.1);
-    let from_disk = cached.is_none();
-    if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
-    }
-    let build = create_graphics_pso_cached(
+    // (no file without the adapter's identity: it could be another adapter's)
+    let driver = driver_identity(this);
+    let disk = driver.and_then(|id| driver_cache::graphics_path(driver_cache::graphics_file_hash(gkey, id, crate::gpu::recomp::pso::mem_windows()), bytes));
+    let build = graphics_pso_through_cache(
+        gkey,
+        disk.as_deref(),
+        driver_cache::keep_threshold(),
         &mut copy,
-        cached.as_deref().map(Vec::as_slice),
         rect_gs.is_some(),
-        || {
-            forget_graphics_blob(gkey);
-            if from_disk {
-                driver_cache::note(false, disk.as_deref());
-            }
-        },
-        |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), f),
+        ps_hash,
         |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
+        || keep_graphics_blob(gkey, *ppv, bytes),
     );
     let hr = build.hr;
-    if build.cache_eligible {
-        if let (Some(p), Some(b)) = (disk.as_deref(), keep_graphics_blob(gkey, *ppv, bytes)) {
-            driver_cache::keep(p, &b, build.in_driver);
-        }
-    } else if build.reused && from_disk {
-        driver_cache::note(true, None);
-    }
     if hr < 0 {
         note_translation_error(format!(
             "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
@@ -5501,7 +5747,12 @@ pub fn driver_cache_stats() -> (u64, u64, u64) {
     driver_cache::stats()
 }
 
-fn two_pass_driver_id(device: *mut c_void) -> Option<u64> {
+/// The adapter of `device` and its driver (vendor, device, subsystem, revision, user-mode
+/// driver version), for the names of the driver blobs kept on disk: the driver refuses another
+/// one's blob (it is compiled again), and two adapters sharing the cache (a GPU and the
+/// software one) would take turns overwriting each other's files. None: not known (no blob of
+/// its pipelines is kept on disk).
+fn driver_identity(device: *mut c_void) -> Option<u64> {
     use windows::Win32::Graphics::Dxgi::*;
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&device) }?;
     let luid = unsafe { dev.GetAdapterLuid() };
@@ -5586,7 +5837,7 @@ unsafe fn build_two_pass_pso(
     take_cold_slot();
     let (hr, pso, took) = attempt(None)?;
     if let Some(cache) = cache {
-        let min = driver_cache::two_pass_threshold();
+        let min = driver_cache::keep_threshold();
         let disk = cache.disk.as_deref().filter(|_| took >= min);
         let keep_ram = bytes >= COMPUTE_BLOB_MIN_DXIL || took >= min;
         if let Some(blob) = (disk.is_some() || keep_ram).then(|| read_pso_cached_blob(pso.as_raw())).flatten() {
@@ -5670,7 +5921,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     if ppv.is_null() { return E_INVALIDARG }
     *ppv = std::ptr::null_mut();
 
-    let driver = two_pass_driver_id(this);
+    let driver = driver_identity(this);
     let persist = driver.is_some() && driver_cache::enabled();
     let windows = crate::gpu::recomp::pso::mem_windows();
     let cs = TwoPassBlob::new(two_pass_cs_key(&tp.cs, &tp.samplers, driver.unwrap_or(0), windows), tp.cs.len(), rs, false, persist);
