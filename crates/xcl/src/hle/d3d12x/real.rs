@@ -1250,9 +1250,10 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
         return dev_create_descriptor_heap(this, desc as usize, riid, ppv);
     }
     // views: an SRV / UAV pair per console slot (in the shared shader-visible heap, the
-    // title's own a CPU-only mirror – `console_heap`); samplers: one per slot
-    let pc_n = if sampler { d[1] } else { d[1].saturating_mul(2) };
+    // title's own a CPU-only mirror – `console_heap`); samplers: one per slot, a shader-visible
+    // heap all a shader can index (`console_heap::pc_samplers`)
     let visible = d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0;
+    let pc_n = if sampler { super::console_heap::pc_samplers(d[1], visible) } else { d[1].saturating_mul(2) };
     let shared = match ID3D12Device::from_raw_borrowed(&this) {
         Some(dev) if !sampler && !desc.is_null() => super::console_heap::shared_heap(dev),
         _ => false,
@@ -1270,7 +1271,8 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
         if sampler {
             // an S# of zeros – a slot nothing was written to – is a sampler on the console: point
             // filtering, wrap, mip 0 only. Every PC slot starts as that one, so a table entry the
-            // title left empty samples as there (an unwritten PC descriptor is undefined).
+            // title left empty samples as there (an unwritten PC descriptor is undefined), as does
+            // an index past the title's slots (`console_heap::pc_samplers`).
             let zero = D3D12_SAMPLER_DESC {
                 Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
                 AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
@@ -1283,7 +1285,7 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
                 MinLOD: 0.0,
                 MaxLOD: 0.0,
             };
-            for k in 0..d[1] as u64 {
+            for k in 0..pc_n as u64 {
                 dev.CreateSampler(&zero, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize });
             }
         }

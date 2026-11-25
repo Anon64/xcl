@@ -531,6 +531,19 @@ unsafe fn title_memory(u: &crate::gpu::uma::Uma, bytes: usize) -> Option<usize> 
     None
 }
 
+/// PC samplers of a console sampler heap of `n` slots: a shader-visible one gets the 2 048 a
+/// shader-visible PC sampler heap holds at most, whatever `n` is. Translated shaders index the
+/// bound sampler heap with S# word 3 [10:0] (0..2047), and a title builds S#s itself (a border
+/// color pointer there): with only `n` PC samplers an index from `n` on read past the heap's end.
+/// The samplers past `n` are the zero sampler; the console heap keeps its `n` slots.
+pub fn pc_samplers(n: u32, visible: bool) -> u32 {
+    if visible {
+        n.max(D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE)
+    } else {
+        n
+    }
+}
+
 /// `obj` is a PC heap from `pc_cpu` / `pc_gpu` (increment `inc`; `pc_gpu` 0 when not shader
 /// visible) with 2·`n` view descriptors or `n` samplers: give it `n` console slots in
 /// unified memory. `shared`: its views go to the shared heap (`shared_heap`), a page at a
@@ -961,6 +974,30 @@ mod tests {
         assert_eq!(heap_capacities(Some(0)), vec![1 << 21, 1_000_000]);
         assert_eq!(heap_capacities(Some(1 << 21)), vec![1 << 21]);
         assert_eq!(heap_capacities(Some(u32::MAX)), vec![1 << 21], "never past the shaders' guard");
+    }
+
+    /// A shader-visible sampler heap has a PC sampler at every index a translated shader forms
+    /// (S# word 3 & 0x7FF), whatever the title asked for (a retail title: 128); a CPU-only one
+    /// as many as its slots. D3D12 makes a shader-visible sampler heap of that size.
+    #[test]
+    fn every_sampler_index_a_shader_forms_is_in_the_pc_heap() {
+        for n in [1, 16, 128, 2047, 2048] {
+            assert_eq!(pc_samplers(n, true), 2048, "{n} slots");
+            assert!(u32::MAX & 0x7FF < pc_samplers(n, true), "{n} slots: the highest index a shader forms");
+            assert_eq!(pc_samplers(n, false), n, "{n} slots, CPU only");
+        }
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let dev = unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            match CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) {
+                Ok(warp) if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() => dev.unwrap(),
+                _ => return crate::gpu::recomp::runner::skip_test("no WARP device"),
+            }
+        };
+        let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, NumDescriptors: pc_samplers(128, true), Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
+        let made = unsafe { dev.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&d) };
+        assert!(made.is_ok(), "a shader-visible sampler heap of {}: {made:?}", d.NumDescriptors);
     }
 
     /// Every descriptor of a range that is not handed out gets a null view, an SRV at even and a
