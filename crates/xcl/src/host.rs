@@ -49,6 +49,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut cost = crate::hle::api_cost::totals();
             let mut own_cost = crate::hle::api_cost::submitter_totals();
             let mut views = crate::hle::d3d12x::view_want::totals();
+            let mut tile_calls = crate::hle::d3d12x::sparse::tile_calls();
             let mut said_budget = false;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
@@ -87,6 +88,12 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     crate::xlog_info!("GPU view (2 s): {line}");
                 }
                 views = asked;
+                // the sparse queue's UpdateTileMappings calls and tiles, by kind of window
+                let mappings = crate::hle::d3d12x::sparse::tile_calls();
+                if let Some(line) = crate::hle::d3d12x::sparse::tile_calls_line(&mappings, &tile_calls) {
+                    crate::xlog_info!("tile mappings (2 s): {line}");
+                }
+                tile_calls = mappings;
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
                     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};

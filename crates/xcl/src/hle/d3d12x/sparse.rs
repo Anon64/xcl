@@ -1090,6 +1090,7 @@ impl State {
         for &(a, (h, t)) in tiles {
             by_heap.entry(h).or_default().push((((a - res_base) / TILE) as u32, t));
         }
+        count_tile_calls(res_base, false, by_heap.len(), tiles.len());
         for (h, mut pairs) in by_heap {
             pairs.sort_unstable_by_key(|&(x, _)| x);
             let mut coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = Vec::with_capacity(pairs.len());
@@ -1154,6 +1155,7 @@ impl State {
             counts.push(run);
             i += run as usize;
         }
+        count_tile_calls(res_base, true, 1, tiles.len());
         self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
@@ -3283,6 +3285,35 @@ const LS_UNMAP_TILES: usize = 10;
 /// so far: [tiles `flush_pending` mapped, its calls, tiles `flush_parked` unmapped, bytes of
 /// copies back landed] (read under the state's lock, which all of them are done with)
 static TILE_WORK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// so far, always counted: the sparse queue's UpdateTileMappings calls and their tiles, [map
+/// calls, tiles mapped, unmap calls, tiles unmapped] in the sparse windows, then the same in
+/// the view windows (GPU views). A placed buffer's mapping counts with its window's.
+static TILE_CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// `calls` UpdateTileMappings of `tiles` tiles of the resource at `base` (`TILE_CALLS`)
+fn count_tile_calls(base: usize, unmap: bool, calls: usize, tiles: usize) {
+    let k = if super::view_want::is_view(base as u64) { 4 } else { 0 } + if unmap { 2 } else { 0 };
+    TILE_CALLS[k].fetch_add(calls as u64, Ordering::Relaxed);
+    TILE_CALLS[k + 1].fetch_add(tiles as u64, Ordering::Relaxed);
+}
+
+/// `TILE_CALLS` so far, for the periodic log line (`tile_calls_line`)
+pub fn tile_calls() -> [u64; 8] {
+    std::array::from_fn(|k| TILE_CALLS[k].load(Ordering::Relaxed))
+}
+
+/// The tile mapping calls between two `tile_calls`, None when there were none.
+pub fn tile_calls_line(now: &[u64; 8], before: &[u64; 8]) -> Option<String> {
+    let d: [u64; 8] = std::array::from_fn(|k| now[k].saturating_sub(before[k]));
+    if d.iter().all(|&n| n == 0) {
+        return None;
+    }
+    Some(format!(
+        "sparse windows {} calls mapping {} tiles, {} calls unmapping {} tiles; GPU views {} calls mapping {} tiles, {} calls unmapping {} tiles",
+        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+    ))
+}
 
 /// The sparse lock split line of `x` (`LOCK_SPLIT`'s sums), as averages a submit.
 fn lock_split_line(x: &[u64; 11]) -> String {
@@ -5585,6 +5616,18 @@ mod tests {
         assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), Some((0, 6)), "the oldest first");
         assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), Some((2, 1)));
         assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), None);
+    }
+
+    /// The tile mapping line gives the calls and tiles since the counts before, by kind of window.
+    #[test]
+    fn the_tile_mapping_line_counts_since_the_last() {
+        let before = [1, 10, 2, 20, 3, 30, 4, 40];
+        assert_eq!(tile_calls_line(&before, &before), None, "no call: no line");
+        let now = [2, 74, 2, 20, 3, 30, 7, 41];
+        assert_eq!(
+            tile_calls_line(&now, &before).as_deref(),
+            Some("sparse windows 1 calls mapping 64 tiles, 0 calls unmapping 0 tiles; GPU views 0 calls mapping 0 tiles, 3 calls unmapping 1 tiles")
+        );
     }
 
     /// A pool goes when all its tiles are free or cooled: one with a tile still cooling stays.
