@@ -318,6 +318,15 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
             }
+            // diagnostic: a GPU heap the coherent window has no room for (plain memory from here)
+            static UNFIT: AtomicUsize = AtomicUsize::new(0);
+            static UNFIT_BYTES: AtomicUsize = AtomicUsize::new(0);
+            let k = UNFIT.fetch_add(1, Ordering::Relaxed) + 1;
+            let total = UNFIT_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+            if k <= 8 || k.is_power_of_two() {
+                let (free, _, used, _) = u.committed_state();
+                crate::xlog_warn!("kernelx: a GPU heap of {} MB does not fit in the coherent window ({} MB used, {} MB free): #{k}, {} MB in all", size >> 20, used >> 20, free >> 20, total >> 20);
+            }
         }
     }
     // GPU-visible title memory the windows above had no room for (a retail game: a 24 GB

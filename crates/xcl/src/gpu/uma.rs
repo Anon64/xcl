@@ -155,6 +155,22 @@ impl Uma {
         *self.pool.lock().unwrap() = (p, p + bytes, (p..p + bytes).step_by(ARENA_BLOCK).rev().collect());
     }
 
+    /// Diagnostic: how the committed window stands: free bytes in it in total, the largest free
+    /// run, the bytes in use, and XCL's pool blocks left.
+    pub fn committed_state(&self) -> (usize, usize, usize, usize) {
+        let Some(win) = self.kinds.iter().position(|w| matches!(w, WindowKind::Committed(_))) else { return (0, 0, 0, 0) };
+        let g = self.inner.lock().unwrap();
+        let mine = |o: usize| o / WINDOW == win;
+        let (mut free, mut largest) = (0usize, 0usize);
+        for (_, &l) in g.free.iter().filter(|(&o, _)| mine(o)) {
+            free += l;
+            largest = largest.max(l);
+        }
+        let used = g.used.iter().filter(|(&o, _)| mine(o)).map(|(_, &l)| l).sum();
+        drop(g);
+        (free, largest, used, self.pool.lock().unwrap().2.len())
+    }
+
     /// A block of `ARENA_BLOCK` bytes from XCL's pool (None: the pool is used up or absent).
     fn pool_block(&self) -> Option<usize> {
         self.pool.lock().unwrap().2.pop()

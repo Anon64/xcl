@@ -942,6 +942,25 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     }
 }
 
+/// Diagnostic: what the committed window looks like when a draw's arguments find no room in it
+/// (the first four times, then every power of two).
+fn note_arena_full(u: &crate::gpu::uma::Uma, asked: usize) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if k > 4 && !k.is_power_of_two() {
+        return;
+    }
+    let (free, largest, used, pool) = u.committed_state();
+    let (allocators, blocks) = console_list::pending_blocks();
+    crate::xlog_warn!(
+        "D3D12.X: no unified memory for draw data ({k} so far): {asked} bytes asked; coherent window {} MB in use, {} MB free (largest run {} KB), {pool} of {} pool blocks left; {blocks} blocks held for {allocators} allocators",
+        used >> 20,
+        free >> 20,
+        largest >> 10,
+        crate::gpu::uma::POOL / crate::gpu::uma::ARENA_BLOCK
+    );
+}
+
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
@@ -972,7 +991,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or_else(|| {
+            note_arena_full(u, bytes.len());
+            "unified memory is full"
+        })?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
