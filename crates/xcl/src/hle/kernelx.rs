@@ -515,18 +515,37 @@ fn keep_last_error<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// The pages of `[a, a + n)` (`n == 0`: to the end of the reservation at `a`) are about to be
-/// decommitted or released: those of a paired CPU view (`mirrors`) may be shown by tiles of its
-/// GPU view, which a submit fills from them and scans with the sparse state's lock held – sparse
-/// is told first (`sparse::source_decommitted`), or that read faults. Call it with no lock held
-/// that sparse takes (AWAY is fine: AWAY → sparse is the order). One atomic load while nothing
-/// is paired; else a look at the pairs, and sparse returns after one more atomic load while no
-/// tile shows a CPU view.
-unsafe fn source_going(a: usize, n: usize) {
-    let Some((lo, len)) = mirrors::cpu_view_part(a, n) else { return };
+/// The part of `[a, a + n)` (`n == 0`: to the end of the reservation at `a`) that lies in a
+/// paired CPU view (`mirrors`): the pages `source_going` tells sparse about. One atomic load
+/// while nothing is paired; else a look at the pairs.
+unsafe fn source_part(a: usize, n: usize) -> Option<(usize, usize)> {
+    let (lo, len) = mirrors::cpu_view_part(a, n)?;
     #[cfg(test)]
     tests::SOURCES_GOING.with(|s| s.borrow_mut().push((lo, len, committed_page(lo))));
-    crate::hle::d3d12x::sparse::source_decommitted(lo, len);
+    Some((lo, len))
+}
+
+/// `os` decommits (or, with `release`, releases) pages of `[a, a + n)` (`n == 0`: to the end of
+/// the reservation at `a`) in Windows. Those of a paired CPU view (`mirrors`) may be shown by
+/// tiles of its GPU view, which a submit fills from them and scans with the sparse state's lock
+/// held – that read faults on a page that goes meanwhile. So sparse is told around the call
+/// (`sparse::source_decommit` / `source_release`): the pages are holes for every submit from
+/// before Windows takes them until after, and a submit that asks Windows about them in between
+/// does not take them back. Telling it only before left that gap. Call it with no lock held
+/// that sparse takes (AWAY is fine: AWAY → sparse is the order); `os` runs with no lock of
+/// sparse's held.
+unsafe fn source_going<R>(a: usize, n: usize, release: bool, os: impl FnOnce() -> R) -> R {
+    source_part_going(source_part(a, n), release, os)
+}
+
+/// `source_going` for a part looked up before (`source_part`: a release unpairs the views
+/// before Windows is called, and the part is not found after that).
+unsafe fn source_part_going<R>(part: Option<(usize, usize)>, release: bool, os: impl FnOnce() -> R) -> R {
+    match part {
+        Some((lo, len)) if release => crate::hle::d3d12x::sparse::source_release(lo, len, os),
+        Some((lo, len)) => crate::hle::d3d12x::sparse::source_decommit(lo, len, os),
+        None => os(),
+    }
 }
 
 /// Blocks of the unified memory region go back to it (MEM_RELEASE) or stay (MEM_DECOMMIT
@@ -546,8 +565,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             // pages while they go (the submit thread's copy faulted on them)
             crate::hle::d3d12x::sparse::decommitted(a, n);
             // (the CPU view of a pair may lie here too: tiles of its GPU view show these pages)
-            source_going(a, n);
-            if mem::VirtualFree(addr, n, mem::MEM_DECOMMIT) == 0 {
+            if source_going(a, n, false, || mem::VirtualFree(addr, n, mem::MEM_DECOMMIT)) == 0 {
                 return 0;
             }
         }
@@ -579,7 +597,8 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     }
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.contains(addr as usize)) {
         if t & 0x8000 != 0 {
-            source_going(addr as usize, 0);
+            // (the block stays committed in its window: nothing goes in Windows, the tiles do)
+            source_going(addr as usize, 0, true, || ());
             mirrors::released(addr as usize);
             return u.free(addr as usize) as BOOL;
         }
@@ -591,15 +610,14 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     // a decommit, or a release (of the whole reservation: size 0), of a paired CPU view – the
     // title's CPU view is plain write-watched memory – is told to sparse before Windows does it
     let release = t & mem::MEM_RELEASE != 0;
-    if release != (t & mem::MEM_DECOMMIT != 0) && !(release && size != 0) {
-        source_going(addr as usize, size);
-    }
+    // (looked up before the pair goes: a graphics reservation is unpaired below, before Windows)
+    let part = if release != (t & mem::MEM_DECOMMIT != 0) && !(release && size != 0) { source_part(addr as usize, size) } else { None };
     // a graphics reservation is unpaired before Windows can hand its address out again
     let graphics = t & 0x8000 != 0 && size == 0 && GRAPHICS_RESERVATIONS.lock().unwrap().contains_key(&(addr as usize));
     if graphics {
         mirrors::released(addr as usize);
     }
-    let ok = mem::VirtualFree(addr, size, t);
+    let ok = source_part_going(part, release, || mem::VirtualFree(addr, size, t));
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
         if !graphics {
@@ -1538,8 +1556,7 @@ unsafe fn release_at(at: usize) {
         crate::hle::d3d12x::sparse::decommitted(at, PHYS_PAGE);
     }
     // (most pages are mapped in the CPU view of a pair: the tiles of its GPU view show them)
-    source_going(at, PHYS_PAGE);
-    mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT);
+    source_going(at, PHYS_PAGE, false, || mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT));
 }
 
 /// A page mapped away from home (at `old`) that the title maps at `at`: what `old` holds copied
