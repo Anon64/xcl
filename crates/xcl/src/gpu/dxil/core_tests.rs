@@ -785,6 +785,21 @@ fn loop_counts(dis: &str) -> (usize, usize, Option<(String, Vec<String>, Vec<Str
     (1, subs, Some((cap, at_entry, again)))
 }
 
+/// Whether the count `n` leaves the program at 0: `%z = icmp eq i32 n, 0` drives a `br i1 %z`
+/// whose taken label is the block that returns.
+fn leaves_to_ret(dis: &str, n: &str) -> bool {
+    let name = |l: &str| l.trim().split_once(" = ").map(|(n, _)| n.to_string());
+    let Some(z) = dis.lines().find(|l| l.contains(&format!("= icmp eq i32 {n}, 0"))).and_then(name) else { return false };
+    let br = format!("br i1 {z}, label ");
+    let Some(to) = dis.lines().find_map(|l| l.trim().strip_prefix(br.as_str())).and_then(|r| r.split(',').next()) else { return false };
+    main_blocks(dis).iter().any(|(b, _, text)| b == to && text.contains("ret void"))
+}
+
+/// The count phis of `dis` that take `cap` from block `b`.
+fn count_phis(dis: &str, cap: &str, b: &str) -> Vec<String> {
+    dis.lines().filter(|l| l.contains(" = phi i32 ") && l.contains(&format!("[ {cap}, {b} ]"))).filter_map(|l| l.trim().split_once(" = ").map(|(n, _)| n.to_string())).collect()
+}
+
 /// The direct translator counts each entry of a compute program's loop as the HLSL path does
 /// (`only_compute_programs_with_a_loop_read_the_dispatch_loop_budget`): `IO_LOOP_BUDGET` is
 /// loaded once, every loop has a count besides the lane's budget, and the outer loop's head
@@ -809,12 +824,18 @@ fn direct_compute_loops_count_each_entry() {
         let (loads, subs, counts) = loop_counts(&one);
         let (_, at_entry, again) = counts.unwrap_or_default();
         assert_eq!((loads, subs, at_entry.len(), again.len()), (1, 2, 1, 0), "wave64 {wave64}:\n{one}");
+        assert!(leaves_to_ret(&one, &at_entry[0]), "wave64 {wave64}: a count of 0 in {} ends the program:\n{one}", at_entry[0]);
         // nested: the outer count set at the entry; the inner one set back to `cap` on a path
         // from the outer loop's head, after the outer count was counted down there
         let nested = dis(&endless_loop_entered_three_times()).unwrap();
         let (loads, subs, counts) = loop_counts(&nested);
-        let (_, at_entry, again) = counts.unwrap_or_default();
+        let (cap, at_entry, again) = counts.unwrap_or_default();
         assert_eq!((loads, subs, at_entry.len(), again.len()), (1, 4, 1, 1), "wave64 {wave64}:\n{nested}");
+        let inner = count_phis(&nested, &cap, &again[0]);
+        assert_eq!(inner.len(), 1, "wave64 {wave64}:\n{nested}");
+        for n in [&at_entry[0], &inner[0]] {
+            assert!(leaves_to_ret(&nested, n), "wave64 {wave64}: a count of 0 in {n} ends the program:\n{nested}");
+        }
         let blocks = main_blocks(&nested);
         let mut b = again[0].clone();
         let after_outer_head = loop {
