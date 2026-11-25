@@ -556,6 +556,8 @@ pub fn init() -> Result<String, String> {
     if !device_raw().is_null() {
         return Ok(ADAPTER.lock().map(|a| a.clone()).unwrap_or_default());
     }
+    #[cfg(test)]
+    OPENED.fetch_add(1, Ordering::Relaxed);
     unsafe {
         let cfg = crate::state::config();
         match crate::gpu::agility::state() {
@@ -6000,6 +6002,31 @@ unsafe fn report_dred_lists(head: *const D3D12_AUTO_BREADCRUMB_NODE, mut report:
                 if reported == REPORT_LIMIT { return; }
             }
         }
+    }
+}
+
+/// devices opened (one a process)
+#[cfg(test)]
+static OPENED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    /// Threads that ask at once share one device (each had made one and opened the memory windows
+    /// for it: GPU work on the one with the other's window addresses hung the GPU).
+    #[test]
+    fn threads_that_ask_at_once_get_one_device() {
+        let all = std::sync::Barrier::new(4);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    all.wait();
+                    let _ = init();
+                });
+            }
+        });
+        assert!(OPENED.load(Ordering::Relaxed) <= 1, "{} devices were opened", OPENED.load(Ordering::Relaxed));
     }
 }
 
