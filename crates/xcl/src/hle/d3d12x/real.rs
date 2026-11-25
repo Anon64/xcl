@@ -10834,6 +10834,64 @@ mod depth_uav_twin_tests {
         }
     }
 
+    /// A console depth buffer the title places at an address in unified memory
+    /// (CreatePlacedResourceX) and a stencil UAV of that memory made by address (device #71, on
+    /// XCL's own object there): the buffer is kept under its title address with the state it was
+    /// made in, and the view by address is a view of that buffer's twin. On WARP, in a child
+    /// process.
+    #[test]
+    fn gpu_a_stencil_uav_by_address_is_a_view_of_the_placed_buffers_twin() {
+        if !in_child("gpu_a_stencil_uav_by_address_is_a_view_of_the_placed_buffers_twin") {
+            return;
+        }
+        use super::super::{console_heap, depth_uav, device_x, vram};
+        unsafe {
+            let Some(f) = Fixture::new() else { return };
+            let d = f.dev.as_raw();
+            let Some(va) = crate::gpu::uma::get().and_then(|u| u.alloc(1 << 20, 0x1_0000)) else {
+                crate::gpu::recomp::runner::skip_test("no unified memory for the buffer");
+                return;
+            };
+            let va = va as u64;
+            let console = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let rdesc = &console as *const _ as *const u8;
+            let mut raw = std::ptr::null_mut();
+            let hr = device_x::create_placed_resource_x(
+                d,
+                va,
+                rdesc,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32,
+                std::ptr::null(),
+                &ID3D12Resource::IID as *const _ as *const GUID,
+                &mut raw,
+            );
+            assert!(hr >= 0 && !raw.is_null(), "the placed depth buffer: {hr:#x}");
+            let _placed = ID3D12Resource::from_raw(raw);
+            let at = vram::canonical_va(va as usize);
+            assert_eq!(depth_uav::made_in(raw as usize), Some((Some(D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32), Some(at))), "kept under its title address, made in DEPTH_WRITE");
+
+            // #71: { the PC's UAV desc; the GPU address @0x28 }
+            let mut view = [0u64; 8];
+            std::ptr::write_unaligned(view.as_mut_ptr() as *mut D3D12_UNORDERED_ACCESS_VIEW_DESC, uav(DXGI_FORMAT_X24_TYPELESS_G8_UINT, 1));
+            view[5] = va;
+            dev_create_uav_at_x(d, rdesc, view.as_ptr() as *const u8, f.base);
+            let twin = depth_uav::twin_of(raw as usize).expect("the placed buffer has a stencil twin");
+            let s = console_heap::slot(f.base).unwrap();
+            assert_eq!(console_heap::names_of(&s), (twin, twin), "the view by address names the placed buffer's twin");
+            assert_eq!(depth_uav::made_in(raw as usize).unwrap().0, Some(D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32), "the view's own object (made in COMMON) does not change the buffer's state");
+        }
+    }
+
     /// ClearUnorderedAccessViewUint of console code with the console handles of a stencil UAV
     /// and the depth buffer as its resource: the PC clear goes to the twin the slot's view names,
     /// and the twin reads back the value. On WARP, in a child process.

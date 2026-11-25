@@ -707,6 +707,37 @@ mod tests {
         assert!(!in_cells(&co.key) && cell_of(c).is_none());
     }
 
+    /// The library's tests run with the switch as the process has it (by default as DEFAULT_ON).
+    #[test]
+    fn the_switch_decides_whether_a_buffer_is_kept_and_its_uavs_redirected() {
+        let res = 0x7B20_0000_1000usize;
+        note_created(res as *mut c_void, &desc(3, 64, 64, 45, 1, 6), Some(0x2_2000_0000), 0x10);
+        assert_eq!(kept(res), enabled(), "registered only with the switch on");
+        let rd = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R24G8_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        // (no device: with the switch on the twin cannot be made, it is never a twin here)
+        let why = match unsafe { resolve_uav(std::ptr::null_mut(), res as *mut c_void, Some(&rd), Some(&uav2d(DXGI_FORMAT_X24_TYPELESS_G8_UINT, 1))) } {
+            Resolve::Null(why) => Some(why),
+            Resolve::Twin(..) | Resolve::NotOurs => None,
+        };
+        if enabled() {
+            assert_eq!(why, Some("the twin could not be made"));
+        } else {
+            assert_eq!(why, Some("XCL_DEPTH_UAV_TWIN is off"), "off: a null view, as before the twins");
+        }
+        forget(res);
+        assert!(!kept(res));
+    }
+
     #[test]
     fn the_state_a_buffer_was_made_in_is_that_of_the_titles_object() {
         let (view, title, at) = (0x7B10_0000_1000usize, 0x7B10_0000_2000usize, 0x2_1000_0000usize);
