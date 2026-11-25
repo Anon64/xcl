@@ -29,6 +29,8 @@ enum Dead {
     Resource(usize),
     /// a pipeline state XCL owns (`hold_pipeline`)
     Pipeline(usize),
+    /// a heap XCL owns (`hold_heap`)
+    Heap(usize),
 }
 
 struct Batch {
@@ -185,6 +187,19 @@ pub fn hold_pipeline(p: usize) {
     start_thread();
 }
 
+/// A heap XCL owns that reserved resources mapped tiles of (`vram`'s page pools) is let go: a
+/// resource the title released maps them until it goes here, and work queued before still reads
+/// them – with the heap gone under that work the GPU faults. So it goes as such a resource does,
+/// and not before those held earlier: once every queue is past a fence value signalled after this.
+/// `XCL_LATE_RELEASE=0`: now.
+pub fn hold_heap(heap: ID3D12Heap) {
+    if !enabled() {
+        return drop(heap);
+    }
+    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(Dead::Heap(heap.into_raw() as usize));
+    start_thread();
+}
+
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
@@ -210,6 +225,10 @@ pub unsafe fn drain_known(seal_now: bool) {
             Dead::Resource(res) => res,
             Dead::Pipeline(p) => {
                 super::pso_async::release(p);
+                continue;
+            }
+            Dead::Heap(h) => {
+                drop(ID3D12Heap::from_raw(h as *mut c_void));
                 continue;
             }
         };
