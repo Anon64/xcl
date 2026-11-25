@@ -655,7 +655,22 @@ impl Lw {
             self.s.try_finish_graphics(g.io, info)
         } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
             self.s.m.optimize();
-            dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
+            // A single split wave64 meets its other half through group-shared counters its entry
+            // zeroes (`Partner::Spin`), and the exchange's running number counts from the
+            // program's start: a later piece of a chain, a new dispatch, would wait for counts
+            // its own counters never reach. Such a program stays whole.
+            if split_tid.is_some() && self.partner == Partner::Spin {
+                let size: usize = (0..self.s.m.block_count()).map(|b| self.s.m.block_insts(Block(b as u32)).len()).sum();
+                if size > limit {
+                    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 4 || n.is_power_of_two() {
+                        crate::xlog_info!("compute split: a split wave64 compute program of {size} instructions stays whole: its halves exchange through group-shared counters a later dispatch would start again at zero ({} so far)", n + 1);
+                    }
+                }
+            } else {
+                dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
+            }
             self.s.finish_optimized(numthreads, Some(hw))
         } else {
             self.s.try_finish(numthreads, Some(hw))
@@ -713,6 +728,45 @@ fn dispatch_chain_native_wave64_builds_whole() {
     let expected: Vec<_> = initial.iter().map(|v| v + 40 * 64).collect();
     let result = runner::dispatch(&program.dxil, [1, 1, 1], &[], &initial).unwrap();
     assert_eq!(result, expected);
+}
+
+/// A single split wave64 of a compute group meets its other half through group-shared counters
+/// its entry zeroes (`Partner::Spin`): its program stays whole above the piece limit too.
+#[cfg(test)]
+#[test]
+fn a_split_wave64_compute_program_stays_whole() {
+    let threads = [64, 1, 1];
+    let cs = CsInterface { threads, ..Default::default() };
+    let options = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+    assert!(lw.partner == Partner::Spin);
+    let (tid, _) = lw.setup_lanes_compute(threads, false);
+    let offset = lw.shlc(tid, 2);
+    let mem = lw.mems[0];
+    let half = lw.half;
+    let early = lw.exchange(half);
+    // conditional updates: blocks the optimiser cannot merge into one (their edges go to the
+    // SSA too: the spin exchange reads its running number through it)
+    for _ in 0..40 {
+        let update = lw.block(Some(1));
+        let join = lw.block(Some(2));
+        let taken = lw.cmpc(Pred::ULt, tid, 48);
+        lw.cond_br(taken, update, join);
+        lw.s.m.set_block(update);
+        let old = lw.s.raw_load(mem, offset, 1)[0];
+        let new = lw.add(old, early);
+        lw.s.raw_store(mem, offset, &[new]);
+        lw.br(join);
+        lw.s.m.set_block(join);
+    }
+    let late = lw.exchange(tid);
+    lw.s.raw_store(mem, offset, &[late]);
+    lw.s.m.ret();
+    lw.s.m.optimize();
+    assert!(lw.s.m.dispatch_plan(64).is_some(), "the program could be cut");
+    let program = lw.finish_dispatch(threads, 32, 64, Some(tid)).unwrap();
+    assert!(program.dispatch_chain.is_none());
+    super::validate::validate(&program.dxil).expect("valid split wave64 whole shader");
 }
 
 /// The kernel's epilogue: SGPRs and SCC from lane 0, every touched VGPR per lane.

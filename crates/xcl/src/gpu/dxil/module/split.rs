@@ -698,11 +698,10 @@ mod tests {
         assert!(m.dispatch_plan(4).is_none());
     }
 
+    /// 64 threads: a single split wave64, whose halves exchange through group-shared counters
+    /// its entry zeroes (`Partner::Spin`). A later piece would start them again at zero while
+    /// the exchange's running number counts from the program's start, so it stays whole.
     fn compare(threads: u32, extra_adds: u32) {
-        if !runner::wave32_supported().unwrap_or(false) {
-            runner::skip_test("no wave32 GPU");
-            return;
-        }
         let geometry = [threads, 1, 1];
         let split = threads == 64;
         let cs = CsInterface { threads: geometry, ..Default::default() };
@@ -735,9 +734,11 @@ mod tests {
         let mut large_loop = None;
         for round in 1..=16 {
             let pred = lw.cur();
-            let body = lw.s.m.new_block();
-            let exit = lw.s.m.new_block();
-            lw.s.m.br(body);
+            // (the edges go to the translator's SSA too: the spin exchange of 64 threads reads
+            // its running number through it)
+            let body = lw.block(Some(2));
+            let exit = lw.block(Some(1));
+            lw.br(body);
             lw.s.m.set_block(body);
             let counter = lw.s.m.phi(i32);
             let acc = lw.s.m.phi(i32);
@@ -753,7 +754,7 @@ mod tests {
             lw.s.m.add_incoming(counter, next, body);
             lw.s.m.add_incoming(acc, value, body);
             let again = lw.cmp(Pred::ULt, next, trips);
-            lw.s.m.cond_br(again, body, exit);
+            lw.cond_br(again, body, exit);
             lw.s.m.set_block(exit);
             if split && round == 8 {
                 let other_half = lw.exchange(lw.half);
@@ -777,8 +778,18 @@ mod tests {
         let chain = lw.s.split_compute(geometry, split.then_some(tid), 40);
         let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
         crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");
-        let chain = chain.expect("split the synthetic program");
-        assert!(chain.pieces.len() >= 3);
+        let chain = if split {
+            assert!(chain.is_none(), "a split wave64 that exchanges through counters stays whole");
+            None
+        } else {
+            let chain = chain.expect("split the synthetic program");
+            assert!(chain.pieces.len() >= 3);
+            Some(chain)
+        };
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
         let initial: Vec<_> = (1..=threads * 3).collect();
         let expected: Vec<_> = initial.iter().enumerate().map(|(i, &v)| {
             let n = (i as u32 % 4) + 1;
@@ -786,8 +797,10 @@ mod tests {
         }).collect();
         let reference = runner::dispatch(&whole, [3, 1, 1], &[], &initial).unwrap();
         assert_eq!(reference, expected);
-        let result = runner::dispatch_split(&chain, [3, 1, 1], &initial).unwrap();
-        assert_eq!(result, reference);
+        if let Some(chain) = chain {
+            let result = runner::dispatch_split(&chain, [3, 1, 1], &initial).unwrap();
+            assert_eq!(result, reference);
+        }
     }
 
     fn check_persistent_payload(reuse_hole: bool) {
@@ -919,7 +932,7 @@ mod tests {
     #[test]
     fn dispatch_chain_wave32_live_loops() { compare(32, 0); }
 
-    /// A guest wave64 split across two hardware wave32s.
+    /// A guest wave64 split across two hardware wave32s (it stays whole: `compare`).
     #[test]
     fn dispatch_chain_wave64_live_loops_and_exchange() { compare(64, 0); }
     #[test]
@@ -929,14 +942,16 @@ mod tests {
     }
 
     /// Early exits and forward skips retain their own continuation tags; group
-    /// indexing must keep every lane separate across all three dispatch axes.
+    /// indexing must keep every lane separate across all three dispatch axes. A split wave64
+    /// (64 threads) stays whole (`compare`).
     #[test]
     fn dispatch_chain_divergent_forward_edges_3d() {
-        if !runner::wave32_supported().unwrap_or(false) {
+        let gpu = runner::wave32_supported().unwrap_or(false);
+        if gpu {
+            println!("CHAIN_GPU={}", runner::adapter().unwrap());
+        } else {
             runner::skip_test("no wave32 GPU");
-            return;
         }
-        println!("CHAIN_GPU={}", runner::adapter().unwrap());
         for threads in [32, 64] {
             let geometry = [threads, 1, 1];
             let split = threads == 64;
@@ -1023,10 +1038,20 @@ mod tests {
             let plan = lw.s.m.dispatch_plan(64).expect("partition branch fixture");
             let stage = |b| plan.blocks.iter().position(|blocks| blocks.contains(&b)).unwrap();
             assert!(plan.edges.iter().any(|edge| stage(edge.to) > stage(edge.from) + 1), "exercise a forward skip over an intermediate piece");
-            let chain = lw.s.split_compute(geometry, split.then_some(tid), 64).expect("split branch fixture");
-            assert!(chain.pieces.len() >= 3);
+            let chain = lw.s.split_compute(geometry, split.then_some(tid), 64);
+            let chain = if split {
+                assert!(chain.is_none(), "a split wave64 that exchanges through counters stays whole");
+                None
+            } else {
+                let chain = chain.expect("split branch fixture");
+                assert!(chain.pieces.len() >= 3);
+                Some(chain)
+            };
             let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
             crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");
+            if !gpu {
+                continue;
+            }
             let words = (threads * 12) as usize;
             let initial: Vec<_> = (0..words + 16).map(|i| if i < words { i as u32 + 17 } else { 0xdeadbeef }).collect();
             let expected: Vec<_> = initial.iter().enumerate().map(|(i, &v)| {
@@ -1040,9 +1065,11 @@ mod tests {
             }).collect();
             let reference = runner::dispatch(&whole, [2, 3, 2], &[], &initial).unwrap();
             assert_eq!(reference, expected, "unsplit {threads}");
-            let result = runner::dispatch_split(&chain, [2, 3, 2], &initial).unwrap();
-            assert_eq!(result, expected, "split {threads}");
-            println!("CHAIN_BRANCH threads={threads} pieces={} scratch_words_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
+            if let Some(chain) = chain {
+                let result = runner::dispatch_split(&chain, [2, 3, 2], &initial).unwrap();
+                assert_eq!(result, expected, "split {threads}");
+                println!("CHAIN_BRANCH threads={threads} pieces={} scratch_words_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
+            }
         }
     }
 
