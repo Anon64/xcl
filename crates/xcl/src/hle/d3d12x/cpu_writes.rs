@@ -115,6 +115,7 @@ unsafe fn write_now(va: usize, words: &[u32]) {
 /// where its own pages are.
 unsafe fn write_now_in(va: usize, words: &[u32], run: &dyn Fn(usize, usize) -> Option<usize>) {
     let bytes = 4 * words.len();
+    let asked = va;
     let Some(va) = run(va, bytes) else {
         let first = ((va | 0xFFFF) - va + 1).div_ceil(4);
         if first < words.len() {
@@ -135,6 +136,19 @@ unsafe fn write_now_in(va: usize, words: &[u32], run: &dyn Fn(usize, usize) -> O
     }
     for (i, &w) in words.iter().enumerate() {
         (*((va + 4 * i) as *const AtomicU32)).store(w, Ordering::Release);
+    }
+    note_placed(asked, va, bytes);
+}
+
+/// A write for the GPU at `va` was made at `at`, where XCL keeps the page the queue's page
+/// mappings put at `va` (`kernelx::mirrors`): it is told as XCL's own write there
+/// (`title_textures::note_known_write`) – that place may be a home, which is not write-watched,
+/// and the tiles and textures that show the page would not see it. One atomic load while nothing
+/// is mapped.
+fn note_placed(va: usize, at: usize, bytes: usize) {
+    use crate::hle::kernelx::mirrors::{any_mapped, shows, Shows};
+    if at != va && any_mapped() && matches!(shows(va), Shows::Page { .. }) {
+        super::title_textures::note_known_write(at, bytes);
     }
 }
 
@@ -159,9 +173,10 @@ unsafe fn u64_writable_now(va: usize) -> bool {
 
 /// An 8-byte aligned 64-bit value at `va`, if the memory is still there and writable.
 unsafe fn write_u64_now(va: usize, value: u64) {
-    let va = cpu_at(va);
+    let (asked, va) = (va, cpu_at(va));
     if u64_writable_now(va) {
         (*(va as *const AtomicU64)).store(value, Ordering::Release);
+        note_placed(asked, va, 8);
     }
 }
 
@@ -170,9 +185,10 @@ unsafe fn write_u64_now(va: usize, value: u64) {
 /// before the atomic write (same TOCTOU trade-off as `write_u64_now`: a concurrent title decommit
 /// between check and store is unguarded).
 pub(super) unsafe fn max_u64_now(va: usize, value: u64) {
-    let va = cpu_at(va);
+    let (asked, va) = (va, cpu_at(va));
     if u64_writable_now(va) {
         (*(va as *const AtomicU64)).fetch_max(value, Ordering::AcqRel);
+        note_placed(asked, va, 8);
     }
 }
 
@@ -297,6 +313,50 @@ mod tests {
             write_now_in(g + PAGE + 4, &[6, 7], &run);
             assert_eq!(two[..4], [3, 6, 7, 0]);
             assert_eq!(calls.get(), 4, "inside one page: one piece");
+        }
+    }
+
+    /// A write for the GPU into a GPU-view page the queue's page mappings named is made where its
+    /// page is kept – here its home, which is not write-watched – and told as XCL's own write
+    /// there; one into a page never named is made at the CPU view, as before, and not told.
+    #[test]
+    fn a_write_where_a_mapped_page_is_kept_is_a_known_write() {
+        use crate::hle::kernelx::{self, mirrors::{self, PAGE}};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return crate::gpu::recomp::runner::skip_test("no unified memory");
+            }
+            // a pair of views of a size of the test's own, and a physical page at its home: the pool
+            let size = 211 * PAGE;
+            let cpu = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let gpu = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(cpu != 0 && gpu != 0);
+            mirrors::reserved(cpu, size, 0x2040_2000, 0x04);
+            assert!(mirrors::reserved(gpu, size, 0x2040_2000, 0x801));
+            let (mut n, mut pages) = (1usize, [0usize; 1]);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let home = kernelx::MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 4, pages.as_mut_ptr()) as usize;
+            assert_ne!(home, 0);
+            // pool page 0 at view page 1
+            let ranges: [[u32; 3]; 1] = [[0, 0, 1]];
+            let batch = [(gpu + PAGE) as u64, 1, ranges.as_ptr() as u64];
+            assert!(mirrors::apply_batches(1, batch.as_ptr() as usize, home, 1).is_some());
+            let run = |a: usize, n: usize| super::super::view_want::cpu_run(a as u64, n as u64).map(|c| c as usize);
+            let known = |at: usize| super::super::title_textures::known_in(at, PAGE);
+            write_now_in(gpu + PAGE + 0x40, &[1, 2], &run);
+            assert_eq!(*((home + 0x40) as *const [u32; 2]), [1, 2]);
+            assert_eq!(known(home), vec![(home + 0x40, 8)]);
+            // a page never named: the CPU view, write-watched as the title's
+            assert_eq!(VirtualAlloc(cpu as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, cpu);
+            write_now_in(gpu + 0x40, &[3], &run);
+            assert_eq!(*((cpu + 0x40) as *const u32), 3);
+            assert!(known(cpu).is_empty());
+            super::super::title_textures::forget_known_in(home, PAGE);
+            kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr());
+            mirrors::released(cpu);
+            VirtualFree(cpu as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
         }
     }
 
