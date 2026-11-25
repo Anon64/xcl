@@ -8917,6 +8917,118 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     }
 }
 
+/// `XCL_SAMPLE_BARRIER=<folder>` (a title's dumped shaders, `<data>\shaders`, or a part of them;
+/// `XCL_DIRECT_DXIL=1` as its runs have it): every compute and mesh program there with
+/// `s_barrier` in a thread group of several 32-lane hardware waves is refused by the direct
+/// translator for that reason, and translates completely on the HLSL path with 16 memory windows
+/// from the descriptor heap in the split form, which DXC compiles. The direct translator leaves
+/// those programs to the HLSL path's bounded barrier (`dxil::lower`'s s_barrier): one the HLSL
+/// path could not translate would lose its draws or dispatches altogether.
+#[test]
+#[ignore]
+fn programs_left_to_the_hlsl_path_for_their_barrier_translate_and_compile() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let Some(dir) = std::env::var_os("XCL_SAMPLE_BARRIER") else { return };
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut todo = vec![std::path::PathBuf::from(dir)];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else if p.extension().is_some_and(|x| x == "bin") && !p.to_string_lossy().contains(".fssm") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    const REFUSAL: &str = "s_barrier in a group of several hardware waves";
+    let windows = super::HEAP_WINDOWS | 16;
+    let next = AtomicUsize::new(0);
+    // programs with the barrier in a group of several waves, of them refused by the direct
+    // translator for it, complete on the HLSL path, compiled by DXC
+    let (n, refused, complete, compiled) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..super::dxc::compile_threads() {
+            s.spawn(|| loop {
+                let Some(path) = files.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                let blob = std::fs::read(path).unwrap();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+                for f in &sh.fssm {
+                    let Some(mode) = super::interface(&blob, &sh, f) else { continue };
+                    let threads = match &mode {
+                        Mode::Compute(cs) => cs.threads.iter().product::<u32>(),
+                        Mode::Mesh(ms) => ms.threads,
+                        _ => continue,
+                    };
+                    let Some(p) = f.programs.first() else { continue };
+                    let code = &f.data[p.offset..p.offset + p.len];
+                    let has_barrier = {
+                        let mut off = 0;
+                        let mut found = false;
+                        while off + 4 <= code.len() {
+                            let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { break };
+                            found |= d.inst.name == "S_BARRIER";
+                            off += d.len;
+                        }
+                        found
+                    };
+                    if !has_barrier || threads <= 32 {
+                        continue;
+                    }
+                    n.fetch_add(1, Ordering::Relaxed);
+                    let wave64 = super::detect_wave64(code);
+                    let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64, mem_windows: windows, sampler_base: 0 };
+                    let direct = match &mode {
+                        Mode::Compute(cs) => crate::gpu::dxil::kernel::translate_compute(code, o, cs).map(|_| ()),
+                        Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).map(|_| ()),
+                        _ => unreachable!(),
+                    };
+                    match direct {
+                        Err(e) if e.contains(REFUSAL) => {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => failures.lock().unwrap().push(format!("{name}: the direct translator fails otherwise: {}", e.lines().next().unwrap_or(""))),
+                        Ok(()) => failures.lock().unwrap().push(format!("{name}: the direct translator took it ({threads} threads)")),
+                    }
+                    let opt = Options { mode: mode.clone(), wave64, split_wave64: true, mem_windows: windows, ..Default::default() };
+                    let t = match translate(code, &opt) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            failures.lock().unwrap().push(format!("{name}: HLSL path: {e}"));
+                            continue;
+                        }
+                    };
+                    if !t.complete() {
+                        failures.lock().unwrap().push(format!("{name}: HLSL path incomplete: {:?} {:?}", t.unsupported, t.unsupported_why));
+                        continue;
+                    }
+                    complete.fetch_add(1, Ordering::Relaxed);
+                    if !t.hlsl.contains("xcl_s_barrier();") {
+                        failures.lock().unwrap().push(format!("{name}: the HLSL has no bounded barrier"));
+                    }
+                    match super::dxc::compile_cached(&t.hlsl, "main", "cs_6_6") {
+                        Ok(_) => {
+                            compiled.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => failures.lock().unwrap().push(format!("{name}: DXC: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or("")))),
+                    }
+                }
+            });
+        }
+    });
+    let (n, refused, complete, compiled) = (n.into_inner(), refused.into_inner(), complete.into_inner(), compiled.into_inner());
+    let failures = failures.into_inner().unwrap();
+    println!("barrier programs in groups of several waves: {n}; refused by the direct translator for the barrier: {refused}; complete on the HLSL path: {complete}; compiled: {compiled}");
+    for f in failures.iter().take(40) {
+        println!("  {f}");
+    }
+    assert!(failures.is_empty(), "{} of {n} programs", failures.len());
+}
+
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
 /// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
 #[test]
