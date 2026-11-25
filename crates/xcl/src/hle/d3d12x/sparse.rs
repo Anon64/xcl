@@ -1719,7 +1719,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
 
 /// The PC `ExecuteCommandLists` of `queue` for `list` (an adopted title queue's own method,
 /// not XCL's hook: this is not a submit of the title's).
-unsafe fn pc_execute(queue: &ID3D12CommandQueue, list: &ID3D12GraphicsCommandList) {
+pub(super) unsafe fn pc_execute(queue: &ID3D12CommandQueue, list: &ID3D12GraphicsCommandList) {
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     const SLOT: usize = 10;
     let q = queue.as_raw();

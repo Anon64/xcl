@@ -2823,12 +2823,18 @@ macro_rules! creator {
                     crate::xlog_info!("D3D12.X: {} for interface {asked} (not on the PC) – made as {}", $method, super::layout::guid_string(&iid));
                 }
             }
-            if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+            if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !is_own_object($kind) {
                 adopt(*ppv, $kind);
             }
             hr
         }
     };
+}
+
+/// XCL's own lists, allocators and buffers (made in `title_textures::own_work`) stay the PC's: the
+/// title never sees them, and what a hook does for a title's object is paid on its submit.
+fn is_own_object(kind: Kind) -> bool {
+    matches!(kind, Kind::CommandList | Kind::CommandAllocator | Kind::Resource) && super::title_textures::is_own_work()
 }
 
 creator!(dev_create_command_queue, "CreateCommandQueue", Kind::CommandQueue, [a1]);
@@ -5755,10 +5761,12 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
 pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
     const PC_GET_COMPLETED_VALUE: usize = 8;
     let p = fence.as_raw();
-    let f: unsafe extern "system" fn(*mut c_void) -> u64 = if is_adopted(p) {
-        std::mem::transmute(orig_fn(p, slot_of(p, "GetCompletedValue")))
+    // (a fence XCL holds a reference to: no need to ask Windows whether it can be read, as
+    // `is_adopted` does)
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = if is_ext(vt(p) as usize) {
+        std::mem::transmute(orig_fn(p, PC_GET_COMPLETED_VALUE))
     } else {
-        std::mem::transmute(*(*(p as *const *const usize)).add(PC_GET_COMPLETED_VALUE))
+        std::mem::transmute(*vt(p).add(PC_GET_COMPLETED_VALUE))
     };
     f(p)
 }

@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
+use super::texture_upload;
 use crate::gpu::texture::{self, Subresource};
 use crate::hle::xg;
 
@@ -39,8 +40,18 @@ extern "system" {
     fn ResetWriteWatch(base: *const c_void, size: usize) -> u32;
 }
 
-/// (device, address its bytes are read from, layout, states) of an upload
-type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
+/// A texture whose upload is due, or whose memory was written: a reference while that is seen to.
+struct Due {
+    res: ID3D12Resource,
+    device: usize,
+    /// where its bytes are read
+    src: usize,
+    tex: Arc<xg::Texture>,
+    states: Vec<D3D12_RESOURCE_STATES>,
+    known: texture_upload::Known,
+    /// all of it goes up, whatever was written
+    whole: bool,
+}
 
 struct Entry {
     device: usize,
@@ -68,6 +79,8 @@ struct Entry {
     unmapped: bool,
     /// monotonic registration order (newest wins when uncovering shadowed textures)
     seq: u64,
+    /// what its pages held at its last upload
+    known: texture_upload::Known,
 }
 
 /// textures waiting for their first upload
@@ -340,6 +353,8 @@ impl Table {
             }
             self.shadowed_by_va.remove(&(sva, sres));
             if let Some(mut e) = self.shadowed.remove(&sres) {
+                // (the one that lay over it may have been uploaded over the same video memory)
+                texture_upload::forget(&e.known);
                 if e.unmapped {
                     e.unmapped = false;
                     to_remap.push(sres);
@@ -412,8 +427,6 @@ pub fn counts() -> (usize, u64) {
 
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
-    // (a new texture object, or the address of an old one again: its first upload is not left out)
-    LAST_CONTENT.lock().unwrap().remove(&(res as usize));
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
@@ -469,6 +482,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         placed: super::vram::is_placed_texture(res as usize),
         unmapped: false,
         seq: 0,
+        known: Default::default(),
     };
     let (hot_src, hot_bytes) = (e.src, e.tex.size() as usize);
     let to_unmap = {
@@ -633,7 +647,6 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
 
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
-    LAST_CONTENT.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
         let (removed, delta, remap_ptrs) = t.remove(res);
@@ -1201,6 +1214,13 @@ fn note_dirty_regions(u: &crate::gpu::uma::Uma) {
 }
 
 unsafe fn refresh_once(queue: *mut c_void, look: bool) {
+    refresh_parts(queue, look);
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+        wait_for_own_uploads(q);
+    }
+}
+
+unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
@@ -1288,7 +1308,7 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) {
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
-    let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
+    let todo: Vec<Due> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
         let mut names = t.touched_by(&dirty);
@@ -1304,62 +1324,42 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) {
                 if !wanted {
                     return None;
                 }
+                let whole = e.pending;
                 if e.pending {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| Due { res: r.clone(), device: e.device, src: e.src, tex: Arc::clone(&e.tex), states: e.states.clone(), known: Arc::clone(&e.known), whole })
             })
             .collect()
     });
     let t_tex = std::time::Instant::now();
-    upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
+    DIRTY_BUF.with(|dcell| upload_all(todo, &dcell.borrow(), page as usize, ID3D12CommandQueue::from_raw_borrowed(&queue)));
     super::submit_cost::textures(t_tex.elapsed());
 }
 
-/// texture → `content_hash` of its memory at its last upload
-static LAST_CONTENT: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 static UNCHANGED: AtomicU64 = AtomicU64::new(0);
 
-/// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads a texture whenever its pages were written, as before.
+/// `XCL_TEXTURE_PARTS=0`: a texture that changed goes up as a whole.
+fn upload_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TEXTURE_PARTS").map_or(true, |v| v.trim() != "0"))
+}
+
+/// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads what was written without comparing it.
 fn unchanged_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
 }
 
-/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
-/// content from here on (the caller uploads it when this is false).
-fn same_as_last_upload(res: usize, h: u64) -> bool {
-    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
-}
-
-/// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
-/// 8-byte words: gigabytes a second; not for anything adversarial).
-fn content_hash(b: &[u8]) -> u64 {
-    const K: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut h = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
-    let mut chunks = b.chunks_exact(32);
-    for c in &mut chunks {
-        for (k, lane) in h.iter_mut().enumerate() {
-            let v = u64::from_le_bytes(c[k * 8..k * 8 + 8].try_into().unwrap());
-            *lane = (*lane ^ v).wrapping_mul(K).rotate_left(29);
-        }
-    }
-    let mut tail = b.len() as u64;
-    for (k, &x) in chunks.remainder().iter().enumerate() {
-        tail = (tail ^ ((x as u64) << (8 * (k % 8)))).wrapping_mul(K).rotate_left(23);
-    }
-    h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
-}
-
-/// staging bytes of one batch at most
+/// bytes of the textures in one batch at most
 const BATCH_BYTES: usize = 256 << 20;
 
 struct QueueUploads {
     fence: ID3D12Fence,
     value: u64,
-    in_flight: std::collections::VecDeque<(u64, texture::InFlight)>,
+    in_flight: std::collections::VecDeque<(u64, texture_upload::Job)>,
     bytes: u64,
 }
 
@@ -1367,7 +1367,10 @@ unsafe impl Send for QueueUploads {}
 
 static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
 
+/// upload buffers the GPU has not read yet, before a submit waits for it: a moment past the first,
+/// in earnest past the second (a title's queue can stand at a wait that another submit ends)
 const IN_FLIGHT_BYTES: u64 = 512 << 20;
+const IN_FLIGHT_MAX: u64 = 2 << 30;
 
 unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>) -> Option<ID3D12CommandQueue> {
     let q = title?;
@@ -1380,24 +1383,22 @@ unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>
 }
 
 unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) {
-    let done = q.fence.GetCompletedValue();
-    while q.in_flight.front().is_some_and(|&(v, _)| v <= done) {
-        let (_, f) = q.in_flight.pop_front().unwrap();
-        q.bytes -= f.bytes;
-    }
-    while q.bytes > cap {
-        let Some(&(v, _)) = q.in_flight.front() else { break };
-        if crate::gpu::fence::wait(&q.fence, v, dev, None, wait_ms).is_err() {
+    let done = super::real::fence_completed(&q.fence);
+    while let Some((v, job)) = q.in_flight.pop_front() {
+        if v > done && (q.bytes <= cap || crate::gpu::fence::wait(&q.fence, v, dev, None, wait_ms).is_err()) {
+            q.in_flight.push_front((v, job));
             break;
         }
-        let (_, f) = q.in_flight.pop_front().unwrap();
-        q.bytes -= f.bytes;
+        q.bytes -= job.bytes;
+        texture_upload::give_back(job);
     }
 }
 
-unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, batch: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
-    let (failed, f) = texture::submit_batch(dev, queue, batch)?;
-    let Some(f) = f else { return Ok(failed) };
+/// Upload `items` on `queue`, a DIRECT one: the ones that could not be, the bytes of the others and
+/// the value the queue signals its uploads' fence with behind them (0: there were none).
+unsafe fn submit_on(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[texture_upload::Item]) -> Result<(Vec<(usize, String)>, u64, u64), String> {
+    let (failed, f, bytes) = texture_upload::submit(dev, queue, items)?;
+    let Some(f) = f else { return Ok((failed, 0, 0)) };
     let mut g = ON_QUEUE.lock().unwrap();
     let key = queue.as_raw() as usize;
     if !g.contains_key(&key) {
@@ -1423,95 +1424,120 @@ unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, 
     q.bytes += f.bytes;
     let v = q.value;
     q.in_flight.push_back((v, f));
-    reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
-    Ok(failed)
+    reclaim(dev, q, IN_FLIGHT_BYTES, 20);
+    reclaim(dev, q, IN_FLIGHT_MAX, 10_000);
+    Ok((failed, bytes, v))
 }
 
-/// The uploads `todo`, in batches of up to `BATCH_BYTES` (one list and one wait each).
-unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12CommandQueue>) {
+/// The uploads on XCL's own queue (its fence, the last value): each of the title's queues waits for
+/// them before its next lists (on the GPU; that queue waits for nothing of the title's).
+static OWN_UPLOADS: Mutex<Option<(ID3D12Fence, u64)>> = Mutex::new(None);
+/// title queue → the value it waited for last
+static OWN_WAITED: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+
+unsafe fn wait_for_own_uploads(queue: &ID3D12CommandQueue) {
+    let Some((fence, v)) = OWN_UPLOADS.lock().unwrap().clone() else { return };
+    let key = queue.as_raw() as usize;
+    let mut g = OWN_WAITED.lock().unwrap();
+    if g.get(&key).is_some_and(|&w| w >= v) {
+        return;
+    }
+    if super::real::fence_completed(&fence) < v && queue.Wait(&fence, v).is_ok() {
+        super::list_x::note_internal_wait(key, "texture uploads", &fence, v);
+    }
+    g.insert(key, v);
+}
+
+/// What changed of the textures `todo` (written pages: `dirty`, sorted) goes up, in batches of up to
+/// `BATCH_BYTES` (one list each).
+unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option<&ID3D12CommandQueue>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("title texture: upload failed: {e}");
         }
     };
-    let mut todo = todo.into_iter().peekable();
+    // The written pages that hold what they held at their texture's last upload are nothing to do:
+    // the write watch is per page and a title writes next to its textures (and rewrites what it
+    // wrote).
+    let t = std::time::Instant::now();
+    let mut changes: std::collections::VecDeque<texture_upload::Change> = {
+        let written: Vec<texture_upload::Written> = todo
+            .iter()
+            .filter(|d| !d.whole)
+            .map(|d| {
+                let size = d.tex.size() as usize;
+                let (from, to) = (dirty.partition_point(|&p| p + page <= d.src), dirty.partition_point(|&p| p < d.src + size));
+                texture_upload::Written { src: d.src, size, dirty: &dirty[from..to.max(from)], known: &d.known }
+            })
+            .collect();
+        let (changes, compared) = texture_upload::changed(&written, unchanged_skip());
+        let same = changes.iter().filter(|c| **c == texture_upload::Change::None).count() as u64;
+        let before = UNCHANGED.fetch_add(same, Ordering::Relaxed);
+        if same > 0 && (before == 0 || (before >= 512 && before.ilog2() != (before + same).ilog2())) {
+            crate::xlog_info!("title textures: {} uploads left out so far – the texture's memory held what it held at its last upload", before + same);
+        }
+        super::submit_cost::textures_compared(written.len(), same as usize, compared, t.elapsed());
+        changes.into()
+    };
+    let mut todo = todo.into_iter().filter_map(|d| {
+        let changed = match if d.whole { texture_upload::Change::All } else { changes.pop_front()? } {
+            texture_upload::Change::None => return None,
+            texture_upload::Change::All => None,
+            texture_upload::Change::Parts(_) if !upload_parts() => None,
+            texture_upload::Change::Parts(p) => Some(p),
+        };
+        let bytes = changed.as_ref().map_or(d.tex.size() as usize, |p| p.iter().map(|r| r.1 - r.0).sum());
+        Some((d, changed, bytes))
+    }).peekable();
     while todo.peek().is_some() {
-        let mut picked = Vec::new();
-        let mut bytes = 0usize;
-        let mut device = 0usize;
-        while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !picked.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
-                break;
+        let (mut items, mut known) = (Vec::new(), Vec::new());
+        let (mut bytes, mut device) = (0usize, 0usize);
+        while let Some((d, changed, n)) = todo.next_if(|(d, _, n)| items.is_empty() || (bytes + n <= BATCH_BYTES && d.device == device)) {
+            device = d.device;
+            bytes += n;
+            if changed.is_none() {
+                // (before its bytes are read: what is written from here on is compared)
+                texture_upload::all_sent(&d.known, d.src, d.tex.size() as usize);
             }
-            let (r, (dev, va, tex, states)) = todo.next().unwrap();
-            // The same bytes as at this texture's last upload: nothing to do. The write watch is
-            // per page and a title writes next to its textures (and rewrites what it wrote): a
-            // retail title's video planes and UI targets went up again for every submit, ~25 MB
-            // a presented frame where ~3 MB had changed, and the submits waited here.
-            if unchanged_skip() {
-                let t = std::time::Instant::now();
-                let h = content_hash(&title_bytes(va, tex.size() as usize));
-                let same = same_as_last_upload(r.as_raw() as usize, h);
-                super::submit_cost::texture_compared(tex.size() as usize, same, t.elapsed());
-                if same {
-                    let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n == 1 || (n.is_power_of_two() && n >= 1024) {
-                        crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
-                    }
-                    continue;
-                }
-            }
-            device = dev;
-            bytes += tex.size() as usize;
-            picked.push((r, va, tex, states));
-        }
-        let t_detile = std::time::Instant::now();
-        let subs = subresources_of_all(&picked, bytes);
-        let detile = t_detile.elapsed();
-        let mut batch = Vec::with_capacity(picked.len());
-        for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
-                note_content(va, &r, &subs);
+                note_content(d.src, &d.res, &subresources(d.src, &d.tex));
             }
-            batch.push((r, subs, states));
+            items.push(texture_upload::Item { res: d.res, src: d.src, tex: d.tex, states: d.states, changed });
+            known.push(d.known);
         }
-        let d = device as *mut c_void;
-        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        let p = device as *mut c_void;
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&p) else { continue };
         let t_submit = std::time::Instant::now();
-        if let Some(tq) = title_queue_for(dev, title) {
-            match own_work(|| submit_on_title_queue(dev, &tq, &batch)) {
-                Ok(failed) => {
-                    for (_, e) in failed {
-                        warn(&e);
-                    }
-                    UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        let done = own_work(|| match title_queue_for(dev, title) {
+            Some(q) => submit_on(dev, &q, &items),
+            // not from a compute or copy queue: on XCL's own, which the title's queues wait for
+            None => {
+                let queue = upload_queue(dev, device)?;
+                super::vram::before_execute(&queue);
+                let r = submit_on(dev, &queue, &items)?;
+                if r.2 > 0 {
+                    let fence = ON_QUEUE.lock().unwrap().get(&(queue.as_raw() as usize)).map(|q| q.fence.clone());
+                    *OWN_UPLOADS.lock().unwrap() = fence.map(|f| (f, r.2));
                 }
-                Err(e) => warn(&e),
+                Ok(r)
             }
-            super::submit_cost::textures_uploaded(batch.len(), bytes, detile, t_submit.elapsed());
-            continue;
-        }
-        let queue = match upload_queue(dev, device) {
-            Ok(q) => q,
+        });
+        // (what did not go up is not what the PC texture holds: as a whole at its next write)
+        match done {
+            Ok((failed, sent, _)) => {
+                for (k, e) in &failed {
+                    warn(e);
+                    texture_upload::forget(&known[*k]);
+                }
+                UPLOADS.fetch_add((items.len() - failed.len()) as u64, Ordering::Relaxed);
+                super::submit_cost::textures_uploaded(items.len() - failed.len(), sent as usize, t_submit.elapsed());
+            }
             Err(e) => {
                 warn(&e);
-                continue;
+                known.iter().for_each(texture_upload::forget);
             }
-        };
-        match own_work(|| {
-            super::vram::before_execute(&queue);
-            texture::upload_batch(dev, &queue, &batch)
-        }) {
-            Ok(failed) => {
-                for (_, e) in failed {
-                    warn(&e);
-                }
-                UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
-            }
-            Err(e) => warn(&e),
         }
-        super::submit_cost::textures_uploaded(batch.len(), bytes, detile, t_submit.elapsed());
     }
 }
 
@@ -1711,9 +1737,20 @@ unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
     copy_rec(GetCurrentProcess(), src, dst, len);
 }
 
+/// The bytes at `at` into `to`, zeros for pages that cannot be read (or go while they are).
+pub(super) unsafe fn copy_readable(at: usize, to: &mut [u8]) {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut read = 0usize;
+    if ReadProcessMemory(GetCurrentProcess(), at as *const c_void, to.as_mut_ptr() as *mut c_void, to.len(), &mut read) == 0 || read < to.len() {
+        to.fill(0);
+        copy_committed_region(at, to.as_mut_ptr(), to.len());
+    }
+}
+
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
 /// has only some of its pages mapped).
-unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
+pub(super) unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut out = vec![0u8; len];
     let Some(limit) = at.checked_add(len) else { return out };
@@ -1742,50 +1779,6 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     out
 }
 
-/// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
-const PARALLEL_BYTES: usize = 1 << 20;
-
-/// `subresources` of every texture of a batch (`bytes` of them), in order: on several threads
-/// when the batch is big. They were read and detiled one after another in the title's own
-/// submit – most of a retail game's render thread while it streamed textures the CPU writes.
-unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)], bytes: usize) -> Vec<Vec<Subresource>> {
-    let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, va, tex, _)| (*va, &**tex)).collect();
-    let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
-    subresources_on(&picked, threads)
-}
-
-/// `subresources` of each (address, texture), in order, on up to `threads` threads.
-unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> Vec<Vec<Subresource>> {
-    let threads = threads.min(picked.len());
-    if threads <= 1 {
-        return picked.iter().map(|&(va, tex)| subresources(va, tex)).collect();
-    }
-    // the next texture to take; each thread hands back (index, subresources)
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut out: Vec<Vec<Subresource>> = (0..picked.len()).map(|_| Vec::new()).collect();
-    let done: Vec<Vec<(usize, Vec<Subresource>)>> = std::thread::scope(|s| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut mine = Vec::new();
-                    loop {
-                        let k = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(va, tex)) = picked.get(k) else { break };
-                        // SAFETY: as in the serial path – the title's memory is only read
-                        mine.push((k, unsafe { subresources(va, tex) }));
-                    }
-                    mine
-                })
-            })
-            .collect();
-        workers.into_iter().map(|w| w.join().unwrap_or_default()).collect()
-    });
-    for (k, subs) in done.into_iter().flatten() {
-        out[k] = subs;
-    }
-    out
-}
-
 /// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
 /// as much as the detile of a video frame), else read page run by page run.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
@@ -1797,7 +1790,7 @@ unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> 
 }
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
-unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
+pub(super) unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let Some(tex) = tex.texels() else { return Vec::new() };
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
@@ -1817,36 +1810,14 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    /// A texture is left out only when its memory hashes as at its own last upload, and a
-    /// texture that was forgotten (released, or its address registered again) is uploaded again.
-    #[test]
-    fn a_texture_with_unchanged_memory_is_left_out_until_it_is_forgotten() {
-        let (a, b) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
-        let mut mem = vec![0u8; 3 << 20];
-        mem[5] = 1;
-        let h = content_hash(&mem);
-        assert!(!same_as_last_upload(a, h), "the first upload is not left out");
-        assert!(same_as_last_upload(a, h), "the same bytes again: left out");
-        assert!(!same_as_last_upload(b, h), "another texture over the same bytes has its own first upload");
-        // one byte anywhere, also in the tail that is not a whole 32-byte step
-        for at in [0usize, 31, 32, (3 << 20) - 1] {
-            let mut m = mem.clone();
-            m[at] ^= 0x80;
-            assert_ne!(content_hash(&m), h, "byte {at} changed");
-        }
-        mem[(3 << 20) - 1] = 9;
-        let h2 = content_hash(&mem);
-        assert!(!same_as_last_upload(a, h2), "changed memory is uploaded");
-        assert!(same_as_last_upload(a, h2));
-        // the length is part of the content: a prefix of zeros is not the whole
-        assert_ne!(content_hash(&[0u8; 64]), content_hash(&[0u8; 96]));
-        forget(a);
-        assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
-        forget(a);
-        forget(b);
+    /// A 64x64 R8 texture's upload from memory full of `value`, with that memory.
+    fn r8_item(texture: &ID3D12Resource, value: u8) -> (texture_upload::Item, Vec<u8>) {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 61, 1)).unwrap());
+        let mem = vec![value; tex.size() as usize];
+        (texture_upload::Item { res: texture.clone(), src: mem.as_ptr() as usize, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], changed: None }, mem)
     }
 
     unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> Vec<u8> {
@@ -1916,8 +1887,8 @@ mod tests {
             let texture: ID3D12Resource = texture.unwrap();
             let key = queue.as_raw() as usize;
             let upload = |value: u8| {
-                let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![value; 64 * 64] }];
-                own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])])).unwrap();
+                let (item, _mem) = r8_item(&texture, value);
+                own_work(|| submit_on(dev, &queue, &[item])).unwrap();
             };
             for value in [0x21, 0xC4] {
                 upload(value);
@@ -1934,6 +1905,47 @@ mod tests {
             }
             assert_eq!(read_r8(dev, &queue, &texture), vec![0x5E; 64 * 64]);
             ON_QUEUE.lock().unwrap().remove(&key);
+        }
+    }
+
+    /// An upload on XCL's own queue (for a compute queue's submit) is waited for by the next submit
+    /// on each queue, on the GPU and once; the thread that submits does not wait.
+    #[test]
+    fn gpu_every_queue_waits_once_for_the_uploads_on_the_own_queue() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let was = OWN_UPLOADS.lock().unwrap().replace((gate.clone(), 1));
+            let types = [D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY];
+            let queues: Vec<ID3D12CommandQueue> = types.iter().map(|&t| dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: t, ..Default::default() }).unwrap()).collect();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let t0 = std::time::Instant::now();
+            for (k, q) in queues.iter().enumerate() {
+                OWN_WAITED.lock().unwrap().remove(&(q.as_raw() as usize));
+                wait_for_own_uploads(q);
+                // (a second time: nothing more to wait for)
+                wait_for_own_uploads(q);
+                let own: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                q.Signal(&own, 1).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                assert_eq!(own.GetCompletedValue(), 0, "queue {k} went on without the upload");
+                q.Signal(&done, k as u64 + 1).unwrap();
+            }
+            assert!(t0.elapsed().as_millis() < 2_000, "the submitting thread waited");
+            gate.Signal(1).unwrap();
+            for (k, q) in queues.iter().enumerate() {
+                let own: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                q.Signal(&own, 1).unwrap();
+                crate::gpu::fence::wait(&own, 1, dev, None, 5_000).unwrap_or_else(|e| panic!("queue {k}: {e:?}"));
+                OWN_WAITED.lock().unwrap().remove(&(q.as_raw() as usize));
+            }
+            *OWN_UPLOADS.lock().unwrap() = was;
         }
     }
 
@@ -1961,8 +1973,8 @@ mod tests {
             ).unwrap();
             let texture: ID3D12Resource = texture.unwrap();
             let key = queue.as_raw() as usize;
-            let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![0x77; 64 * 64] }];
-            own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])])).unwrap();
+            let (item, _mem) = r8_item(&texture, 0x77);
+            own_work(|| submit_on(dev, &queue, &[item])).unwrap();
             {
                 let mut g = ON_QUEUE.lock().unwrap();
                 let q = g.get_mut(&key).unwrap();
@@ -2109,7 +2121,7 @@ mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0 };
+            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0, known: Default::default() };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -2207,7 +2219,7 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0, known: Default::default() });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -2280,33 +2292,7 @@ mod tests {
         assert_eq!(watch_ranges(&regions, vec![(0x1000_0000, 0x1000_1000), (0x2008_0000, 0x2009_0000)]), vec![(0x2008_0000, 0x1_0000)]);
     }
 
-    /// The textures of a batch detiled on several threads come back as on one: complete and in
-    /// order (2D with mips and slices, 3D, BC7, a tiny one; more textures than threads).
-    #[test]
-    fn a_batch_detiled_on_several_threads_matches_one_thread() {
-        let descs = [
-            console_desc(3, 64, 64, 2, 3, 28, 0x105),
-            console_desc(3, 200, 72, 1, 5, 28, 0x105),
-            console_desc(4, 40, 24, 6, 3, 28, 0x105),
-            console_desc(3, 256, 256, 1, 9, 98, 0x10A),
-            console_desc(3, 4, 4, 1, 1, 28, 0x105),
-            console_desc(3, 128, 32, 3, 2, 28, 0x105),
-            console_desc(3, 64, 64, 1, 1, 28, 0x105),
-        ];
-        let textures: Vec<xg::Texture> = descs.iter().map(|d| xg::Texture::new(d).unwrap()).collect();
-        // each texture's console memory: distinct bytes per texture
-        let mems: Vec<Vec<u8>> = textures.iter().enumerate().map(|(t, x)| (0..x.size() as usize).map(|i| (i * 7 + t * 61) as u8).collect()).collect();
-        let picked: Vec<(usize, &xg::Texture)> = mems.iter().zip(&textures).map(|(m, x)| (m.as_ptr() as usize, x)).collect();
-        unsafe {
-            let one = subresources_on(&picked, 1);
-            assert!(one.iter().all(|s| !s.is_empty()), "a texture gave no subresources");
-            for threads in [2, 3, 8] {
-                assert!(subresources_on(&picked, threads) == one, "{threads} threads differ from one");
-            }
-        }
-    }
-
-    fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
+    pub(in crate::hle::d3d12x) fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
         let mut d = [0u8; 0x38];
         d[0..4].copy_from_slice(&dim.to_le_bytes());
         d[0x10..0x18].copy_from_slice(&w.to_le_bytes());
@@ -2339,6 +2325,7 @@ mod tests {
             placed,
             unmapped: false,
             seq: 0,
+            known: Default::default(),
         };
         let mut tbl = Table::new();
         // Two adjacent placed 16 KiB textures + one placed 64 KiB texture after them.

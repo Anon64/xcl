@@ -33,6 +33,7 @@ mod shader_cache_session;
 pub mod sparse;
 pub mod title_list;
 mod submit_cost;
+mod texture_upload;
 pub mod title_textures;
 pub mod vram;
 mod worker_pool;
