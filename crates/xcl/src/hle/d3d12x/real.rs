@@ -1852,7 +1852,8 @@ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         forget_pso(this as usize);
-        super::pso_async::release(super::pso_async::released(this as usize));
+        // (lists in flight may bind the real one: `late_release` lets it go)
+        super::late_release::hold_pipeline(super::pso_async::released(this as usize));
     }
     n
 }
@@ -5794,8 +5795,9 @@ pub struct TwoPassPso {
 
 impl Drop for TwoPassPso {
     fn drop(&mut self) {
-        // the compute pipeline state is XCL's (the root signatures are cached or the title's)
-        super::pso_async::release(self.compute);
+        // the compute pipeline state is XCL's (the root signatures are cached or the title's);
+        // lists in flight may bind it: `late_release` lets it go once the queues are past them
+        super::late_release::hold_pipeline(self.compute);
     }
 }
 
