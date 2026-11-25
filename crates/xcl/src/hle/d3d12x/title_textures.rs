@@ -908,7 +908,7 @@ fn note_dirty_regions(u: &crate::gpu::uma::Uma) {
         }
     });
     let looks = LOOKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if looks % 4096 == 0 {
+    if looks % 2048 == 0 {
         let mut g = COUNTS.lock().unwrap();
         if let Some(m) = g.as_mut() {
             let total: u64 = m.values().sum();
@@ -927,7 +927,7 @@ fn note_dirty_regions(u: &crate::gpu::uma::Uma) {
                     format!("{a:#x} ({kind}{}): {} %", w.map_or(String::new(), |k| format!(" window {k}")), c * 100 / total.max(1))
                 })
                 .collect();
-            crate::xlog_info!("D3D12.X: written pages of the last 4096 looks by 64 MiB piece ({total} pages in {} pieces): {}", v.len(), top.join(", "));
+            crate::xlog_info!("D3D12.X: written pages of the last 2048 looks by 64 MiB piece ({total} pages in {} pieces): {}", v.len(), top.join(", "));
             m.clear();
         }
     }
