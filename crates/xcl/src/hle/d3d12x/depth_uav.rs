@@ -319,13 +319,15 @@ pub(super) enum Clear {
     AsIs,
     /// the twin the slot's view names
     Twin(usize),
-    /// nothing: what the slot's view names is not known
+    /// nothing: what the slot's view names is not known, or it is a null view
     NotDone,
 }
 
 /// ClearUnorderedAccessView* of `res` through a GPU slot whose UAV in the shared heap names
 /// `named` (`console_heap::names_of`; None: the slot is not in the shared heap). The PC clear of
 /// a view of a twin must name the twin: the depth buffer with the twin's view is an invalid pair.
+/// A buffer with a twin whose slot names 0 or `GONE` is not cleared: 0 is also what a copy from a
+/// slot outside the shared heap notes, and that copy may hold the twin's view.
 pub(super) fn clear_target(res: usize, named: Option<usize>) -> Clear {
     if !any() {
         return Clear::AsIs;
@@ -342,13 +344,14 @@ pub(super) fn clear_target(res: usize, named: Option<usize>) -> Clear {
 }
 
 /// `clear_target` for a buffer with the twins `twins`: the twin when the view names one; not
-/// done when what it names is not known; else as it came (a null view, another resource).
+/// done when what it names is not known (a null view clears nothing either); else as it came
+/// (a view of another resource).
 fn clear_choice(twins: [Option<usize>; 2], named: Option<usize>) -> Clear {
     if twins.iter().all(Option::is_none) {
         return Clear::AsIs;
     }
     match named {
-        None => Clear::NotDone,
+        None | Some(0) | Some(super::console_heap::GONE) => Clear::NotDone,
         Some(n) if twins.contains(&Some(n)) => Clear::Twin(n),
         Some(_) => Clear::AsIs,
     }
@@ -804,18 +807,46 @@ mod tests {
         let (twin, buffer, other) = (0x7D00_0000_1000usize, 0x7D00_0000_2000usize, 0x7D00_0000_3000usize);
         let twinned = [None, Some(twin)];
         assert_eq!(clear_choice(twinned, Some(twin)), Clear::Twin(twin), "the view names the twin");
-        assert_eq!(clear_choice(twinned, Some(0)), Clear::AsIs, "a null view");
         assert_eq!(clear_choice(twinned, Some(other)), Clear::AsIs, "a view of another resource");
         assert_eq!(clear_choice(twinned, None), Clear::NotDone, "a slot outside the shared heap: not known");
+        // 0: a null view, or a copy of a slot outside the shared heap (which may hold the twin's
+        // view); GONE: the null view of a destroyed resource
+        assert_eq!(clear_choice(twinned, Some(0)), Clear::NotDone, "0: not known");
+        assert_eq!(clear_choice(twinned, Some(super::super::console_heap::GONE)), Clear::NotDone, "GONE");
         // a buffer without a twin, whatever the slot
         for named in [None, Some(0), Some(buffer)] {
             assert_eq!(clear_choice([None, None], named), Clear::AsIs, "{named:?}");
         }
-        // a buffer XCL does not keep, or one without a twin
+
+        // the lookup: a kept buffer with a stand-in twin (a COM object that only counts
+        // references), one without a twin, and one XCL does not keep
+        unsafe extern "system" fn add_ref(_this: *mut c_void) -> u32 {
+            1
+        }
+        let vt: &'static [usize; 3] = Box::leak(Box::new([0, add_ref as usize, add_ref as usize]));
+        let fake: &'static mut *const usize = Box::leak(Box::new(vt.as_ptr()));
+        let fake = fake as *mut *const usize as *mut c_void;
+        let untwinned = 0x7D00_0000_4000usize;
         assert!(register(buffer, &desc(3, 64, 64, 45, 1, 6), None, 0x10));
-        assert_eq!(clear_target(buffer, None), Clear::AsIs);
-        assert_eq!(clear_target(other, None), Clear::AsIs);
+        assert!(register(untwinned, &desc(3, 32, 32, 45, 1, 6), None, 0x10));
+        {
+            let o = OBJECTS.get(buffer).unwrap();
+            TWINS.fetch_add(1, Ordering::Relaxed);
+            o.cell.inner.lock().unwrap().twins[1] = Some(Twin { res: unsafe { ID3D12Resource::from_raw(fake) }, n: 0 });
+        }
+        let t = fake as usize;
+        let before = clears();
+        assert_eq!(clear_target(buffer, Some(t)), Clear::Twin(t), "the slot names the twin");
+        assert_eq!(clear_target(buffer, None), Clear::NotDone, "not known");
+        assert_eq!(clear_target(buffer, Some(0)), Clear::NotDone, "0");
+        assert_eq!(clear_target(buffer, Some(other)), Clear::AsIs, "a view of another resource");
+        assert_eq!(clear_target(untwinned, None), Clear::AsIs, "a kept buffer without a twin");
+        assert_eq!(clear_target(other, None), Clear::AsIs, "a buffer XCL does not keep");
+        let after = clears();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 2), "one clear on the twin, two not done");
+        // (the last release takes the stand-in twin with the Cell)
         forget(buffer);
+        forget(untwinned);
     }
 
     #[test]
