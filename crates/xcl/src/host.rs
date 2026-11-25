@@ -47,6 +47,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             };
             let mut last = snap();
             let mut cost = crate::hle::api_cost::totals();
+            let mut views = crate::hle::d3d12x::view_want::totals();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -67,6 +68,12 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if !calls.is_empty() {
                     crate::xlog_info!("calls (2 s, all threads): {}", calls.join(", "));
                 }
+                // the addresses in its GPU view the title gave the GPU, by the path they took
+                let asked = crate::hle::d3d12x::view_want::totals();
+                if let Some(line) = crate::hle::d3d12x::view_want::line(&asked, &views) {
+                    crate::xlog_info!("GPU view (2 s): {line}");
+                }
+                views = asked;
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
                     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};

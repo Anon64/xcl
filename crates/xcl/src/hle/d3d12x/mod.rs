@@ -39,6 +39,7 @@ pub mod title_list;
 mod submit_cost;
 mod texture_upload;
 pub mod title_textures;
+pub mod view_want;
 pub mod vram;
 mod worker_pool;
 
