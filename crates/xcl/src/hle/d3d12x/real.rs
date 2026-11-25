@@ -3750,7 +3750,7 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// for one of the `XCL_HUGE_PSO_CONCURRENCY` slots. NVIDIA's compiler (nvgpucomp64) takes
 /// minutes and ~1 GB for a 1 – 2 MB program; ~20 of them at once (one per worker) were slower
 /// in total than 1 – 2 at a time. Small programs (ms each) never wait.
-fn huge_pso_bytes() -> usize {
+pub(super) fn huge_pso_bytes() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_BYTES").ok().as_deref(), 256 << 10, 1, usize::MAX))
 }
@@ -3773,9 +3773,15 @@ struct Slots {
     n: Mutex<usize>,
     cv: std::sync::Condvar,
     most: usize,
+    /// compiles that are not built ahead of their first use waiting for a slot (`big_compile_turn`)
+    urgent: AtomicUsize,
 }
 
 impl Slots {
+    const fn new(most: usize) -> Slots {
+        Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most, urgent: AtomicUsize::new(0) }
+    }
+
     fn most(&self) -> usize {
         if self.most == 0 { huge_pso_concurrency() } else { self.most }
     }
@@ -3790,9 +3796,9 @@ impl Drop for SlotGuard {
     }
 }
 
-static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0 };
+static BIG_COMPILES: Slots = Slots::new(0);
 const GIANT_DRIVER_COMPILE: usize = 4 << 20;
-static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+static GIANT_COMPILES: Slots = Slots::new(1);
 
 fn compile_slots(bytes: usize) -> &'static Slots {
     if bytes >= GIANT_DRIVER_COMPILE { &GIANT_COMPILES } else { &BIG_COMPILES }
@@ -3819,16 +3825,21 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
+    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted, super::pso_async::build_is_ahead)).flatten();
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let log = pso_trace() || bytes >= huge_pso_bytes();
+    if bytes >= huge_pso_bytes() {
+        super::pso_async::note_huge();
+    }
     if log {
         let record = record.map_or_else(String::new, |(hash, cached)| {
             format!(", record {hash:016x}, driver blob {}", if cached { "supplied" } else { "absent" })
         });
-        crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
+        let stages = if kind.starts_with("graphics") { GRAPHICS_STAGES.with(|s| s.get()) } else { None };
+        let before = stages.map_or_else(String::new, |(vs, ps)| stage_note(super::pso_async::job_elapsed(), vs, ps, waited));
+        crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}{before}");
     }
     let started = std::time::Instant::now();
     let r = build();
@@ -3837,6 +3848,26 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, slot.is_some(), waited));
     }
     (r, took)
+}
+
+thread_local! {
+    /// The translation and DXC compile of the VS and the PS of the graphics pipeline this
+    /// thread builds (`translated_graphics_pso_once`), for the driver compile log.
+    static GRAPHICS_STAGES: std::cell::Cell<Option<(std::time::Duration, std::time::Duration)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Where a graphics pipeline's time went before the driver's compile (`job`: since its build
+/// started on a worker, None elsewhere): the VS's and the PS's translation and DXC compile
+/// (waits of DXC for memory included), the wait for the huge-pipeline gate (slot and commit),
+/// and the rest (root signature, driver blob lookup). Measured on a retail title: 4 – 7 s for
+/// a 300 – 480 KB stage, one after the other, before 3 – 8 s in the driver.
+fn stage_note(job: Option<std::time::Duration>, vs: std::time::Duration, ps: std::time::Duration, waited: std::time::Duration) -> String {
+    let ms = |d: std::time::Duration| d.as_millis();
+    let stages = format!("VS {} ms, PS {} ms, gate {} ms", ms(vs), ms(ps), ms(waited));
+    match job {
+        Some(job) => format!("; {} ms since its build started: {stages}, other {} ms", ms(job), ms(job.saturating_sub(vs + ps + waited))),
+        None => format!("; {stages}"),
+    }
 }
 
 /// How a logged driver compile went through the huge-pipeline gate.
@@ -3861,19 +3892,34 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 /// pipeline (`wanted`): then at once and without a slot (None), as when that thread builds it
 /// itself. Holding such a build back holds the title back: on a machine with less than the
 /// headroom free throughout a retail title's world loading, the first one would not go on and
-/// keeps the slot, until the title's watchdog ends it.
-fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
+/// keeps the slot, until the title's watchdog ends it. A build ahead of the pipeline's first use
+/// (`ahead`, `pso_async::Backlog`) takes a free slot only when no other build waits for one:
+/// one a bind waited for and gave up on (`XCL_GFX_PSO_WAIT_MS`) goes first.
+fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool, ahead: impl Fn() -> bool) -> Option<SlotGuard> {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let slot = {
         let mut n = slots.n.lock().unwrap();
-        loop {
+        // (counted in `urgent` while it waits)
+        let mut queued = false;
+        let turn = loop {
             if wanted() {
-                return None;
+                break false;
             }
-            if *n < slots.most() {
-                break;
+            let ahead = ahead();
+            if *n < slots.most() && !(ahead && slots.urgent.load(Ordering::Acquire) > 0) {
+                break true;
+            }
+            if !ahead && !queued {
+                queued = true;
+                slots.urgent.fetch_add(1, Ordering::AcqRel);
             }
             n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
+        };
+        if queued {
+            slots.urgent.fetch_sub(1, Ordering::AcqRel);
+        }
+        if !turn {
+            return None;
         }
         *n += 1;
         SlotGuard(slots)
@@ -3897,7 +3943,7 @@ fn big_compile_headroom(dxil_len: usize) -> u64 {
 }
 
 /// That much commit is free (true when that is not known).
-fn big_compile_commit_free(need: u64) -> bool {
+pub(super) fn big_compile_commit_free(need: u64) -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
@@ -3912,14 +3958,14 @@ mod big_compile_tests {
 
     #[test]
     fn a_wanted_build_waits_for_neither_the_slot_nor_the_commit() {
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
-        let held = big_compile_turn(&S, || true, || false).expect("a free slot");
+        static S: Slots = Slots::new(1);
+        let held = big_compile_turn(&S, || true, || false, || false).expect("a free slot");
         assert_eq!(*S.n.lock().unwrap(), 1);
         // the slot is taken: a wanted build goes on without one, at once
-        assert!(big_compile_turn(&S, || true, || true).is_none());
+        assert!(big_compile_turn(&S, || true, || true, || false).is_none());
         // … and one that becomes wanted while it waits for the slot goes on then
         static WANTED: AtomicBool = AtomicBool::new(false);
-        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || WANTED.load(Ordering::Acquire)).is_none());
+        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || WANTED.load(Ordering::Acquire), || false).is_none());
         std::thread::sleep(Duration::from_millis(120));
         assert!(!t.is_finished(), "not wanted yet: it waits for its turn");
         WANTED.store(true, Ordering::Release);
@@ -3929,7 +3975,7 @@ mod big_compile_tests {
         // without the commit: not wanted, it waits; wanted, it goes on and gives the slot back
         static WANTED2: AtomicBool = AtomicBool::new(false);
         let t0 = Instant::now();
-        let t = std::thread::spawn(|| big_compile_turn(&S, || false, || WANTED2.load(Ordering::Acquire)).is_none());
+        let t = std::thread::spawn(|| big_compile_turn(&S, || false, || WANTED2.load(Ordering::Acquire), || false).is_none());
         std::thread::sleep(Duration::from_millis(120));
         assert!(!t.is_finished(), "no commit free: it waits");
         WANTED2.store(true, Ordering::Release);
@@ -3956,6 +4002,42 @@ mod big_compile_tests {
         assert!(gate_note(true, false, false, ms).contains("ungated here"));
     }
 
+    /// A build ahead of its pipeline's first use takes a free slot when nobody else waits for
+    /// one, and gives its turn to a build that is not ahead (one a bind gave up waiting for).
+    #[test]
+    fn a_build_ahead_gives_its_turn_to_any_other() {
+        static S: Slots = Slots::new(1);
+        static ORDER: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+        drop(big_compile_turn(&S, || true, || false, || true).expect("a free slot and nobody waiting: at once"));
+        let held = big_compile_turn(&S, || true, || false, || false).expect("a free slot");
+        let other = std::thread::spawn(|| {
+            let g = big_compile_turn(&S, || true, || false, || false);
+            ORDER.lock().unwrap().push("other");
+            std::thread::sleep(Duration::from_millis(50));
+            drop(g);
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        let ahead = std::thread::spawn(|| {
+            let g = big_compile_turn(&S, || true, || false, || true);
+            ORDER.lock().unwrap().push("ahead");
+            drop(g);
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!other.is_finished() && !ahead.is_finished(), "the slot is taken: both wait");
+        drop(held);
+        other.join().unwrap();
+        ahead.join().unwrap();
+        assert_eq!(*ORDER.lock().unwrap(), ["other", "ahead"]);
+        assert_eq!((*S.n.lock().unwrap(), S.urgent.load(Ordering::Acquire)), (0, 0));
+    }
+
+    #[test]
+    fn a_graphics_compile_log_says_where_the_time_went_before_it() {
+        let s = Duration::from_secs;
+        assert_eq!(stage_note(Some(s(10)), s(4), s(3), s(1)), "; 10000 ms since its build started: VS 4000 ms, PS 3000 ms, gate 1000 ms, other 2000 ms");
+        assert_eq!(stage_note(None, s(4), s(3), s(0)), "; VS 4000 ms, PS 3000 ms, gate 0 ms");
+    }
+
     #[test]
     fn giant_driver_compiles_have_their_own_lane() {
         assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE - 1), &BIG_COMPILES));
@@ -3971,7 +4053,7 @@ mod big_compile_tests {
     #[test]
     fn the_concurrency_limit_holds_and_all_finish() {
         use std::sync::atomic::AtomicUsize;
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2 };
+        static S: Slots = Slots::new(2);
         static IN: AtomicUsize = AtomicUsize::new(0);
         static PEAK: AtomicUsize = AtomicUsize::new(0);
         // the two holders of the slots meet here: both are inside at once, deterministically
@@ -3979,7 +4061,7 @@ mod big_compile_tests {
         let t: Vec<_> = (0..8)
             .map(|_| {
                 std::thread::spawn(|| {
-                    let _g = big_compile_turn(&S, || true, || false).expect("a turn");
+                    let _g = big_compile_turn(&S, || true, || false, || false).expect("a turn");
                     let now = IN.fetch_add(1, Ordering::SeqCst) + 1;
                     PEAK.fetch_max(now, Ordering::SeqCst);
                     BOTH.wait();
@@ -4000,8 +4082,8 @@ mod big_compile_tests {
         // every slot taken: a small compile on a worker, and a huge one on an unnamed (title)
         // thread, both go on at once
         // (both lanes: a huge compile of any size would block on a gate it should bypass)
-        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false).unwrap()).collect();
-        held.push(big_compile_turn(&GIANT_COMPILES, || true, || false).unwrap());
+        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false, || false).unwrap()).collect();
+        held.push(big_compile_turn(&GIANT_COMPILES, || true, || false, || false).unwrap());
         let small = std::thread::Builder::new()
             .name("xcl-pso-test".into())
             .spawn(|| driver_compile("test", huge_pso_bytes() - 1, true, || 7))
@@ -4028,9 +4110,9 @@ mod big_compile_tests {
 
     #[test]
     fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
-        let first = big_compile_turn(&S, || true, || false).expect("its turn");
-        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || false).is_some());
+        static S: Slots = Slots::new(1);
+        let first = big_compile_turn(&S, || true, || false, || false).expect("its turn");
+        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || false, || false).is_some());
         std::thread::sleep(Duration::from_millis(120));
         assert!(!t.is_finished(), "one at a time");
         drop(first);
@@ -5163,6 +5245,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     // picks; RDNA2 does for pixel shaders): the lanes 32..63 it reads come from `upper_lanes`
     // (split_wave64)
     let split = graphics_wave32(this);
+    let vs_started = std::time::Instant::now();
     let vs_c = match console_to_dxil_for(vs, Stage::Vertex, 0, split) {
         Ok(b) => b,
         Err(e) => {
@@ -5172,6 +5255,8 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     };
     let mut samplers = vs_c.samplers;
     let vs_dxil = vs_c.dxil;
+    let ps_started = std::time::Instant::now();
+    let vs_took = ps_started - vs_started;
     let ps_dxil = match shader_bytes(&d.PS) {
         Some(p) if is_console(p) => match console_to_dxil_for(p, Stage::Pixel, samplers.len() as u32, split) {
             Ok(b) => {
@@ -5186,6 +5271,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         Some(p) => Some(p.to_vec()),
         None => None,
     };
+    let ps_took = ps_started.elapsed();
     let rs = abi_rs_for(this, &samplers)?;
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
@@ -5215,6 +5301,8 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     // (no file without the adapter's identity: it could be another adapter's)
     let driver = driver_identity(this);
     let disk = driver.and_then(|id| driver_cache::graphics_path(driver_cache::graphics_file_hash(gkey, id, crate::gpu::recomp::pso::mem_windows()), bytes));
+    // (for the driver compile log of this pipeline only)
+    GRAPHICS_STAGES.with(|s| s.set(Some((vs_took, ps_took))));
     let build = graphics_pso_through_cache(
         gkey,
         disk.as_deref(),
@@ -5225,6 +5313,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
         || keep_graphics_blob(gkey, *ppv, bytes),
     );
+    GRAPHICS_STAGES.with(|s| s.set(None));
     let hr = build.hr;
     if hr < 0 {
         note_translation_error(format!(
@@ -5319,6 +5408,8 @@ enum OwnedDesc {
 }
 
 unsafe impl Send for OwnedDesc {}
+// (only read once made: the build and its translation ahead share it)
+unsafe impl Sync for OwnedDesc {}
 
 /// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
 /// pipeline by in the next run.
@@ -5495,6 +5586,11 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    let owned = std::sync::Arc::new(owned);
+    let warm: Option<super::pso_async::Warm> = matches!(*owned, OwnedDesc::Graphics(..)).then(|| {
+        let owned = owned.clone();
+        Box::new(move || unsafe { warm_graphics(dev, &owned) }) as super::pso_async::Warm
+    });
     let job: super::pso_async::Job = Box::new(move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
@@ -5504,11 +5600,30 @@ unsafe fn go_background(
         }
     });
     if super::pso_async::lazy() {
-        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+        super::pso_async::submit_lazy_with(*ppv as usize, compute, job, key, warm);
     } else {
         super::pso_async::submit(*ppv as usize, compute, job);
     }
     Some(hr)
+}
+
+/// The translation and DXC compile of a graphics pipeline's console VS and PS as
+/// `translated_graphics_pso_once` makes them, without the driver's compile: its later build
+/// finds them in the shader caches (`pso_async::Warm`). Errors are left to that build to note.
+unsafe fn warm_graphics(dev: Dev, d: &OwnedDesc) {
+    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    let OwnedDesc::Graphics(desc, ..) = d else { return };
+    let this = dev.0 as *mut c_void;
+    let Some(vs) = shader_bytes(&desc.VS).filter(|v| is_console(v)) else { return };
+    // (with HS / DS or a console GS it takes another path)
+    if shader_bytes(&desc.HS).is_some() || shader_bytes(&desc.DS).is_some() || shader_bytes(&desc.GS).is_some_and(|g| is_console(g)) {
+        return;
+    }
+    let split = graphics_wave32(this);
+    let Ok(vs_c) = console_to_dxil_for(vs, Stage::Vertex, 0, split) else { return };
+    if let Some(ps) = shader_bytes(&desc.PS).filter(|p| is_console(p)) {
+        let _ = console_to_dxil_for(ps, Stage::Pixel, vs_c.samplers.len() as u32, split);
+    }
 }
 
 unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
@@ -6007,7 +6122,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mut take_cold_slot = || {
         cold_slot.get_or_insert_with(|| {
             let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
-            gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten()
+            gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted, super::pso_async::build_is_ahead)).flatten()
         });
     };
 
