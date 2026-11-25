@@ -2886,6 +2886,58 @@ void main(uint t : SV_GroupIndex) {
         forget(to);
     }
 
+    /// The title's last Release of an allocator gives back the two-pass buffers ended recordings
+    /// on it left (`alloc_pool::forget`), when nothing records on it and the GPU is done with it:
+    /// no Reset of it comes any more, and they stayed counted against `two_pass_cap`. Those of an
+    /// allocator a list still records on stay. (Buffers of a software device: no GPU work.)
+    #[test]
+    fn a_released_allocator_gives_back_its_two_pass_buffers() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let dev = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            dev.unwrap()
+        };
+        let key = dev.as_raw() as usize;
+        let ids = Box::new([0u8; 4]);
+        let (done, busy) = (ids.as_ptr() as usize, ids.as_ptr() as usize + 1);
+        let (ended, recording) = (done + 2, done + 3);
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT.0;
+        // a list recorded on `done` and is gone (never submitted); one still records on `busy`
+        super::super::alloc_pool::created_on(ended, done, ty);
+        super::super::alloc_pool::forget_list(ended);
+        super::super::alloc_pool::created_on(recording, busy, ty);
+        let a = unsafe { TwoPassBuf::make(&dev, 1 << 16, "record buffer") }.unwrap();
+        let b = unsafe { TwoPassBuf::make(&dev, 1 << 16, "record buffer") }.unwrap();
+        let (a_raw, b_raw) = (a.res.as_raw() as usize, b.res.as_raw() as usize);
+        hold_res_until_reset(done, vec![a]);
+        hold_res_until_reset(busy, vec![b]);
+        unsafe {
+            super::super::alloc_pool::forget(done);
+            super::super::alloc_pool::forget(busy);
+        }
+        let held = |alloc: usize| -> Vec<usize> {
+            ALLOC_RES.lock().unwrap().as_ref().and_then(|m| m.get(&alloc)).map_or(Vec::new(), |v| v.iter().map(|b| b.res.as_raw() as usize).collect())
+        };
+        let (held_done, held_busy) = (held(done), held(busy));
+        let mut freed = Vec::new();
+        while let Some(f) = FREE_RES.lock().unwrap().take(key, 0, u64::MAX) {
+            freed.push(f.res.as_raw() as usize);
+        }
+        // (before the assertions: nothing of this test stays)
+        let left = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&busy));
+        drop(left);
+        assert!(held_done.is_empty(), "the released allocator's buffers do not wait for a Reset that never comes");
+        assert_eq!(freed, vec![a_raw], "they are kept for reuse");
+        assert_eq!(held_busy, vec![b_raw], "a list still records on the other: its buffers stay");
+    }
+
     /// Binds on XCL's ABI (`bind_abi`, both two-pass stages) take window 0 the same way: not
     /// open on the GPU is refused, and so is shadowed memory without a buffer there (a null root
     /// descriptor); unshadowed memory with none keeps going as before.
