@@ -561,9 +561,11 @@ mod tests {
         static HELD: AtomicBool = AtomicBool::new(true);
         let (tx, rx) = std::sync::mpsc::channel();
         let t = std::thread::spawn(move || {
+            tx.send(()).unwrap();
             wait_while(&HELD);
             tx.send(()).unwrap();
         });
+        rx.recv_timeout(Duration::from_secs(10)).expect("the thread runs");
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "held");
         HELD.store(false, Ordering::Release);
         rx.recv_timeout(Duration::from_secs(10)).expect("goes on once the hold ends");
