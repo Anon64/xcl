@@ -529,8 +529,10 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
-/// The process's video memory on the device's adapter: (local, non-local) bytes in use.
-pub fn video_memory() -> Option<(u64, u64)> {
+/// The process's video memory on the device's adapter: (local, non-local) bytes in use, and
+/// the local budget – what Windows lets the process have of the card now, with what the other
+/// programs hold taken off. Past it Windows moves the process's memory off the card.
+pub fn video_memory() -> Option<(u64, u64, u64)> {
     use windows::Win32::Graphics::Dxgi::*;
     let raw = device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
@@ -542,8 +544,13 @@ pub fn video_memory() -> Option<(u64, u64)> {
         let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
-        Some((local.CurrentUsage, non_local.CurrentUsage))
+        Some((local.CurrentUsage, non_local.CurrentUsage, local.Budget))
     }
+}
+
+/// How far `used` is past `budget` (bytes; None: within it, or no budget known).
+pub fn over_video_budget(used: u64, budget: u64) -> Option<u64> {
+    (budget != 0 && used > budget).then(|| used - budget)
 }
 
 /// The device runs only 32-lane waves: wave64 compute, mesh and geometry programs need the
@@ -7615,6 +7622,14 @@ mod own_program_tests {
 #[cfg(test)]
 mod dred_tests {
     use super::*;
+
+    #[test]
+    fn video_memory_is_over_its_budget_only_past_a_known_one() {
+        assert_eq!(over_video_budget(30 << 30, 28 << 30), Some(2 << 30));
+        assert_eq!(over_video_budget(28 << 30, 28 << 30), None);
+        assert_eq!(over_video_budget(1 << 30, 28 << 30), None);
+        assert_eq!(over_video_budget(30 << 30, 0), None, "no budget known (the query failed)");
+    }
 
     #[test]
     fn a_late_partially_executed_list_is_reported_before_unstarted_lists() {

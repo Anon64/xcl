@@ -49,6 +49,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut cost = crate::hle::api_cost::totals();
             let mut own_cost = crate::hle::api_cost::submitter_totals();
             let mut views = crate::hle::d3d12x::view_want::totals();
+            let mut said_budget = false;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -94,7 +95,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
                     c.PrivateUsage
                 };
-                let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
+                let (local, non_local, budget) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
@@ -111,6 +112,17 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                // past the budget Windows moves the process's video memory off the card and
+                // every frame pays for bringing it back; a run at the card's limit is also
+                // where the driver gave up (the guard script ends a run that stays there)
+                match crate::hle::d3d12x::real::over_video_budget(local, budget) {
+                    Some(over) => crate::xlog_warn!("video memory: {} MB in use, {} MB over the budget of {} MB Windows gives this process", mb(local), mb(over), mb(budget)),
+                    None if budget != 0 && !said_budget => {
+                        said_budget = true;
+                        crate::xlog_info!("video memory: the budget Windows gives this process is {} MB", mb(budget));
+                    }
+                    None => {}
+                }
                 last = now;
             }
         });
