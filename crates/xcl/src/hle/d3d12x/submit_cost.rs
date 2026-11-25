@@ -53,6 +53,26 @@ pub(super) fn textures(d: Duration) {
     add(TEXTURES, d);
 }
 
+/// The texture uploads: [looked at, unchanged, uploaded, bytes looked at, bytes uploaded, µs
+/// comparing, µs detiling, µs submitting].
+static TEX: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// A texture with a written page was compared with its last upload.
+pub(super) fn texture_compared(bytes: usize, unchanged: bool, took: Duration) {
+    TEX[0].fetch_add(1, Ordering::Relaxed);
+    TEX[1].fetch_add(unchanged as u64, Ordering::Relaxed);
+    TEX[3].fetch_add(bytes as u64, Ordering::Relaxed);
+    TEX[5].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// A batch of textures went up.
+pub(super) fn textures_uploaded(textures: usize, bytes: usize, detile: Duration, submit: Duration) {
+    TEX[2].fetch_add(textures as u64, Ordering::Relaxed);
+    TEX[4].fetch_add(bytes as u64, Ordering::Relaxed);
+    TEX[6].fetch_add(detile.as_micros() as u64, Ordering::Relaxed);
+    TEX[7].fetch_add(submit.as_micros() as u64, Ordering::Relaxed);
+}
+
 /// A whole submit (from the hook's entry) is done.
 pub(super) fn done(t0: Instant) {
     add(TOTAL, t0.elapsed());
@@ -63,6 +83,7 @@ pub(super) fn done(t0: Instant) {
     struct Last {
         sum: [u64; 9],
         parts: [u64; 4],
+        tex: [u64; 8],
         at: Instant,
     }
     static LAST: Mutex<Option<Last>> = Mutex::new(None);
@@ -70,7 +91,20 @@ pub(super) fn done(t0: Instant) {
     let now: [u64; 9] = std::array::from_fn(|i| SUM[i].load(Ordering::Relaxed));
     // [look, STATE lock wait, chunk scan, upload] µs inside the refreshes
     let parts = super::sparse::timing_totals();
+    let tex: [u64; 8] = std::array::from_fn(|i| TEX[i].load(Ordering::Relaxed));
     if let Some(l) = g.as_ref() {
+        let x = |i: usize| tex[i].saturating_sub(l.tex[i]);
+        crate::xlog_info!(
+            "submit cost, textures in these 1024: {} looked at ({} unchanged, {} uploaded), {:.1} MB compared in {:.1} ms, {:.1} MB uploaded: {:.1} ms detiling, {:.1} ms submitting",
+            x(0),
+            x(1),
+            x(2),
+            x(3) as f64 / 1e6,
+            x(5) as f64 / 1e3,
+            x(4) as f64 / 1e6,
+            x(6) as f64 / 1e3,
+            x(7) as f64 / 1e3
+        );
         let d = |i: usize| now[i].saturating_sub(l.sum[i]) as f64 / 1024.0 / 1000.0;
         let p = |i: usize| parts[i].saturating_sub(l.parts[i]) as f64 / 1024.0 / 1000.0;
         let refresh = d(REFRESH);
@@ -92,5 +126,5 @@ pub(super) fn done(t0: Instant) {
             1024.0 / l.at.elapsed().as_secs_f64().max(1e-3)
         );
     }
-    *g = Some(Last { sum: now, parts, at: Instant::now() });
+    *g = Some(Last { sum: now, parts, tex, at: Instant::now() });
 }

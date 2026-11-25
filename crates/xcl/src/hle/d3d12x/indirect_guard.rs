@@ -26,23 +26,32 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
 use super::real;
 
-/// ExecuteIndirects whose counts are kept (a ring): more than the queues hold at once
-const SLOTS: u32 = 1 << 16;
+/// ExecuteIndirects whose counts are kept (a ring). A title can submit a recording again seconds
+/// later, when its slot has been given to another: then one of the two runs the other's counts
+/// (in range, but another program's), so the ring holds minutes of them.
+const SLOTS: u32 = 1 << 18;
 /// bytes of a slot in `out` and in `seen`: the arguments (5 words at most), in `seen` then 1
 const SLOT: u32 = 32;
 /// the word of a `seen` slot that says the GPU read it
 const SEEN_WORD: u32 = 5;
-/// `seen`: how many counts were out of range, how many the title's buffer showed differently,
-/// the first of the former, then the slots
+/// `seen`: how many counts were out of range, how many the title's buffer showed differently, how
+/// many of either kind, the first of these, then the slots
 const BAD_AT: u32 = 32;
 const BAD_SIZE: u32 = 64;
-const BAD_KEPT: u32 = 64;
+const BAD_KEPT: u32 = 128;
 const SEEN_AT: u32 = BAD_AT + BAD_KEPT * BAD_SIZE;
 
 /// vertices (indices) and instances one draw may have, and their product: far above what a
 /// frame draws
 const MAX_VERTICES: u32 = 1 << 28;
 const MAX_INSTANCES: u32 = 1 << 24;
+
+/// `XCL_INDIRECT_GUARD=compare`: what the title's buffer shows is read as well and compared with
+/// the memory window (a diagnostic: the two are one memory).
+fn compare() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("XCL_INDIRECT_GUARD").is_ok_and(|v| v.trim() == "compare"));
+    *ON
+}
 
 /// What a command signature of one argument runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,12 +120,12 @@ void main() {{
     uint b4 = 0u;
     [branch] if (kind != 0u) {{ a.w = args.Load(12u); b.w = shown.Load(12u); }}
     [branch] if (kind == 2u) {{ a4 = args.Load(16u); b4 = shown.Load(16u); }}
-    // (as floats: the product of the counts does not fit 32 bits)
+    // (as floats: the product of the counts does not fit 32 bits; a count of 0 runs nothing)
     bool ok;
     if (kind == 0u)
-        ok = a.x <= max_groups && a.y <= 65535u && a.z <= 65535u && (float)a.x * (float)a.y * (float)a.z <= (float)max_groups;
+        ok = a.x == 0u || a.y == 0u || a.z == 0u || (a.x <= max_groups && a.y <= 65535u && a.z <= 65535u && (float)a.x * (float)a.y * (float)a.z <= (float)max_groups);
     else
-        ok = a.x <= {MAX_VERTICES}u && a.y <= {MAX_INSTANCES}u && (float)a.x * (float)a.y <= (float){MAX_VERTICES}u;
+        ok = a.x == 0u || a.y == 0u || (a.x <= {MAX_VERTICES}u && a.y <= {MAX_INSTANCES}u && (float)a.x * (float)a.y <= (float){MAX_VERTICES}u);
     uint at = slot * {SLOT}u;
     outp.Store4(at, ok ? a : uint4(0u, 0u, 0u, 0u));
     outp.Store(at + 16u, ok ? a4 : 0u);
@@ -128,14 +137,19 @@ void main() {{
         seen.InterlockedAdd(4u, 1u, m);
     }}
     if (!ok) {{
+        uint m;
+        seen.InterlockedAdd(0u, 1u, m);
+    }}
+    if (!ok || differs) {{
         uint n;
-        seen.InterlockedAdd(0u, 1u, n);
+        seen.InterlockedAdd(8u, 1u, n);
         if (n < {BAD_KEPT}u) {{
             uint r = {BAD_AT}u + n * {BAD_SIZE}u;
             seen.Store4(r, a);
             seen.Store4(r + 16u, uint4(id_lo, id_hi, at_lo, at_hi));
             seen.Store4(r + 32u, b);
-            seen.Store4(r + 48u, uint4(kind, differs ? 1u : 0u, slot, 1u));
+            // (the last word says that the record is there)
+            seen.Store4(r + 48u, uint4(kind, (differs ? 1u : 0u) | (ok ? 0u : 2u), slot, 1u));
         }}
     }}
 }}
@@ -286,7 +300,9 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     // The memory window is what the title's shaders write: the counts are read there. (The
     // title's buffer is a resource of its own over the same video memory.)
     let delta = real::buffer_delta(args);
-    let va = real::console_buffer(args).and_then(|(p, _)| real::uma_va_of(p + args_off.checked_sub(delta)? as usize)).filter(|v| v % 4 == 0).unwrap_or(shown);
+    let title = real::console_buffer(args).and_then(|(p, _)| Some(p + args_off.checked_sub(delta)? as usize));
+    let va = title.and_then(real::uma_va_of).filter(|v| v % 4 == 0).unwrap_or(shown);
+    let shown = if compare() { shown } else { va };
     let g = guard_of(l)?;
     let slot = g.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
     g.word(SEEN_AT + slot * SLOT + 4 * SEEN_WORD).store(0, Ordering::Release);
@@ -300,7 +316,9 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     l.ResourceBarrier(&[written]);
     l.SetComputeRootSignature(&g.rs);
     l.SetPipelineState(&g.pso);
-    let constants = [max_groups(), slot, id as u32, (id >> 32) as u32, va as u32, (va >> 32) as u32, kind as u32];
+    // (the title's address, for the log; a buffer that is not in unified memory: the GPU's)
+    let at = title.map_or(va, |t| t as u64);
+    let constants = [max_groups(), slot, id as u32, (id >> 32) as u32, at as u32, (at >> 32) as u32, kind as u32];
     l.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr() as *const c_void, 0);
     l.SetComputeRootUnorderedAccessView(1, va);
     l.SetComputeRootUnorderedAccessView(2, g.out_va);
@@ -336,36 +354,54 @@ fn bad_so_far(g: &Guard) -> u32 {
     g.word(0).load(Ordering::Acquire)
 }
 
+/// A counter that stood at `last` when it was last logged and stands at `now`: is it logged again
+/// (the first few, then at each doubling)? It is looked at now and then, so it jumps.
+fn logged_again(last: u64, now: u64) -> bool {
+    now > last && (last < 4 || now.ilog2() > last.ilog2())
+}
+
+/// `report` from elsewhere (the GPU wait watchdog: nothing may be recorded any more).
+pub(super) fn report_now() {
+    let g = GUARD.lock().unwrap().clone();
+    if let Some(g) = g {
+        report(&g);
+    }
+}
+
 /// Log the counts found out of range since the last time (and how often the window and the
 /// title's buffer held different ones).
 fn report(g: &Guard) {
     static DIFFERED: AtomicU64 = AtomicU64::new(0);
-    let d = g.word(4).load(Ordering::Acquire) as u64;
-    if d > DIFFERED.load(Ordering::Relaxed) && (d < 4 || d.is_power_of_two()) && DIFFERED.swap(d, Ordering::Relaxed) < d {
-        crate::xlog_warn!("D3D12.X: ExecuteIndirect: {d} time(s) the title's buffer did not show the counts the memory window holds");
-    }
-    static REPORTED: AtomicU64 = AtomicU64::new(0);
-    let n = bad_so_far(g) as u64;
-    let last = REPORTED.load(Ordering::Relaxed);
-    if n <= last || REPORTED.compare_exchange(last, n, Ordering::Relaxed, Ordering::Relaxed).is_err() {
-        return;
-    }
-    for k in last..n.min(BAD_KEPT as u64) {
-        let at = BAD_AT + k as u32 * BAD_SIZE;
+    static BAD: AtomicU64 = AtomicU64::new(0);
+    static RECORDS: Mutex<u32> = Mutex::new(0);
+    let (bad, d, n) = (bad_so_far(g) as u64, g.word(4).load(Ordering::Acquire) as u64, g.word(8).load(Ordering::Acquire));
+    let records = RECORDS.try_lock();
+    let Ok(mut records) = records else { return };
+    while *records < n.min(BAD_KEPT) {
+        let at = BAD_AT + *records * BAD_SIZE;
+        // (a record the GPU has counted but not written yet is logged the next time)
+        if g.word(at + 60).load(Ordering::Acquire) == 0 {
+            break;
+        }
+        *records += 1;
         let w: [u32; 16] = std::array::from_fn(|i| g.word(at + 4 * i as u32).load(Ordering::Relaxed));
         let id = w[4] as u64 | (w[5] as u64) << 32;
-        let va = w[6] as u64 | (w[7] as u64) << 32;
+        let title = w[6] as u64 | (w[7] as u64) << 32;
         let what = match w[12] {
             0 => format!("CS {id:016x}: {:#x} x {:#x} x {:#x} groups", w[0], w[1], w[2]),
             _ => format!("VS {id:016x}: {:#x} vertices or indices x {:#x} instances", w[0], w[1]),
         };
-        let shown = if w[13] != 0 { format!(" (the title's buffer shows {:#x}, {:#x}, {:#x})", w[8], w[9], w[10]) } else { String::new() };
-        crate::xlog_warn!("D3D12.X: ExecuteIndirect of {what} at GPU {va:#x}{shown} – out of range, not run ({n} so far)");
+        let shown = if w[13] & 1 != 0 { format!(" (the title's buffer shows {:#x}, {:#x}, {:#x})", w[8], w[9], w[10]) } else { String::new() };
+        let verdict = if w[13] & 2 != 0 { "out of range, not run" } else { "run" };
+        crate::xlog_warn!("D3D12.X: ExecuteIndirect of {what}, arguments at {title:#x}{shown} – {verdict} ({bad} out of range so far)");
     }
-    if last < BAD_KEPT as u64 || n.ilog2() == last.max(1).ilog2() {
-        return;
+    drop(records);
+    for (counter, now, what) in [(&BAD, bad, "counts out of range so far, not run"), (&DIFFERED, d, "time(s) the title's buffer did not show the counts the memory window holds")] {
+        let last = counter.load(Ordering::Relaxed);
+        if logged_again(last, now) && counter.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() && last >= BAD_KEPT as u64 {
+            crate::xlog_warn!("D3D12.X: ExecuteIndirect: {now} {what}");
+        }
     }
-    crate::xlog_warn!("D3D12.X: ExecuteIndirect: {n} counts out of range so far, not run");
 }
 
 #[cfg(test)]
@@ -438,14 +474,26 @@ mod tests {
         fence::wait(&done, 1, dev, None, 10_000).unwrap();
     }
 
-    /// Garbage counts run 0 groups and are kept for the log; counts in range run as they are.
+    #[test]
+    fn a_counter_is_logged_at_its_first_values_and_at_each_doubling_however_it_jumps() {
+        assert!(logged_again(0, 1) && logged_again(0, 7) && logged_again(3, 5));
+        assert!(logged_again(7, 8) && logged_again(7, 100) && logged_again(64, 129));
+        assert!(!logged_again(7, 7) && !logged_again(8, 15) && !logged_again(100, 127));
+    }
+
+    /// Garbage counts run 0 groups and are kept for the log; counts in range run as they are. Each
+    /// case takes the slot the one before it ran from, so that a guard that writes nothing would
+    /// run that one's counts.
     #[test]
     fn an_execute_indirect_with_garbage_counts_runs_no_groups() {
         // the counts the memory holds, and the groups that may run
-        let cases: [([u32; 3], u32); 6] = [
+        let cases: [([u32; 3], u32); 8] = [
             ([7, 1, 1], 7),
             ([3, 4, 5], 60),
             ([0, 1, 1], 0),
+            ([7, 1, 1], 7),
+            // (garbage beside a 0 runs nothing as it is)
+            ([0x3F80_0000, 0, 1], 0),
             // the bits of 1.0f, a count below 2^32 that is none, and a product too large
             ([0x3F80_0000, 1, 1], 0),
             ([1, 0xFFFF_FFFF, 1], 0),
@@ -491,7 +539,11 @@ void main() { c.InterlockedAdd(0, 1u); }
                 type Ei = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
                 let ei: Ei = std::mem::transmute(real::orig_fn(raw, 59));
                 let before = GUARD.lock().unwrap().as_ref().map_or(0, |g| bad_so_far(g));
+                if let Some(g) = GUARD.lock().unwrap().as_ref() {
+                    g.next.store(0, Ordering::Relaxed);
+                }
                 let checked = check(raw, 0, s, 1, a, off, 0).expect("checked");
+                assert!(k == 0 || checked.slot == 0);
                 list.SetComputeRootSignature(&rs);
                 list.SetPipelineState(&pso);
                 list.SetComputeRootUnorderedAccessView(0, groups.GetGPUVirtualAddress());
@@ -500,7 +552,7 @@ void main() { c.InterlockedAdd(0, 1u); }
                 assert_eq!(std::ptr::read_volatile(groups_at), *runs, "{want:x?}: groups run");
                 assert_eq!(counts(checked.slot), Some(*want), "{want:x?}: what the CPU sees");
                 let bad = bad_so_far(&checked.guard) - before;
-                assert_eq!(bad, (*runs == 0 && want[0] != 0) as u32, "{want:x?}: counted as out of range");
+                assert_eq!(bad, (*runs == 0 && !want.contains(&0)) as u32, "{want:x?}: counted as out of range");
             }
             // a count buffer or several commands: not checked; nor a signature with more arguments
             let (_alloc, list) = title_list(&dev, ty);
