@@ -245,6 +245,19 @@ pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
     Some((UMA_BUFFER.lock().ok()?.get(k)?.0, (p - base) as u64))
 }
 
+/// `uma_window_buffer`, and a view window's buffer too: for a caller that hands the range to
+/// the GPU only, or reads and writes it on the CPU at `view_want::cpu` of the address (the CPU
+/// cannot touch a GPU view), and that has asked for its tiles (`view_want::want`).
+pub(super) fn uma_window_buffer_gpu(p: usize, len: usize) -> Option<(usize, u64)> {
+    let u = crate::gpu::uma::get()?;
+    let k = u.window_of(p)?;
+    let (base, size) = u.window(k);
+    if p - base + len > size {
+        return None;
+    }
+    Some((UMA_BUFFER.lock().ok()?.get(k)?.0, (p - base) as u64))
+}
+
 /// GPU virtual address of a UMA address (None: not in UMA or not open on the GPU).
 pub fn uma_va_of(p: usize) -> Option<u64> {
     let u = crate::gpu::uma::get()?;
