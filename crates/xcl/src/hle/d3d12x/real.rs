@@ -4283,7 +4283,8 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
-        if let (Some(p), Some(b)) = (disk.as_deref(), keep_compute_blob(key, *ppv, dxil.len())) {
+        let (memory, to_disk) = compute_blob_kept(dxil.len(), in_driver, driver_cache::compute_keep_threshold());
+        if let (Some(p), Some(b)) = (disk.as_deref(), keep_compute_blob(key, *ppv, memory, to_disk && disk.is_some())) {
             driver_cache::keep(p, &b, in_driver);
         }
     } else if reused && from_disk {
@@ -4402,7 +4403,7 @@ pub(crate) mod driver_cache {
 
     /// Compute builds shorter than this keep no file (`COMPUTE_KEEP`; `XCL_PSO_DISK_CACHE_MIN_MS`
     /// to choose, as for the others).
-    fn compute_keep_threshold() -> std::time::Duration {
+    pub(super) fn compute_keep_threshold() -> std::time::Duration {
         static MIN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
         *MIN.get_or_init(|| keep_threshold_of(std::env::var("XCL_PSO_DISK_CACHE_MIN_MS").ok().as_deref(), COMPUTE_KEEP))
     }
@@ -4601,7 +4602,8 @@ pub(crate) mod driver_cache {
 /// up to `COMPUTE_BLOBS_MAX` bytes across ordinary compute and both two-pass PSOs.
 static COMPUTE_BLOBS: Mutex<Option<(HashMap<(u64, usize, i32), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
 const COMPUTE_BLOBS_MAX: usize = 512 << 20;
-/// smaller programs compile in milliseconds: not kept
+/// smaller programs mostly compile in milliseconds: not kept (a compute one's slow build only on
+/// disk: `compute_blob_kept`)
 const COMPUTE_BLOB_MIN_DXIL: usize = 16 << 10;
 
 fn compute_blob_key(dxil: &[u8], rs: usize, flags: i32) -> (u64, usize, i32) {
@@ -4669,6 +4671,17 @@ mod compute_blob_tests {
 
         assert!(super::remember_compute_blob(&mut store, (5, 6, 0), Vec::new()).is_none(), "an empty blob is nothing to keep");
     }
+
+    /// A small program's slow build keeps its blob on disk (not in memory); a big program's is
+    /// kept in memory, and on disk when its build was slow, as before.
+    #[test]
+    fn a_small_programs_slow_build_keeps_its_blob_on_disk() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(super::compute_blob_kept(4392, ms(228), ms(20)), (false, true), "4 KB of DXIL, 228 ms in the driver");
+        assert_eq!(super::compute_blob_kept(4392, ms(5), ms(20)), (false, false));
+        assert_eq!(super::compute_blob_kept(super::COMPUTE_BLOB_MIN_DXIL, ms(5), ms(20)), (true, false));
+        assert_eq!(super::compute_blob_kept(827_344, ms(57_200), ms(20)), (true, true));
+    }
 }
 
 fn store_compute_blob(key: (u64, usize, i32), blob: std::sync::Arc<Vec<u8>>) {
@@ -4706,16 +4719,28 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     (!bytes.is_empty()).then_some(bytes)
 }
 
+/// What the driver's blob of a compute build is kept for: (in memory, on disk). Memory takes a
+/// program of `COMPUTE_BLOB_MIN_DXIL` or more; the disk a build of `min` or longer whatever the
+/// program's size: a small program without its file is compiled again in every run, at its
+/// first bind (a retail title's thread spent 228 ms in the driver on one of 4 KB).
+fn compute_blob_kept(dxil_len: usize, took: std::time::Duration, min: std::time::Duration) -> (bool, bool) {
+    (dxil_len >= COMPUTE_BLOB_MIN_DXIL, took >= min)
+}
+
 /// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
-/// passes owned by `TwoPassPso`).
-unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) -> Option<std::sync::Arc<Vec<u8>>> {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() {
+/// passes owned by `TwoPassPso`), for the disk (`disk`) and in memory (`memory`) – as
+/// `compute_blob_kept` chooses.
+unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, memory: bool, disk: bool) -> Option<std::sync::Arc<Vec<u8>>> {
+    if !(memory || disk) || pso.is_null() {
         return None;
     }
     if let Some(b) = compute_blob(key) {
         return Some(b);
     }
     let bytes = read_pso_cached_blob(pso)?;
+    if !memory {
+        return (!bytes.is_empty()).then(|| std::sync::Arc::new(bytes));
+    }
     let mut g = COMPUTE_BLOBS.lock().unwrap();
     remember_compute_blob(g.get_or_insert_with(|| (HashMap::new(), 0)), key, bytes)
 }
