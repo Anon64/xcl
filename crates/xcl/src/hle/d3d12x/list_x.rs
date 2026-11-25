@@ -3891,6 +3891,7 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
     super::bind::heaps_changed(this);
+    super::bind::set_heaps(this, if heaps.is_null() { &[] } else { std::slice::from_raw_parts(heaps, n as usize) });
     if heaps.is_null() || n == 0 {
         // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heap again
         // before a translated draw or dispatch reads the memory windows from it)
