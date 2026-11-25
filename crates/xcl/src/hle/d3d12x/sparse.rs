@@ -1182,6 +1182,8 @@ impl State {
         }
         for (wi, tiles) in by_window {
             let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
+            TILE_WORK[0].fetch_add(tiles.len() as u64, Ordering::Relaxed);
+            TILE_WORK[1].fetch_add(1, Ordering::Relaxed);
             self.map_tiles(&r, b, &tiles);
         }
         self.signal();
@@ -1557,6 +1559,7 @@ impl State {
             for &(dst, off, len, gen) in &copies {
                 self.copy_back(job.ptr, dst, off, len, gen);
             }
+            TILE_WORK[3].fetch_add(copies.iter().map(|c| c.2 as u64).sum(), Ordering::Relaxed);
             RB_PENDING.fetch_sub(1, Ordering::Release);
             job.copies = copies;
             job.copies.clear();
@@ -2438,6 +2441,7 @@ impl State {
         }
         for (wi, ts) in by_window {
             let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
+            TILE_WORK[2].fetch_add(ts.len() as u64, Ordering::Relaxed);
             self.unmap_tiles(&r, b, &ts);
         }
         self.signal();
@@ -3147,6 +3151,7 @@ unsafe fn run_copies(jobs: &mut Vec<(usize, usize, usize)>, staging: *mut u8) {
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
     let mut g = lock_first(&STATE, &SUBMITS_WAITING);
+    let t_got = super::look_stats::deep().then(std::time::Instant::now);
     forget_released(&mut g);
     let Some(s) = g.as_mut() else { return };
     if MIRROR_ASKING.swap(false, Ordering::AcqRel) {
@@ -3155,34 +3160,109 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let waited = t0.elapsed().as_micros() as u64;
     PHASES[0].fetch_add(waited, Ordering::Relaxed);
     SUBMIT_US.fetch_add(waited, Ordering::Relaxed);
+    if let Some(t_got) = t_got {
+        LOCK_SPLIT.add(LS_WAIT, (t_got - t0).as_micros() as u64);
+        LOCK_SPLIT.add(LS_ALL, waited);
+    }
     s.before_execute_on(queue, dirty, page);
 }
 
 /// microseconds in `before_execute`, the wait for the state's lock with it
 static SUBMIT_US: AtomicU64 = AtomicU64::new(0);
 
+/// `XCL_LOOK_STATS=2`: the parts of what `submit_cost` calls "sparse lock" (`PHASES[0]`: the wait
+/// for the state's lock and the work before the scan), in µs but where said: a long wait asks for
+/// less work under the lock elsewhere, the parts for less of that work here. (The pages of the
+/// tiles that came to show a CPU view are gathered after it: the scan split's gather.)
+static LOCK_SPLIT: super::look_stats::Sums<11> = super::look_stats::Sums::new();
+const LS_SUBMITS: usize = 0;
+/// `PHASES[0]` of these submits
+const LS_ALL: usize = 1;
+const LS_WAIT: usize = 2;
+/// landing finished copies back, and their bytes
+const LS_BACK: usize = 3;
+const LS_BACK_BYTES: usize = 4;
+/// the tiles over CPU views (`map_mirrors`, `mirror_writes`)
+const LS_VIEWS: usize = 5;
+/// `flush_pending`, its tiles and calls
+const LS_MAP: usize = 6;
+const LS_MAP_TILES: usize = 7;
+const LS_MAP_CALLS: usize = 8;
+/// `flush_parked` (with the pools it left free), its tiles
+const LS_UNMAP: usize = 9;
+const LS_UNMAP_TILES: usize = 10;
+
+/// so far: [tiles `flush_pending` mapped, its calls, tiles `flush_parked` unmapped, bytes of
+/// copies back landed] (read under the state's lock, which all of them are done with)
+static TILE_WORK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The sparse lock split line of `x` (`LOCK_SPLIT`'s sums), as averages a submit.
+fn lock_split_line(x: &[u64; 11]) -> String {
+    let n = x[LS_SUBMITS].max(1) as f64;
+    let ms = |k: usize| x[k] as f64 / n / 1e3;
+    let parts = [LS_WAIT, LS_BACK, LS_VIEWS, LS_MAP, LS_UNMAP].iter().map(|&k| x[k]).sum::<u64>();
+    format!(
+        "sparse lock split ({} submits): wait {:.3} ms, copies back {:.3} ms ({:.0} KB), GPU-view tiles {:.3} ms, mappings {:.3} ms ({:.1} tiles in {:.1} calls), unmappings {:.3} ms ({:.1} tiles), rest {:.3} ms a submit (of {:.3} ms)",
+        x[LS_SUBMITS],
+        ms(LS_WAIT),
+        ms(LS_BACK),
+        x[LS_BACK_BYTES] as f64 / n / 1024.0,
+        ms(LS_VIEWS),
+        ms(LS_MAP),
+        x[LS_MAP_TILES] as f64 / n,
+        x[LS_MAP_CALLS] as f64 / n,
+        ms(LS_UNMAP),
+        x[LS_UNMAP_TILES] as f64 / n,
+        x[LS_ALL].saturating_sub(parts) as f64 / n / 1e3,
+        ms(LS_ALL)
+    )
+}
+
 impl State {
     /// `before_execute` with the state locked
     unsafe fn before_execute_on(&mut self, queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
         let t0 = std::time::Instant::now();
         let s = self;
+        // (`XCL_LOOK_STATS=2`: the time after each step, and the work counted so far)
+        let split = super::look_stats::deep();
+        let stamp = || split.then(std::time::Instant::now);
+        let work0: [u64; 4] = std::array::from_fn(|k| if split { TILE_WORK[k].load(Ordering::Relaxed) } else { 0 });
         // (copies back done before the tiles change below: a page that stops being a hole there
         // would take what the GPU had in it)
         s.drain_readbacks(Drain::Finished);
+        let t_back = stamp();
         // tiles asked to show CPU views, and the CPU writes that change them: before the flushes
         // below, so their mappings reach the title's work (a tile taken back from `parked` needs
         // none)
         s.map_mirrors();
         s.mirror_writes(dirty, page);
+        let t_views = stamp();
         // the title's work sees what was committed mapped …
         s.flush_pending();
         PENDING.store(false, Ordering::Release);
+        let t_map = stamp();
         // the title's work sees what was decommitted unmapped, as it was
         if s.flush_parked() {
             s.retire_free_pools();
         }
         let t_locked = std::time::Instant::now();
         PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
+        if let (Some(t_back), Some(t_views), Some(t_map)) = (t_back, t_views, t_map) {
+            let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
+            let work = |k: usize| TILE_WORK[k].load(Ordering::Relaxed) - work0[k];
+            LOCK_SPLIT.add(LS_ALL, us(t0, t_locked));
+            LOCK_SPLIT.add(LS_BACK, us(t0, t_back));
+            LOCK_SPLIT.add(LS_BACK_BYTES, work(3));
+            LOCK_SPLIT.add(LS_VIEWS, us(t_back, t_views));
+            LOCK_SPLIT.add(LS_MAP, us(t_views, t_map));
+            LOCK_SPLIT.add(LS_MAP_TILES, work(0));
+            LOCK_SPLIT.add(LS_MAP_CALLS, work(1));
+            LOCK_SPLIT.add(LS_UNMAP, us(t_map, t_locked));
+            LOCK_SPLIT.add(LS_UNMAP_TILES, work(2));
+            if LOCK_SPLIT.add(LS_SUBMITS, 1) >= 1024 {
+                crate::xlog_info!("D3D12.X: {}", lock_split_line(&LOCK_SPLIT.take()));
+            }
+        }
         let zero_runs = zero_runs(std::mem::take(&mut s.to_zero));
         for &(a, n) in &zero_runs {
             s.clear_sent_range(a, n);
@@ -3430,6 +3510,31 @@ mod tests {
             }
         }
         runs.into_iter().collect()
+    }
+
+    /// The sparse lock split: the parts and the rest are the whole, as averages a submit.
+    #[test]
+    fn the_sparse_lock_parts_and_rest_are_the_whole() {
+        let mut x = [0u64; 11];
+        x[LS_SUBMITS] = 4;
+        x[LS_ALL] = 4_000;
+        x[LS_WAIT] = 1_000;
+        x[LS_BACK] = 400;
+        x[LS_BACK_BYTES] = 8 << 10;
+        x[LS_VIEWS] = 200;
+        x[LS_MAP] = 1_200;
+        x[LS_MAP_TILES] = 10;
+        x[LS_MAP_CALLS] = 2;
+        x[LS_UNMAP] = 800;
+        x[LS_UNMAP_TILES] = 6;
+        assert_eq!(
+            lock_split_line(&x),
+            "sparse lock split (4 submits): wait 0.250 ms, copies back 0.100 ms (2 KB), GPU-view tiles 0.050 ms, mappings 0.300 ms (2.5 tiles in 0.5 calls), unmappings 0.200 ms (1.5 tiles), rest 0.100 ms a submit (of 1.000 ms)"
+        );
+        // (parts counted over a submit that ended after the sums were taken: no negative rest)
+        x[LS_ALL] = 0;
+        assert!(lock_split_line(&x).contains("rest 0.000 ms"));
+        assert!(lock_split_line(&[0; 11]).starts_with("sparse lock split (0 submits): wait 0.000 ms"));
     }
 
     /// A device of the test's own (a software one without a GPU).

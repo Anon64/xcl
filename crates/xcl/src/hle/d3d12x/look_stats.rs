@@ -86,8 +86,9 @@ impl<const N: usize> Sums<N> {
         Sums([const { AtomicU64::new(0) }; N])
     }
 
-    pub(super) fn add(&self, k: usize, v: u64) {
-        self.0[k].fetch_add(v, Ordering::Relaxed);
+    /// (the sum with it)
+    pub(super) fn add(&self, k: usize, v: u64) -> u64 {
+        self.0[k].fetch_add(v, Ordering::Relaxed) + v
     }
 
     pub(super) fn take(&self) -> [u64; N] {
@@ -285,7 +286,7 @@ mod tests {
             for k in 0..4u64 {
                 t.spawn(move || {
                     for _ in 0..1000 {
-                        S.add(0, 1);
+                        assert!(S.add(0, 1) >= 1);
                         S.add(2, k);
                     }
                 });
