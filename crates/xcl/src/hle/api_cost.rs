@@ -1,5 +1,5 @@
-//! Diagnostic (`XCL_ACTIVITY`): the time the title's threads spend in some of XCL's calls while it
-//! loads, summed over the threads.
+//! Diagnostic (`XCL_ACTIVITY`, and `pso_async`'s pipeline line): the time the title's threads
+//! spend in some of XCL's calls while it loads, summed over the threads.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -11,14 +11,17 @@ pub enum Call {
     PhysicalPages,
     Memory,
     Pipeline,
+    /// a bind's wait for a pipeline still being built (`pso_async::resolve_wait`)
+    PipelineWait,
 }
 
-pub const CALLS: [(Call, &str); 5] = [
+pub const CALLS: [(Call, &str); 6] = [
     (Call::PlacedTexture, "placed textures"),
     (Call::PlacedBuffer, "placed buffers"),
     (Call::PhysicalPages, "physical page calls"),
     (Call::Memory, "memory calls"),
     (Call::Pipeline, "pipelines"),
+    (Call::PipelineWait, "waits for pipelines being built"),
 ];
 
 /// calls, microseconds

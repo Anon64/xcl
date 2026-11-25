@@ -3697,7 +3697,7 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// for one of the `XCL_HUGE_PSO_CONCURRENCY` slots. NVIDIA's compiler (nvgpucomp64) takes
 /// minutes and ~1 GB for a 1 – 2 MB program; ~20 of them at once (one per worker) were slower
 /// in total than 1 – 2 at a time. Small programs (ms each) never wait.
-fn huge_pso_bytes() -> usize {
+pub(super) fn huge_pso_bytes() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_BYTES").ok().as_deref(), 256 << 10, 1, usize::MAX))
 }
@@ -3771,11 +3771,16 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let log = pso_trace() || bytes >= huge_pso_bytes();
+    if bytes >= huge_pso_bytes() {
+        super::pso_async::note_huge();
+    }
     if log {
         let record = record.map_or_else(String::new, |(hash, cached)| {
             format!(", record {hash:016x}, driver blob {}", if cached { "supplied" } else { "absent" })
         });
-        crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
+        let stages = if kind.starts_with("graphics") { GRAPHICS_STAGES.with(|s| s.get()) } else { None };
+        let before = stages.map_or_else(String::new, |(vs, ps)| stage_note(super::pso_async::job_elapsed(), vs, ps, waited));
+        crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}{before}");
     }
     let started = std::time::Instant::now();
     let r = build();
@@ -3784,6 +3789,26 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, slot.is_some(), waited));
     }
     (r, took)
+}
+
+thread_local! {
+    /// The translation and DXC compile of the VS and the PS of the graphics pipeline this
+    /// thread builds (`translated_graphics_pso_once`), for the driver compile log.
+    static GRAPHICS_STAGES: std::cell::Cell<Option<(std::time::Duration, std::time::Duration)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Where a graphics pipeline's time went before the driver's compile (`job`: since its build
+/// started on a worker, None elsewhere): the VS's and the PS's translation and DXC compile
+/// (waits of DXC for memory included), the wait for the huge-pipeline gate (slot and commit),
+/// and the rest (root signature, driver blob lookup). Measured on a retail title: 4 – 7 s for
+/// a 300 – 480 KB stage, one after the other, before 3 – 8 s in the driver.
+fn stage_note(job: Option<std::time::Duration>, vs: std::time::Duration, ps: std::time::Duration, waited: std::time::Duration) -> String {
+    let ms = |d: std::time::Duration| d.as_millis();
+    let stages = format!("VS {} ms, PS {} ms, gate {} ms", ms(vs), ms(ps), ms(waited));
+    match job {
+        Some(job) => format!("; {} ms since its build started: {stages}, other {} ms", ms(job), ms(job.saturating_sub(vs + ps + waited))),
+        None => format!("; {stages}"),
+    }
 }
 
 /// How a logged driver compile went through the huge-pipeline gate.
@@ -3901,6 +3926,13 @@ mod big_compile_tests {
         assert_eq!(gate_note(true, true, true, ms), ", gated (waited 5 ms)");
         assert!(gate_note(true, true, false, ms).contains("wanted at once"));
         assert!(gate_note(true, false, false, ms).contains("ungated here"));
+    }
+
+    #[test]
+    fn a_graphics_compile_log_says_where_the_time_went_before_it() {
+        let s = Duration::from_secs;
+        assert_eq!(stage_note(Some(s(10)), s(4), s(3), s(1)), "; 10000 ms since its build started: VS 4000 ms, PS 3000 ms, gate 1000 ms, other 2000 ms");
+        assert_eq!(stage_note(None, s(4), s(3), s(0)), "; VS 4000 ms, PS 3000 ms, gate 0 ms");
     }
 
     #[test]
@@ -5110,6 +5142,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     // picks; RDNA2 does for pixel shaders): the lanes 32..63 it reads come from `upper_lanes`
     // (split_wave64)
     let split = graphics_wave32(this);
+    let vs_started = std::time::Instant::now();
     let vs_c = match console_to_dxil_for(vs, Stage::Vertex, 0, split) {
         Ok(b) => b,
         Err(e) => {
@@ -5119,6 +5152,8 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     };
     let mut samplers = vs_c.samplers;
     let vs_dxil = vs_c.dxil;
+    let ps_started = std::time::Instant::now();
+    let vs_took = ps_started - vs_started;
     let ps_dxil = match shader_bytes(&d.PS) {
         Some(p) if is_console(p) => match console_to_dxil_for(p, Stage::Pixel, samplers.len() as u32, split) {
             Ok(b) => {
@@ -5133,6 +5168,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         Some(p) => Some(p.to_vec()),
         None => None,
     };
+    let ps_took = ps_started.elapsed();
     let rs = abi_rs_for(this, &samplers)?;
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
@@ -5162,6 +5198,8 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     // (no file without the adapter's identity: it could be another adapter's)
     let driver = driver_identity(this);
     let disk = driver.and_then(|id| driver_cache::graphics_path(driver_cache::graphics_file_hash(gkey, id, crate::gpu::recomp::pso::mem_windows()), bytes));
+    // (for the driver compile log of this pipeline only)
+    GRAPHICS_STAGES.with(|s| s.set(Some((vs_took, ps_took))));
     let build = graphics_pso_through_cache(
         gkey,
         disk.as_deref(),
@@ -5172,6 +5210,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
         || keep_graphics_blob(gkey, *ppv, bytes),
     );
+    GRAPHICS_STAGES.with(|s| s.set(None));
     let hr = build.hr;
     if hr < 0 {
         note_translation_error(format!(

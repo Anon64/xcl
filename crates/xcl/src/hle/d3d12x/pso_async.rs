@@ -30,6 +30,12 @@ struct Pending {
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
     late: std::sync::atomic::AtomicBool,
     demand: Mutex<Demand>,
+    /// made by `submit_lazy` (the pipeline line counts these)
+    lazy: bool,
+    /// its build gave the driver a huge program (`note_huge`)
+    huge: std::sync::atomic::AtomicBool,
+    /// a wait for it passed 1 s and was logged (once a pipeline)
+    warned: std::sync::atomic::AtomicBool,
 }
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
@@ -43,6 +49,34 @@ struct Demand {
 thread_local! {
     /// what this worker is building
     static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
+    /// when the build this thread runs (`run_job`) started
+    static JOB_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    /// the build this thread runs gave the driver a huge program (`note_huge`)
+    static JOB_HUGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `p`'s build `job` on this thread (a worker's, or a bind's that took it): its time and
+/// whether its program was huge are noted for the logs.
+fn run_job(p: &Pending, job: Job) -> usize {
+    JOB_START.with(|s| s.set(Some(std::time::Instant::now())));
+    JOB_HUGE.with(|h| h.set(false));
+    let real = job();
+    JOB_START.with(|s| s.set(None));
+    if JOB_HUGE.with(|h| h.replace(false)) {
+        p.huge.store(true, Ordering::Relaxed);
+    }
+    real
+}
+
+/// The time since the build this thread runs started (None: it runs none): the driver compile
+/// log says where a slow pipeline's time went before the driver got it.
+pub(super) fn job_elapsed() -> Option<std::time::Duration> {
+    JOB_START.with(|s| s.get()).map(|t| t.elapsed())
+}
+
+/// The build this thread runs gives the driver a huge program (`real::huge_pso_bytes`).
+pub(super) fn note_huge() {
+    JOB_HUGE.with(|h| h.set(true));
 }
 
 /// This thread is a worker and one of the title's threads waits for what it is building: the
@@ -73,7 +107,7 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, job());
+    complete(p, run_job(p, job));
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
@@ -119,6 +153,15 @@ fn complete(p: &Pending, real: usize) {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
         BUILT.fetch_add(1, Ordering::Relaxed);
+        if p.lazy {
+            LAZY_BUILT.fetch_add(1, Ordering::Relaxed);
+            if !p.used.load(Ordering::Relaxed) {
+                LAZY_AHEAD.fetch_add(1, Ordering::Relaxed);
+            }
+            if p.huge.load(Ordering::Relaxed) {
+                LAZY_HUGE.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
     let orphan = {
         let mut done = p.done.lock().unwrap();
@@ -137,6 +180,79 @@ fn complete(p: &Pending, real: usize) {
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
+/// lazy pipelines (`submit_lazy`) made, of them graphics; built, of them before their first use,
+/// and with a huge program
+static LAZY_MADE: AtomicUsize = AtomicUsize::new(0);
+static LAZY_GRAPHICS: AtomicUsize = AtomicUsize::new(0);
+static LAZY_BUILT: AtomicUsize = AtomicUsize::new(0);
+static LAZY_AHEAD: AtomicUsize = AtomicUsize::new(0);
+static LAZY_HUGE: AtomicUsize = AtomicUsize::new(0);
+
+/// What the pipeline line (`stats_line`) shows.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+struct Stats {
+    made: usize,
+    graphics: usize,
+    built: usize,
+    ahead: usize,
+    huge: usize,
+    /// binds' waits for pipelines being built: (waits, µs) so far (`api_cost::Call::PipelineWait`)
+    waits: (u64, u64),
+}
+
+fn stats() -> Stats {
+    let l = |a: &AtomicUsize| a.load(Ordering::Relaxed);
+    Stats {
+        made: l(&LAZY_MADE),
+        graphics: l(&LAZY_GRAPHICS),
+        built: l(&LAZY_BUILT),
+        ahead: l(&LAZY_AHEAD),
+        huge: l(&LAZY_HUGE),
+        waits: crate::hle::api_cost::totals()[crate::hle::api_cost::Call::PipelineWait as usize],
+    }
+}
+
+/// The pipeline line for `now` when something changed since `last` (written 2 s before): how
+/// many lazy pipelines the title made, how many are built and how many of those before their
+/// first use (a bind did not wait for them), and how long binds stood still waiting for
+/// pipelines in those 2 s (counted when a wait ends).
+fn stats_line(now: &Stats, last: &Stats, huge_kb: usize) -> Option<String> {
+    if now == last {
+        return None;
+    }
+    Some(format!(
+        "D3D12.X: lazy pipelines: {} made ({} graphics), {} built ({} before their first use, {} with {huge_kb} KB of DXIL or more); binds waited {} ms for pipelines being built ({} waits in 2 s)",
+        now.made,
+        now.graphics,
+        now.built,
+        now.ahead,
+        now.huge,
+        (now.waits.1 - last.waits.1) / 1000,
+        now.waits.0 - last.waits.0,
+    ))
+}
+
+/// The pipeline line every 2 s while it changes (`stats_line`).
+fn start_stats() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    // (a test's pipelines are not the title's)
+    if cfg!(test) {
+        return;
+    }
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-pso-stats".into()).spawn(|| {
+            let mut last = Stats::default();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let now = stats();
+                if let Some(line) = stats_line(&now, &last, super::real::huge_pso_bytes() >> 10) {
+                    crate::xlog_info!("{line}");
+                }
+                last = now;
+            }
+        });
+    });
+}
 /// binds waiting right now for a pipeline still being built (`title_held`)
 static HELD: AtomicUsize = AtomicUsize::new(0);
 
@@ -233,7 +349,17 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         orphan: Default::default(),
         late: Default::default(),
         demand: Default::default(),
+        lazy: !send,
+        huge: Default::default(),
+        warned: Default::default(),
     });
+    if !send {
+        LAZY_MADE.fetch_add(1, Ordering::Relaxed);
+        if !compute {
+            LAZY_GRAPHICS.fetch_add(1, Ordering::Relaxed);
+        }
+        start_stats();
+    }
     PENDING.insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -484,6 +610,61 @@ mod used_tests {
         let _ = released(standin);
     }
 
+    /// The pipeline line's counts: lazy pipelines made (graphics among them), built at their
+    /// first use or before it, with a huge program; a bind's wait is counted with its time, and
+    /// one under a second is not logged.
+    #[test]
+    fn lazy_pipelines_and_the_waits_for_them_are_counted() {
+        let before = stats();
+        let (first_use, ahead) = (0x7E57_C001usize, 0x7E57_C002usize);
+        submit_lazy(first_use, true, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            note_huge();
+            0x6161
+        }), 0);
+        let key = 0x5EED_C002u64;
+        used::earlier_run_used(key);
+        submit_lazy(ahead, false, Box::new(|| 0x6262), key);
+        let start = std::time::Instant::now();
+        while is_pending(ahead) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!is_pending(ahead), "built ahead with no bind");
+        assert_eq!(resolve_wait_for(first_use, None), 0x6161);
+        assert!(!entry(first_use).unwrap().warned.load(Ordering::Relaxed), "a short wait is not logged");
+        let after = stats();
+        assert!(after.made >= before.made + 2 && after.graphics > before.graphics, "{before:?} → {after:?}");
+        assert!(after.built >= before.built + 2 && after.ahead > before.ahead && after.huge > before.huge, "{before:?} → {after:?}");
+        assert!(after.waits.0 > before.waits.0 && after.waits.1 >= before.waits.1 + 5000, "{before:?} → {after:?}");
+        released(first_use);
+        released(ahead);
+    }
+
+    /// The line is written when a count changed, with the waits of its 2 s only.
+    #[test]
+    fn the_pipeline_line_comes_when_a_count_changed() {
+        let last = Stats { made: 10, graphics: 8, built: 2, ahead: 1, huge: 0, waits: (3, 4_000_000) };
+        assert_eq!(stats_line(&last, &last, 256), None);
+        let now = Stats { built: 3, waits: (5, 6_500_000), ..last };
+        let line = stats_line(&now, &last, 256).unwrap();
+        assert!(line.contains("10 made (8 graphics), 3 built (1 before their first use, 0 with 256 KB of DXIL or more)"), "{line}");
+        assert!(line.contains("waited 2500 ms for pipelines being built (2 waits in 2 s)"), "{line}");
+    }
+
+    /// A wait that passes a second is noted on its pipeline (and logged once for it).
+    #[test]
+    fn a_wait_past_a_second_is_noted_on_its_pipeline() {
+        let standin = 0x7E57_C003usize;
+        submit(standin, false, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            0x6363
+        }));
+        let p = entry(standin).unwrap();
+        assert_eq!(resolve_wait_for(standin, None), 0x6363);
+        assert!(p.warned.load(Ordering::Relaxed));
+        released(standin);
+    }
+
     #[test]
     fn the_keys_of_a_file_are_read_and_other_lines_passed_over() {
         let keys = used::parse("00000000000000ff\n\nnot a key\n  1a2b \n0\n");
@@ -545,23 +726,103 @@ pub fn resolve_wait(pso: usize) -> usize {
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
-    // (the title's thread is held from here until the pipeline is built or the budget is over)
-    let _held = (!*p.done.lock().unwrap()).then(Held::new);
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
+    if *p.done.lock().unwrap() {
+        return built_or(&p, pso);
+    }
+    // (the title's thread is held from here until the pipeline is built)
+    let mut wait = Wait::new(&p);
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        complete(&p, run_job(&p, job));
     }
     p.want();
-    let mut done = p.done.lock().unwrap();
-    while !*done {
-        done = p.cv.wait(done).unwrap();
-    }
+    wait.until_done(None);
+    built_or(&p, pso)
+}
+
+/// `p`'s real pipeline once built, else `pso` (its stand-in).
+fn built_or(p: &Pending, pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
+    }
+}
+
+/// A wait of one of the title's threads for a pipeline still being built: the title is held
+/// (`title_held`), the time is counted (`api_cost::Call::PipelineWait`, the pipeline line), and
+/// the first wait for a pipeline that passes 1 s is logged with the thread and the pipeline's
+/// kind – a draw or dispatch of the title stands still meanwhile.
+struct Wait<'a> {
+    p: &'a Pending,
+    start: std::time::Instant,
+    /// this wait logged that it passed 1 s
+    logged: bool,
+    _held: Held,
+    _cost: crate::hle::api_cost::Timer,
+}
+
+/// A wait this long is logged (once a pipeline).
+const LONG_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl<'a> Wait<'a> {
+    fn new(p: &'a Pending) -> Wait<'a> {
+        Wait { p, start: std::time::Instant::now(), logged: false, _held: Held::new(), _cost: crate::hle::api_cost::time(crate::hle::api_cost::Call::PipelineWait) }
+    }
+
+    fn kind(&self) -> &'static str {
+        if self.p.compute { "compute" } else { "graphics" }
+    }
+
+    /// Until the pipeline is built (true) or `budget` from the start of the wait is over
+    /// (false; None: no budget).
+    fn until_done(&mut self, budget: Option<std::time::Duration>) -> bool {
+        loop {
+            let waited = self.start.elapsed();
+            if waited >= LONG_WAIT && !self.p.warned.swap(true, Ordering::Relaxed) {
+                self.logged = true;
+                crate::xlog_warn!(
+                    "D3D12.X: thread {} has waited {} ms for a {} pipeline still being built (its draw or dispatch stands still)",
+                    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+                    waited.as_millis(),
+                    self.kind()
+                );
+            }
+            let mut step = budget.map(|b| b.saturating_sub(waited));
+            if !self.p.warned.load(Ordering::Relaxed) {
+                let to_long = LONG_WAIT.saturating_sub(waited);
+                step = Some(step.map_or(to_long, |s| s.min(to_long)));
+            }
+            let done = self.p.done.lock().unwrap();
+            let done = match step {
+                None => self.p.cv.wait_while(done, |d| !*d).unwrap(),
+                Some(s) => self.p.cv.wait_timeout_while(done, s, |d| !*d).unwrap().0,
+            };
+            if *done {
+                return true;
+            }
+            drop(done);
+            if budget.is_some_and(|b| self.start.elapsed() >= b) {
+                return false;
+            }
+        }
+    }
+}
+
+impl Drop for Wait<'_> {
+    fn drop(&mut self) {
+        let waited = self.start.elapsed();
+        // (a bind that built the pipeline itself did not wait on `until_done`)
+        if self.logged || (waited >= LONG_WAIT && !self.p.warned.swap(true, Ordering::Relaxed)) {
+            crate::xlog_warn!(
+                "D3D12.X: thread {} waited {} ms for a {} pipeline being built",
+                unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+                waited.as_millis(),
+                self.kind()
+            );
+        }
     }
 }
 
@@ -591,12 +852,13 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if p.late.load(Ordering::Acquire) {
         return pso;
     }
+    // (the title's thread is held from here until the pipeline is built or the budget is over)
+    let mut wait = Wait::new(p);
     p.want();
-    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
-    if *done {
+    if wait.until_done(Some(budget)) {
         return built(p);
     }
-    drop(done);
+    drop(wait);
     p.late.store(true, Ordering::Release);
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
