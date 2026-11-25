@@ -859,6 +859,18 @@ fn closed_before_last_look(lists: &[*mut c_void]) -> bool {
     lists.iter().all(|&l| m.get(&(l as usize)).is_some_and(|&t| t < began))
 }
 
+/// When the youngest of `lists` was closed (None: one was not seen closing).
+fn youngest_closed(lists: &[*mut c_void]) -> Option<u64> {
+    let g = CLOSED.lock().unwrap();
+    let m = g.as_ref()?;
+    lists.iter().map(|&l| m.get(&(l as usize)).copied()).try_fold(0, |a, t| Some(t?.max(a)))
+}
+
+thread_local! {
+    /// diagnostic: how long ago the youngest list of this thread's submit was closed (µs)
+    static CLOSED_AGO: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// `refresh` before the title's ExecuteCommandLists of `lists` (its own pointers).
 pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
     if BUSY.with(|b| b.get()) {
@@ -881,6 +893,9 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
     let t1 = std::time::Instant::now();
     // (XCL's copy of the frame to its window reads no memory of the title)
     let look = !(old && look_skip()) && !super::present::presenting();
+    if look && super::look_stats::on() {
+        CLOSED_AGO.with(|c| c.set(youngest_closed(lists).map(|t| now_us().saturating_sub(t))));
+    }
     own_work(|| refresh_once(queue, look));
     super::submit_cost::refresh(t1.elapsed());
 }
@@ -1288,6 +1303,7 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
     if look {
         super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
         note_dirty_regions(u);
+        DIRTY_BUF.with(|d| super::look_stats::look(&d.borrow(), watch_t0.elapsed(), CLOSED_AGO.with(|c| c.take())));
     }
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's

@@ -2208,6 +2208,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     scan_pages(&pages, &mut dirty_runs);
     let t_scanned = std::time::Instant::now();
+    super::look_stats::scan(pages.len(), &dirty_runs);
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
