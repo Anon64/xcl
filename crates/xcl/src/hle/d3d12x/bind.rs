@@ -2054,6 +2054,16 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     if super::real::skip_named_cs(pso) {
         return Ok(());
     }
+    // (the PC takes 65 535 groups a dimension at most, the debug layer's id 1296: what it does
+    // with more is not defined. A retail title dispatches 82 606 x 1 x 1 in its world every
+    // frame. Said, with the program, until such a dispatch is run in parts)
+    if x.max(y).max(z) > 65_535 {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            let cs = super::real::pso_shaders(pso).map_or(0, |(cs, _)| cs);
+            crate::xlog_warn!("D3D12.X: Dispatch of {x} x {y} x {z} groups with cs {cs:016x}: past the PC's 65 535 groups a dimension");
+        }
+    }
     bind_abi(this, list, pso, false, Some([x, y, z]))?;
     let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::Dispatch, [x, y, z]);
     list.Dispatch(x, y, z);
