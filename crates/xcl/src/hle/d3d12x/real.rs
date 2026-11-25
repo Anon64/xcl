@@ -1241,6 +1241,42 @@ unsafe extern "system" fn heap_gpu_start_x(this: *mut c_void) -> u64 {
     h
 }
 
+/// The PC heap behind a console CBV/SRV/UAV or sampler heap of description `d` (PC type): views
+/// an SRV / UAV pair per console slot (in the shared shader-visible heap, the title's own a
+/// CPU-only mirror when `shared` – `console_heap`); samplers one per slot, a shader-visible heap
+/// all a shader can index (`console_heap::pc_samplers`).
+fn pc_descriptor_heap_desc(d: [u32; 4], shared: bool) -> [u32; 4] {
+    let sampler = d[0] == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32;
+    let visible = d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0;
+    let pc_n = if sampler { super::console_heap::pc_samplers(d[1], visible) } else { d[1].saturating_mul(2) };
+    let flags = if shared { d[2] & !(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32) } else { d[2] };
+    [d[0], pc_n, flags, d[3]]
+}
+
+/// Every sampler of the PC sampler heap `heap`, all it holds, made the zero sampler: an S# of
+/// zeros – a slot nothing was written to – is a sampler on the console: point filtering, wrap,
+/// mip 0 only. So a table entry the title left empty samples as there (an unwritten PC
+/// descriptor is undefined), as does an index past the title's slots (`console_heap::pc_samplers`).
+unsafe fn zero_samplers(dev: &ID3D12Device, heap: &ID3D12DescriptorHeap) {
+    let zero = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+        BorderColor: [0.0; 4],
+        MinLOD: 0.0,
+        MaxLOD: 0.0,
+    };
+    let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+    let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as u64;
+    for k in 0..heap.GetDesc().NumDescriptors as u64 {
+        dev.CreateSampler(&zero, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc) as usize });
+    }
+}
+
 unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: *const [u32; 4], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let mut d = if desc.is_null() { [u32::MAX; 4] } else { *desc };
     d[0] = pc_heap_type(d[0]);
@@ -1249,17 +1285,13 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
     if d[0] != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 && !sampler {
         return dev_create_descriptor_heap(this, desc as usize, riid, ppv);
     }
-    // views: an SRV / UAV pair per console slot (in the shared shader-visible heap, the
-    // title's own a CPU-only mirror – `console_heap`); samplers: one per slot, a shader-visible
-    // heap all a shader can index (`console_heap::pc_samplers`)
     let visible = d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0;
-    let pc_n = if sampler { super::console_heap::pc_samplers(d[1], visible) } else { d[1].saturating_mul(2) };
     let shared = match ID3D12Device::from_raw_borrowed(&this) {
         Some(dev) if !sampler && !desc.is_null() => super::console_heap::shared_heap(dev),
         _ => false,
     };
-    let flags = if shared { d[2] & !(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32) } else { d[2] };
-    let pc = [d[0], pc_n, flags, d[3]];
+    let pc = pc_descriptor_heap_desc(d, shared);
+    let flags = pc[2];
     let hr = dev_create_descriptor_heap(this, pc.as_ptr() as usize, riid, ppv);
     if hr >= 0 {
         let raw = *ppv;
@@ -1269,25 +1301,7 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
         let gpu = if flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0 { heap.GetGPUDescriptorHandleForHeapStart().ptr } else { 0 };
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE(d[0] as i32));
         if sampler {
-            // an S# of zeros – a slot nothing was written to – is a sampler on the console: point
-            // filtering, wrap, mip 0 only. Every PC slot starts as that one, so a table entry the
-            // title left empty samples as there (an unwritten PC descriptor is undefined), as does
-            // an index past the title's slots (`console_heap::pc_samplers`).
-            let zero = D3D12_SAMPLER_DESC {
-                Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-                AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-                AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-                AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-                MipLODBias: 0.0,
-                MaxAnisotropy: 1,
-                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
-                BorderColor: [0.0; 4],
-                MinLOD: 0.0,
-                MaxLOD: 0.0,
-            };
-            for k in 0..pc_n as u64 {
-                dev.CreateSampler(&zero, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize });
-            }
+            zero_samplers(dev, heap);
         }
         if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler, shared, visible) {
             crate::xlog_warn!("console descriptor heap: no room in UMA for {} slots", d[1]);
@@ -7866,6 +7880,46 @@ mod this_first_tests {
         }
         if let Some(g) = EXTS.lock().unwrap().as_mut() {
             g.remove(&vtbl);
+        }
+    }
+}
+
+#[cfg(test)]
+mod descriptor_heap_tests {
+    use super::*;
+
+    /// A device on the software adapter, adopted as a title's is.
+    fn warp_device() -> Option<ID3D12Device> {
+        let mut dev: Option<ID3D12Device> = None;
+        unsafe {
+            let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()).ok()?;
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
+            adopt(dev.as_ref()?.as_raw(), Kind::Device);
+        }
+        dev
+    }
+
+    /// A shader-visible console sampler heap of 128 slots (a retail title's) made through device
+    /// #14: its PC heap holds a sampler at every index a translated shader forms (S# word 3 &
+    /// 0x7FF), and each of them, 128 to 2047 too, is the zero sampler slot 0 is. On WARP.
+    #[test]
+    fn a_shader_visible_sampler_heap_has_the_zero_sampler_at_every_index() {
+        let Some(dev) = warp_device() else { return crate::gpu::recomp::runner::skip_test("no WARP device") };
+        let title = [D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32, 128, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32, 0];
+        let riid = &ID3D12DescriptorHeap::IID as *const windows::core::GUID as *const GUID;
+        unsafe {
+            let mut p = std::ptr::null_mut();
+            let hr = dev_create_descriptor_heap_x(dev.as_raw(), &title, riid, &mut p);
+            assert!(hr >= 0 && !p.is_null(), "{hr:#x}");
+            let heap = ID3D12DescriptorHeap::from_raw(p);
+            assert_eq!(heap.GetDesc().NumDescriptors, 2048, "the PC heap");
+            let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
+            let at = |k: usize| std::slice::from_raw_parts((start + k * inc) as *const u8, inc);
+            assert!(at(0).iter().any(|&b| b != 0), "the zero sampler is not zero bytes on WARP");
+            for k in 1..2048 {
+                assert_eq!(at(k), at(0), "PC sampler {k}");
+            }
         }
     }
 }
