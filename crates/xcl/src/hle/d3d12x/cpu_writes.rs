@@ -88,8 +88,25 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
     })
 }
 
+/// Where the CPU writes for the GPU at `va`: at the CPU view behind a GPU view of the title's
+/// memory in a view window (the CPU cannot touch the GPU view; its tiles show the CPU view, and
+/// the write reaches them as any CPU write does), else at `va`.
+fn cpu_at(va: usize) -> usize {
+    cpu_at_in(va, |a| super::view_want::is_view(a as u64))
+}
+
+/// `cpu_at`, with `in_view` saying which addresses lie in a view window.
+fn cpu_at_in(va: usize, in_view: impl Fn(usize) -> bool) -> usize {
+    if in_view(va) {
+        super::view_want::cpu(va as u64) as usize
+    } else {
+        va
+    }
+}
+
 /// The dwords at `va`, if the memory is still there and writable.
 unsafe fn write_now(va: usize, words: &[u32]) {
+    let va = cpu_at(va);
     let bytes = 4 * words.len();
     if !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
         use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
@@ -108,6 +125,7 @@ unsafe fn write_now(va: usize, words: &[u32]) {
 
 /// An 8-byte aligned 64-bit value at `va`, if the memory is still there and writable.
 unsafe fn write_u64_now(va: usize, value: u64) {
+    let va = cpu_at(va);
     let Some(end) = va.checked_add(8) else { return };
     if !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, 8)) {
         use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
@@ -122,8 +140,10 @@ unsafe fn write_u64_now(va: usize, value: u64) {
     (*(va as *const AtomicU64)).store(value, Ordering::Release);
 }
 
-/// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
+/// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later (a GPU view's at its
+/// CPU view, `cpu_at`).
 pub(super) fn writable(va: usize, bytes: usize) -> bool {
+    let va = cpu_at(va);
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
         return true;
     }
@@ -198,6 +218,24 @@ mod tests {
             }
             assert_eq!(*cell, [7, 9]);
         }
+    }
+
+    /// A write for the GPU into a GPU view of the title's memory is made at the CPU view behind
+    /// it (the CPU cannot touch the GPU view: such a write was not done); any other address, and
+    /// every one without view windows, is written where it is.
+    #[test]
+    fn a_write_into_a_gpu_view_is_made_at_its_cpu_view() {
+        use crate::hle::kernelx::mirrors;
+        const SIZE: usize = 71 << 16;
+        // (addresses far above anything Windows hands out: only the pairing is used)
+        let (c, g) = (0x7260_0000_0000usize, 0x7268_0000_0000usize);
+        mirrors::reserved(c, SIZE, 0x2040_2000, 0x04);
+        assert!(mirrors::reserved(g, SIZE, 0x2040_2000, 0x801));
+        let view = |a: usize| (g..g + SIZE).contains(&a);
+        assert_eq!(cpu_at_in(g + 0x4_5678, view), c + 0x4_5678);
+        assert_eq!(cpu_at_in(c + 0x10, view), c + 0x10);
+        assert_eq!(cpu_at_in(g + 0x10, |_| false), g + 0x10, "no view windows: as it was");
+        mirrors::released(c);
     }
 
     /// A ReadbackU64 write copies the 64-bit value from the mapped readback buffer after the queue finishes.

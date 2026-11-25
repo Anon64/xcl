@@ -345,11 +345,9 @@ unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
     let ok = match target {
         FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &bytes),
         FillTarget::Virtual => {
-            if !writable(r.destination as usize, n) {
-                return false;
-            }
+            let Some(dest) = cpu_range(r.destination as usize, n).filter(|&d| writable(d, n)) else { return false };
             if n > 0 {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), r.destination as *mut u8, n);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest as *mut u8, n);
             }
             true
         }
@@ -832,6 +830,26 @@ unsafe fn write_title(p: usize, bytes: &[u8]) -> bool {
     st >= 0 && done == bytes.len()
 }
 
+/// Where the CPU reads or writes `[p, p + n)` of the title's memory for a request: a GPU view of
+/// its memory in a view window (`d3d12x::view_want`; the CPU cannot touch it) at the CPU view
+/// behind it, whose pages the view's tiles show – a retail title gives DirectStorage the GPU
+/// view's addresses; any other address as it is. None: the range runs past its GPU view.
+fn cpu_range(p: usize, n: usize) -> Option<usize> {
+    cpu_range_in(p, n, |a| crate::hle::d3d12x::view_want::is_view(a as u64))
+}
+
+/// `cpu_range`, with `in_view` saying which addresses lie in a view window.
+fn cpu_range_in(p: usize, n: usize, in_view: impl Fn(usize) -> bool) -> Option<usize> {
+    use crate::hle::d3d12x::view_want::cpu;
+    if p == 0 || !in_view(p) {
+        return Some(p);
+    }
+    let c = cpu(p as u64) as usize;
+    let last = n.saturating_sub(1);
+    // (the pair maps its range in one piece: the last byte tells whether it ran past it)
+    (cpu(p.checked_add(last)? as u64) as usize == c.checked_add(last)?).then_some(c)
+}
+
 /// Whether `n` bytes at `p` are committed, writable memory.
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
@@ -896,14 +914,26 @@ fn note_request(r: &Request) {
             r.intermediate_size
         );
     }
+    // destinations in a GPU view (written at its CPU view, `cpu_range`)
+    if !r.dest_physical_pages() && crate::hle::d3d12x::view_want::is_view(r.destination) {
+        static VIEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static VIEW_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let k = VIEW.fetch_add(1, Ordering::Relaxed) + 1;
+        let b = VIEW_BYTES.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        if k.is_power_of_two() {
+            crate::xlog_info!("DirectStorage: {k} requests so far into a GPU view of the title's memory ({} MB), written at its CPU view", b >> 20);
+        }
+    }
 }
 
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     note_request(r);
-    let sparse_dest = !r.dest_physical_pages() && in_sparse_memory(r.destination as usize, n);
-    if !r.dest_physical_pages() && !sparse_dest && !writable(r.destination as usize, n) {
+    // (a page list is read where it is: only a destination of bytes can be a GPU view)
+    let dest = if r.dest_physical_pages() { r.destination as usize } else { cpu_range(r.destination as usize, n).ok_or(E_ACCESS_VIOLATION)? };
+    let sparse_dest = !r.dest_physical_pages() && in_sparse_memory(dest, n);
+    if !r.dest_physical_pages() && !sparse_dest && !writable(dest, n) {
         return Err(E_ACCESS_VIOLATION);
     }
     let src: Vec<u8> = if r.memory_source() {
@@ -914,11 +944,12 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
                 return Err(E_ACCESS_VIOLATION);
             }
         } else {
-            if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
+            let at = cpu_range(r.source as usize, b.len()).ok_or(E_ACCESS_VIOLATION)?;
+            if !crate::gpu::shader::readable(at, r.source_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
             if !b.is_empty() {
-                std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
+                std::ptr::copy_nonoverlapping(at as *const u8, b.as_mut_ptr(), b.len());
             }
         }
         b
@@ -1000,15 +1031,16 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
-        crate::hle::kernelx::pagelog::note("DirectStorage write", r.destination as usize, 0, n);
+        crate::hle::kernelx::pagelog::note("DirectStorage write", dest, 0, n);
         if sparse_dest {
-            if !write_title(r.destination as usize, &payload[..n]) {
+            if !write_title(dest, &payload[..n]) {
                 return Err(E_ACCESS_VIOLATION);
             }
         } else {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), dest as *mut u8, n);
         }
-        crate::hle::d3d12x::title_textures::note_known_write(r.destination as usize, n);
+        // (where the bytes are: the CPU view's pages are watched and shown, a GPU view's are not)
+        crate::hle::d3d12x::title_textures::note_known_write(dest, n);
     }
     Ok(())
 }
@@ -1767,6 +1799,29 @@ mod tests {
         assert_eq!(Request::parse(&request(7 << BCPACK_SHIFT, 0x1000, 24, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC7 part block");
         assert_eq!(Request::parse(&request(4 << BCPACK_SHIFT, 0x1000, 12, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC4 part block");
         assert_eq!(Request::parse(&request(0, 0, 64, 0x2000, 0, 64)).check(false), Err(E_ACCESS_VIOLATION));
+    }
+
+    /// A destination (or memory source) in a GPU view of the title's memory is reached at the CPU
+    /// view behind it – the CPU cannot touch the GPU view, and such a request failed with
+    /// E_ACCESS_VIOLATION; a range that runs past the view is refused, and every other address,
+    /// every one without view windows too, is used as it is.
+    #[test]
+    fn a_range_in_a_gpu_view_is_reached_at_its_cpu_view() {
+        use crate::hle::kernelx::mirrors;
+        const SIZE: usize = 67 << 16;
+        // (addresses far above anything Windows hands out: only the pairing is used)
+        let (c, g) = (0x7250_0000_0000usize, 0x7258_0000_0000usize);
+        mirrors::reserved(c, SIZE, 0x2040_2000, 0x04);
+        assert!(mirrors::reserved(g, SIZE, 0x2040_2000, 0x801));
+        let view = |a: usize| (g..g + SIZE).contains(&a);
+        assert_eq!(cpu_range_in(g + 0x1_2340, 0x800, view), Some(c + 0x1_2340));
+        assert_eq!(cpu_range_in(g + SIZE - 0x100, 0x100, view), Some(c + SIZE - 0x100));
+        assert_eq!(cpu_range_in(g + SIZE - 0x100, 0x101, view), None, "past the view's end");
+        assert_eq!(cpu_range_in(g, 0, view), Some(c));
+        assert_eq!(cpu_range_in(c + 0x40, 0x100, view), Some(c + 0x40), "the CPU view itself");
+        assert_eq!(cpu_range_in(g + 0x40, 0x100, |_| false), Some(g + 0x40), "no view windows: as it was");
+        mirrors::released(c);
+        assert_eq!(cpu_range_in(g + 0x40, 0x100, view), Some(g + 0x40), "unpaired: as it was (and refused where it is written)");
     }
 
     #[test]
