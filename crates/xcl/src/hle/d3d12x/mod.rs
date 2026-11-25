@@ -34,6 +34,7 @@ mod scatter;
 mod shader_cache_session;
 mod sharded;
 pub mod sparse;
+mod targets;
 pub mod title_list;
 mod submit_cost;
 mod texture_upload;
