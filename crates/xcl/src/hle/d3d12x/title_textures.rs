@@ -712,6 +712,10 @@ struct HotBlocks {
 static HOT: Mutex<Option<HotBlocks>> = Mutex::new(None);
 /// the ranges of the last look, for the walk
 static WALK_RANGES: Mutex<Option<Arc<Vec<(usize, usize)>>>> = Mutex::new(None);
+/// a look is at its write-watch calls: the walk stays out of the way (the kernel does one such
+/// call at a time; with the walk going all the time, a look of 45 calls waited behind it for
+/// ~1.3 ms in all)
+static LOOKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// looks, runs they took, bytes they covered, blocks the walk made hot
 static HOT_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -760,9 +764,11 @@ unsafe fn take_hot(ranges: &Arc<Vec<(usize, usize)>>, buf: &mut [*mut c_void], d
         (runs, h.hot.len())
     };
     let first = dirty.len();
+    LOOKING.store(true, Ordering::Release);
     for &(base, size) in &runs {
         take_written(base, size, buf, dirty, page);
     }
+    LOOKING.store(false, Ordering::Release);
     if dirty.len() > first {
         let mut g = HOT.lock().unwrap();
         if let Some(h) = g.as_mut() {
@@ -813,7 +819,7 @@ fn start_walk(ranges: &Arc<Vec<(usize, usize)>>) {
 /// The walk: all watched memory in steps of 64 MiB, without taking the written pages (they stay
 /// reported until a look takes them); a block with a written page is hot from then on.
 unsafe fn walk() {
-    const STEP: usize = 64 << 20;
+    const STEP: usize = 16 << 20;
     let mut buf: Vec<*mut c_void> = vec![std::ptr::null_mut(); 8192];
     let mut found: Vec<usize> = Vec::new();
     loop {
@@ -828,6 +834,9 @@ unsafe fn walk() {
             while at < end {
                 let stop = (at + STEP).min(end);
                 let mut from = at;
+                while LOOKING.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
                 while from < stop {
                     let (mut n, mut page) = (buf.len(), 0u32);
                     if GetWriteWatch(0, from as *const c_void, stop - from, buf.as_mut_ptr(), &mut n, &mut page) != 0 || n == 0 {
@@ -859,10 +868,10 @@ unsafe fn walk() {
                     }
                 }
                 at = stop;
-                std::thread::yield_now();
             }
         }
-        std::thread::sleep(std::time::Duration::from_micros(300));
+        // a pass takes ~0.6 ms a GiB of the kernel's time; the pause keeps the thread to about half a core
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
