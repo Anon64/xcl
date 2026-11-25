@@ -98,25 +98,11 @@ static GLOBAL: Mutex<Option<Global>> = Mutex::new(None);
 static GLOBAL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// descriptors of the shared heap at most (the GPU may take more: OPTIONS19)
-const GLOBAL_MAX: u32 = 1 << 21;
-
-/// What the shared heap is made with, in the order tried: all `GLOBAL_MAX` descriptors first,
-/// then what the device says it takes (`queried`: OPTIONS19's MaxViewDescriptorHeapSize; none:
-/// 1 000 000, resource binding tier 3's minimum).
-///
-/// Translated shaders take a texture's index in this heap from a T# they read from memory and
-/// use it when it is below 2^21 - 1 (the translators' `VIEW_HEAP_MAX_SRV`): the heap of an RTX 5090
-/// made at the 1 000 000 the query gave let an index between that and 2^21 read a descriptor
-/// past the heap's end, memory the GPU has not mapped. Tier 3 hardware takes more than the
-/// query says, so the size the shaders' guard knows is tried first.
-fn heap_capacities(queried: Option<u32>) -> Vec<u32> {
-    let fallback = queried.filter(|&n| n > 0).unwrap_or(1_000_000).min(GLOBAL_MAX);
-    let mut v = vec![GLOBAL_MAX];
-    if fallback != GLOBAL_MAX {
-        v.push(fallback);
-    }
-    v
-}
+pub const GLOBAL_MAX: u32 = 1_000_000;
+// (one million: what every resource binding tier 2+ GPU takes. The translated shaders accept a
+// T# index only below it (`gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV`), so the heap must never be
+// smaller than that bound: an index past the heap's end hangs NVIDIA GPUs, which took 1 000 000
+// while the bound was 2^21 – a raw console T# of a texture at 256–512 MB passed it.)
 
 /// null views in the CPU-only heap the shared heap's free ranges are filled from
 const NULL_BLOCK: u32 = 4096;
@@ -284,6 +270,18 @@ fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) 
     Some(*next - count)
 }
 
+/// Descriptors of the shared heap on `dev`: what it takes (OPTIONS19; 1 000 000 without it), at
+/// most `GLOBAL_MAX`.
+unsafe fn global_cap(dev: &ID3D12Device) -> u32 {
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    let max = if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &mut o as *mut _ as *mut std::ffi::c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.MaxViewDescriptorHeapSize > 0 {
+        o.MaxViewDescriptorHeapSize
+    } else {
+        1_000_000
+    };
+    max.min(GLOBAL_MAX)
+}
+
 /// The shared shader-visible heap, made on first use. False: there is none (it could not be
 /// made) – view heaps then keep their own.
 pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
@@ -299,24 +297,15 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
     // Made and filled without `GLOBAL` held: the device may be adopted, and its descriptor hooks
     // look up the console heaps (`HEAPS`, then `GLOBAL`). Two threads that get here at once both
     // make one; the first to store it wins.
-    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-    let queried = (dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &mut o as *mut _ as *mut std::ffi::c_void, std::mem::size_of_val(&o) as u32).is_ok()).then_some(o.MaxViewDescriptorHeapSize);
-    let mut made = None;
-    let mut failed = Vec::new();
-    for cap in heap_capacities(queried) {
-        let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: cap, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
-        match dev.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&d) {
-            Ok(h) => {
-                made = Some((h, cap));
-                break;
-            }
-            Err(e) => failed.push(format!("{cap}: {e}")),
+    let cap = global_cap(dev);
+    let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: cap, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
+    let heap = match dev.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&d) {
+        Ok(h) => h,
+        Err(e) => {
+            GLOBAL_FAILED.store(true, Relaxed);
+            crate::xlog_warn!("console descriptor heaps: no shared shader-visible heap of {cap} ({e}) – each keeps its own");
+            return false;
         }
-    }
-    let Some((heap, cap)) = made else {
-        GLOBAL_FAILED.store(true, Relaxed);
-        crate::xlog_warn!("console descriptor heaps: no shared shader-visible heap ({}) – each keeps its own", failed.join("; "));
-        return false;
     };
     let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
@@ -333,9 +322,8 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
         (h, at)
     });
     crate::xlog_info!(
-        "console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them ({}){}",
-        if nulls.is_some() { format!("null views in the rest, {} ms", start.elapsed().as_millis()) } else { "no null views past the first: no CPU-only heap for them".into() },
-        if failed.is_empty() { String::new() } else { format!(" – not made at {}", failed.join("; ")) }
+        "console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them ({})",
+        if nulls.is_some() { format!("null views in the rest, {} ms", start.elapsed().as_millis()) } else { "no null views past the first: no CPU-only heap for them".into() }
     );
     if cap < GLOBAL_MAX {
         crate::xlog_warn!(
@@ -613,7 +601,13 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
             );
         }
     }
-    let pages = if shared && !sampler && GLOBAL.lock().unwrap().is_some() { vec![UNMAPPED; n.div_ceil(PAGE_SLOTS).max(1) as usize] } else { Vec::new() };
+    let pages = if shared && !sampler && GLOBAL.lock().unwrap().is_some() {
+        vec![UNMAPPED; n.div_ceil(PAGE_SLOTS).max(1) as usize]
+    } else if shared && sampler && GLOBAL_SAMPLER.lock().unwrap().is_some() {
+        vec![UNMAPPED; n.div_ceil(SAMPLER_PAGE_SLOTS).max(1) as usize]
+    } else {
+        Vec::new()
+    };
     HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
     true
 }
@@ -626,8 +620,12 @@ pub fn unregister(obj: usize) {
     };
     if let Some(h) = gone {
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
-            release_global(f, page_descriptors(h.n, p as u32));
-            PAGES_PLACED.fetch_sub(1, Relaxed);
+            if h.sampler {
+                release_global_sampler(f, sampler_page_descriptors(h.n, p as u32));
+            } else {
+                release_global(f, page_descriptors(h.n, p as u32));
+                PAGES_PLACED.fetch_sub(1, Relaxed);
+            }
         }
         match h.memory {
             Memory::Sparse => {
@@ -679,7 +677,17 @@ pub fn slot(cpu: u64) -> Option<Slot> {
     let h = heaps.iter_mut().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
     let k = ((cpu - h.shadow as u64) / h.slot_bytes() as u64) as u32;
     if h.sampler {
-        return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index: k, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv: 0, k });
+        let shared = sampler_page_of(h, k).and_then(|(first, k0)| {
+            let g = GLOBAL_SAMPLER.lock().unwrap();
+            let g = g.as_ref()?;
+            let i = first + (k - k0);
+            Some((i, g.cpu + i as u64 * g.inc as u64))
+        });
+        // If this sampler heap is hosted in `GLOBAL_SAMPLER` (`!h.pages.is_empty()`), an exhausted
+        // shared heap must map overflowed slots to reserved zero-sampler slot 0 rather than
+        // aliasing unrelated heap entries at local index `k`.
+        let (index, shared_srv) = shared.unwrap_or_else(|| (sampler_unmapped_index(!h.pages.is_empty(), k), 0));
+        return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k });
     }
     let uav = ((2 * k + 1) * h.inc) as u64;
     let shared = page_of(h, k).and_then(|(first, k0)| {
@@ -696,10 +704,21 @@ pub fn slot(cpu: u64) -> Option<Slot> {
     Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
 }
 
-/// The view just made in slot `s` (its SRV, or with `uav` its UAV) of the PC resource `res` (0:
-/// a null view) goes to the shared heap.
+/// The view (or sampler) just made in slot `s` (its SRV, or with `uav` its UAV) of the PC
+/// resource `res` (0: a null view; samplers: 0) goes to the shared heap.
 pub unsafe fn publish(s: &Slot, uav: bool, res: usize) {
     if s.shared_srv == 0 {
+        return;
+    }
+    if s.sampler {
+        if let Some(g) = GLOBAL_SAMPLER.lock().unwrap().as_ref() {
+            g.dev.CopyDescriptorsSimple(
+                1,
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
+                D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+            );
+        }
         return;
     }
     let Some((dev, inc)) = GLOBAL.lock().unwrap().as_ref().map(|g| (g.dev.clone(), g.inc)) else { return };
@@ -710,32 +729,54 @@ pub unsafe fn publish(s: &Slot, uav: bool, res: usize) {
 }
 
 /// The PC resources the SRV and the UAV of view slot `s` name in the shared heap (0: not known,
-/// or the slot has no place there): what `publish_range` takes for a copy of it.
+/// a sampler, or the slot has no place there): what `publish_range` takes for a copy of it.
 pub fn names_of(s: &Slot) -> (usize, usize) {
+    if s.sampler {
+        return (0, 0);
+    }
     match (s.shared_srv, NAMES.get()) {
         (0, _) | (_, None) => (0, 0),
         (_, Some(n)) => (n.name(s.index), n.name(s.index + 1)),
     }
 }
 
-/// `n` view slots from `first` were copied (in the title's heap): they go to the shared heap,
-/// a run per page (a heap's pages lie apart there). `names`: what the source slots' SRV and UAV
-/// name (`names_of`), one pair a slot.
+/// `n` view or sampler slots from `first` were copied (in the title's heap): they go to the shared
+/// heap, a run per page (a heap's pages lie apart there). `names`: what the source view slots' SRV
+/// and UAV name (`names_of`), one pair a slot (none for samplers).
 pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
-    let Some(dev) = GLOBAL.lock().unwrap().as_ref().map(|g| g.dev.clone()) else { return };
+    let page_slots = if first.sampler { SAMPLER_PAGE_SLOTS } else { PAGE_SLOTS };
+    let step = if first.sampler { SAMPLER_SLOT } else { SLOT };
+    // views: the shared heap's device, taken once (no shared heap: nothing to publish)
+    let dev = if first.sampler {
+        None
+    } else {
+        let Some(d) = GLOBAL.lock().unwrap().as_ref().map(|g| g.dev.clone()) else { return };
+        Some(d)
+    };
     let mut done = 0;
     while done < n {
-        let s = if done == 0 { Some(*first) } else { slot((first.at + (done * SLOT) as usize) as u64) };
+        let s = if done == 0 { Some(*first) } else { slot((first.at + (done * step) as usize) as u64) };
         let Some(s) = s else { return };
-        let run = (PAGE_SLOTS - s.k % PAGE_SLOTS).min(n - done);
+        let run = (page_slots - s.k % page_slots).min(n - done);
         if s.shared_srv != 0 {
-            let _w = SLOT_WRITES.lock().unwrap();
-            copy_views(&dev, 2 * run, s.shared_srv, s.pc_srv);
-            let m = self::names();
-            for j in 0..run {
-                let (srv, uav) = names.get((done + j) as usize).copied().unwrap_or((0, 0));
-                m.note(s.index + 2 * j, srv);
-                m.note(s.index + 2 * j + 1, uav);
+            if s.sampler {
+                if let Some(g) = GLOBAL_SAMPLER.lock().unwrap().as_ref() {
+                    g.dev.CopyDescriptorsSimple(
+                        run,
+                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
+                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
+                        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                    );
+                }
+            } else if let Some(dev) = &dev {
+                let _w = SLOT_WRITES.lock().unwrap();
+                copy_views(dev, 2 * run, s.shared_srv, s.pc_srv);
+                let m = self::names();
+                for j in 0..run {
+                    let (srv, uav) = names.get((done + j) as usize).copied().unwrap_or((0, 0));
+                    m.note(s.index + 2 * j, srv);
+                    m.note(s.index + 2 * j + 1, uav);
+                }
             }
         }
         done += run;
@@ -860,9 +901,162 @@ pub fn words_at(addr32: u32) -> Option<[u32; 8]> {
     Some(w)
 }
 
+// ---------------------------------------------------------------------------------------
+// Shared shader-visible PC sampler heap (`GLOBAL_SAMPLER`, up to D3D12's 2048 limit):
+// allows 16-byte S# descriptors copied via raw CPU `memcpy` between CPU-only and
+// shader-visible sampler heaps to keep valid PC sampler indices without CopyDescriptors*.
+// ---------------------------------------------------------------------------------------
+
+/// D3D12 maximum shader-visible sampler heap size.
+const GLOBAL_SAMPLER_MAX: u32 = 2048;
+/// Sampler slots allocated per page from `GLOBAL_SAMPLER` (small page size minimizes waste across
+/// many small sampler heaps while staying within D3D12's 2048-sampler hardware limit).
+const SAMPLER_PAGE_SLOTS: u32 = 8;
+
+/// Fallback index for a sampler slot when no `GLOBAL_SAMPLER` page is mapped:
+/// hosted heaps (`hosted == true`, downgraded to CPU-only) use reserved slot `0` (immutable zero
+/// sampler) so exhaustion never aliases another heap's sampler at `k`; unhosted heaps keep `k`.
+fn sampler_unmapped_index(hosted: bool, k: u32) -> u32 {
+    if hosted { 0 } else { k }
+}
+
+struct GlobalSampler {
+    dev: ID3D12Device,
+    heap: ID3D12DescriptorHeap,
+    cpu: u64,
+    inc: u32,
+    cap: u32,
+    next: u32,
+    free: Vec<(u32, u32)>,
+}
+
+unsafe impl Send for GlobalSampler {}
+
+static GLOBAL_SAMPLER: Mutex<Option<GlobalSampler>> = Mutex::new(None);
+static GLOBAL_SAMPLER_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn sampler_page_descriptors(n: u32, p: u32) -> u32 {
+    n.saturating_sub(p * SAMPLER_PAGE_SLOTS).clamp(1, SAMPLER_PAGE_SLOTS)
+}
+
+/// Shared shader-visible PC sampler heap (2048 descriptors), created lazily on first sampler heap.
+pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if std::env::var("XCL_SHARED_SAMPLER_HEAP").is_ok_and(|v| v.trim() == "0") {
+        return false;
+    }
+    let mut g = GLOBAL_SAMPLER.lock().unwrap();
+    if g.is_none() {
+        if GLOBAL_SAMPLER_FAILED.load(Relaxed) {
+            return false;
+        }
+        let d = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+            NumDescriptors: GLOBAL_SAMPLER_MAX,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        };
+        let heap: ID3D12DescriptorHeap = match dev.CreateDescriptorHeap(&d) {
+            Ok(h) => h,
+            Err(e) => {
+                GLOBAL_SAMPLER_FAILED.store(true, Relaxed);
+                crate::xlog_warn!("console descriptor heaps: no shared shader-visible sampler heap ({e}) – each keeps its own");
+                return false;
+            }
+        };
+        let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        let zero = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            MipLODBias: 0.0,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            BorderColor: [0.0; 4],
+            MinLOD: 0.0,
+            MaxLOD: 0.0,
+        };
+        for k in 0..GLOBAL_SAMPLER_MAX as u64 {
+            dev.CreateSampler(&zero, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize });
+        }
+        crate::xlog_info!("console descriptor heaps: one shader-visible PC sampler heap of {GLOBAL_SAMPLER_MAX} descriptors for all sampler heaps");
+        *g = Some(GlobalSampler {
+            dev: dev.clone(),
+            heap,
+            cpu,
+            inc,
+            cap: GLOBAL_SAMPLER_MAX,
+            // Reserve slot 0 as the immutable point-wrap zero sampler for empty/zeroed S# entries.
+            next: 1,
+            free: Vec::new(),
+        });
+    }
+    true
+}
+
+fn reserve_global_sampler(count: u32) -> Option<u32> {
+    let mut g = GLOBAL_SAMPLER.lock().unwrap();
+    let s = g.as_mut()?;
+    let (cap, mut next) = (s.cap, s.next);
+    let r = take_range(&mut s.free, &mut next, cap, count);
+    s.next = next;
+    if r.is_none() {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            crate::xlog_warn!("console descriptor heaps: the shared sampler heap ({cap}) is full – overflowed sampler slots map to reserved slot 0");
+        }
+    }
+    r
+}
+
+fn sampler_page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
+    let p = (k / SAMPLER_PAGE_SLOTS) as usize;
+    let mut first = *h.pages.get(p)?;
+    if first == UNMAPPED {
+        first = reserve_global_sampler(sampler_page_descriptors(h.n, p as u32))?;
+        h.pages[p] = first;
+    }
+    Some((first, p as u32 * SAMPLER_PAGE_SLOTS))
+}
+
+fn release_global_sampler(first: u32, count: u32) {
+    if let Some(s) = GLOBAL_SAMPLER.lock().unwrap().as_mut() {
+        s.free.push((first, count));
+    }
+}
+
+/// The shared shader-visible PC sampler heap lists bind (None: no shared sampler heap).
+pub fn global_sampler_heap() -> Option<ID3D12DescriptorHeap> {
+    GLOBAL_SAMPLER.lock().unwrap().as_ref().map(|s| s.heap.clone())
+}
+
+/// Whether `obj` (a title's sampler heap) has its descriptors in the shared sampler heap.
+pub fn in_global_sampler(obj: usize) -> bool {
+    HEAPS.lock().unwrap().iter().any(|h| h.obj == obj && h.sampler && !h.pages.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every T# index the translated shaders accept, and its UAV at `tw0 + 1`, is inside the
+    /// shared heap this GPU gets: an index past the heap's end hangs NVIDIA GPUs (whose heap is
+    /// 1 000 000, while the shaders accepted indices up to 2^21 - 2).
+    #[test]
+    fn the_shaders_t_sharp_index_bound_fits_the_shared_heap() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        let cap = unsafe { global_cap(&dev.unwrap()) };
+        let bound = crate::gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV;
+        // accepted: tw0 < bound, so the highest UAV index is bound - 1 + 1 = bound
+        assert!(bound < cap, "shaders accept indices up to {bound}, the shared heap holds {cap}");
+    }
 
     /// Ranges of the shared heap: released ones first (first fit, split), then new ones, and
     /// none past its size.
@@ -1013,17 +1207,6 @@ mod tests {
         for (k, &(is_uav, r, at)) in seen.iter().enumerate() {
             assert_eq!((is_uav, r, at), (k % 2 == 1, 0, 0x1000 + 32 * k), "descriptor {k}");
         }
-    }
-
-    /// The shared heap is tried with every index translated shaders accept (2^21) first, and with
-    /// what the device says it takes only when that fails; never more than 2^21.
-    #[test]
-    fn the_shared_heap_is_tried_at_the_size_the_shader_guard_knows_first() {
-        assert_eq!(heap_capacities(Some(1_000_000)), vec![1 << 21, 1_000_000], "an RTX 5090's query");
-        assert_eq!(heap_capacities(None), vec![1 << 21, 1_000_000], "no OPTIONS19");
-        assert_eq!(heap_capacities(Some(0)), vec![1 << 21, 1_000_000]);
-        assert_eq!(heap_capacities(Some(1 << 21)), vec![1 << 21]);
-        assert_eq!(heap_capacities(Some(u32::MAX)), vec![1 << 21], "never past the shaders' guard");
     }
 
     /// A shader-visible sampler heap has a PC sampler at every index a translated shader forms
@@ -1293,5 +1476,23 @@ mod tests {
         assert_eq!(a.index.abs_diff(b.index), 8, "two heaps of 4 slots lie 8 descriptors apart");
         unregister(0xB100);
         unregister(0xB101);
+    }
+
+    #[test]
+    fn shared_sampler_pages_preserve_zero_slot_and_clamp_tails() {
+        assert_eq!(sampler_page_descriptors(8, 0), 8);
+        assert_eq!(sampler_page_descriptors(SAMPLER_PAGE_SLOTS, 0), SAMPLER_PAGE_SLOTS);
+        assert_eq!(sampler_page_descriptors(SAMPLER_PAGE_SLOTS + 5, 0), SAMPLER_PAGE_SLOTS);
+        assert_eq!(sampler_page_descriptors(SAMPLER_PAGE_SLOTS + 5, 1), 5);
+        // Simulate GLOBAL_SAMPLER reserving slot 0 for the immutable zero sampler.
+        let (mut free, mut next) = (Vec::new(), 1u32);
+        let a = take_range(&mut free, &mut next, GLOBAL_SAMPLER_MAX, sampler_page_descriptors(64, 0)).unwrap();
+        let b = take_range(&mut free, &mut next, GLOBAL_SAMPLER_MAX, sampler_page_descriptors(64, 1)).unwrap();
+        assert_eq!(a, 1);
+        assert_eq!(b, 1 + SAMPLER_PAGE_SLOTS);
+        assert!(b + SAMPLER_PAGE_SLOTS <= GLOBAL_SAMPLER_MAX);
+        // Exhaustion fallback: hosted sampler heaps map overflowed slots to reserved slot 0; unhosted keep local k.
+        assert_eq!(sampler_unmapped_index(true, 42), 0);
+        assert_eq!(sampler_unmapped_index(false, 42), 42);
     }
 }

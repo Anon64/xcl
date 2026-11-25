@@ -1281,6 +1281,24 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     if !gfx && !compute {
         // (a pipeline still being built: skipped above, `DrawPipeline::StandIn`)
+        // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
+        // TWO_PASS rather than TRANSLATED_GRAPHICS. Falling through to raw PC ExecuteIndirect
+        // with the title's graphics root signature (e.g. a non-DispatchMesh indirect draw or a
+        // root-changing signature) invalidates the command list (Close → E_INVALIDARG).
+        // (`DrawPipeline::TwoPass` above takes these; this catches one `draw_pipeline` did not
+        // see as two-pass, e.g. a build that finished after the resolve.)
+        if let Some(tp) = super::real::two_pass_of(pso) {
+            ei_work(this, sig, super::targets::SKIPPED);
+            count(DRAWS_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!(
+                    "D3D12.X: ExecuteIndirect with two-pass {} pipeline ({pso:#x}) skipped – PC pipeline is a mesh shader",
+                    tp.kind
+                );
+            }
+            return;
+        }
         // a console compute program without a translation (its build failed): nothing to run,
         // as for Dispatch. The PC call would run it with the list's compute root signature, which
         // can still be XCL's ABI one from a translated dispatch before it (debug layer 953).
@@ -1552,15 +1570,19 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
     let real = super::pso_async::resolve_wait(pso);
     if !super::real::is_translated_graphics(real) {
-        // A two-pass pipeline (console MS, or VS+GS) draws only through DispatchMesh: a Draw with
-        // it would be a Draw on a mesh pipeline under the title's root signature, whose
-        // pass-through shaders read their memory through root views that signature does not have.
-        if super::real::two_pass_entry(real).is_some() {
+        // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
+        // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
+        // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
+        // (Close → E_INVALIDARG). It draws only through DispatchMesh.
+        if let Some(tp) = super::real::two_pass_of(real) {
             super::targets::note_draw(this, super::targets::SKIPPED);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) == 0 {
-                crate::xlog_warn!("D3D12.X: a Draw with a two-pass (mesh) pipeline skipped: it draws only through DispatchMesh");
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!(
+                    "D3D12.X: draw with two-pass {} pipeline ({real:#x}) skipped – PC pipeline is a mesh shader",
+                    tp.kind
+                );
             }
             return None;
         }
@@ -1582,6 +1604,10 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
                 );
             }
         }
+        // a pending stand-in draws nothing: an occlusion query around it resolves as visible
+        if super::pso_async::is_pending(pso) {
+            super::list_x::note_dropped_draw(this);
+        }
         // a PC pipeline (also a stand-in or fallback): the title's root signature
         if !bind_title_root_signature(this, &list) {
             note_no_root_signature();
@@ -1600,6 +1626,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         }
         Err(e) => {
             super::targets::note_draw(this, super::targets::SKIPPED);
+            super::list_x::note_dropped_draw(this);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -2602,7 +2629,7 @@ void main(uint t : SV_GroupIndex) {
     #[test]
     fn a_draw_with_the_stand_in_of_a_two_pass_pipeline_is_not_recorded_as_its_passes() {
         let (standin, real_mesh, failed, native) = (0x7E57_7001usize, 0x7E57_7002usize, 0x7E57_7003usize, 0x7E57_7004usize);
-        real::register_two_pass_for_test(real_mesh);
+        real::register_two_pass_for_test(real_mesh, "MS");
         // lazy submits: no worker starts them, so the states stay under the test's control
         pso_async::submit_lazy(standin, false, Box::new(move || real_mesh), 0);
         pso_async::submit_lazy(failed, false, Box::new(|| 0), 0);
@@ -2657,7 +2684,7 @@ void main(uint t : SV_GroupIndex) {
         });
         let list = &*fake as *const FakeAdoptedList as *mut c_void;
         let (mesh, native, rs, sig) = (0x7E57_8001usize, 0x7E57_8002usize, 0x7E57_8003usize, 0x7E57_80F0usize);
-        real::register_two_pass_for_test(mesh);
+        real::register_two_pass_for_test(mesh, "MS");
         reset(list, 0x7E57_8100, mesh);
         unsafe {
             set_graphics_root_signature(list, rs as *mut c_void);
@@ -2686,6 +2713,101 @@ void main(uint t : SV_GroupIndex) {
         }
         forget(list);
         real::forget_pso_for_test(mesh);
+    }
+
+    #[test]
+    fn two_pass_pso_skips_direct_draw_and_unmatched_execute_indirect() {
+        #[repr(C)]
+        struct FakeTwoPassList {
+            vt: *const usize,
+            refs: AtomicUsize,
+            set_graphics_rs_calls: AtomicUsize,
+            execute_indirect_calls: AtomicUsize,
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const FakeTwoPassList)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            (*(this as *const FakeTwoPassList)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+        }
+        unsafe extern "system" fn set_graphics_rs(this: *mut c_void, _rs: *mut c_void) {
+            (*(this as *const FakeTwoPassList)).set_graphics_rs_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "system" fn exec_indirect(
+            this: *mut c_void,
+            _sig: usize,
+            _max: u32,
+            _args: usize,
+            _args_off: u64,
+            _count_buf: usize,
+            _count_off: u64,
+        ) {
+            (*(this as *const FakeTwoPassList)).execute_indirect_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = add_ref as usize;
+        orig_vt[2] = release as usize;
+        orig_vt[30] = set_graphics_rs as usize;
+        orig_vt[59] = exec_indirect as usize;
+
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+
+        let fake = Box::new(FakeTwoPassList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            set_graphics_rs_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeTwoPassList as *mut c_void;
+
+        // Register a finished two-pass GS/MS PSO behind an async stand-in (registered in TWO_PASS,
+        // not TRANSLATED_GRAPHICS).
+        let standin_tp = 0x7250_0001usize;
+        let real_tp = 0x7250_0002usize;
+        pso_async::submit(
+            standin_tp,
+            false,
+            Box::new(move || {
+                real::register_two_pass_for_test(real_tp, "GS");
+                real_tp
+            }),
+        );
+        assert_eq!(pso_async::resolve_wait(standin_tp), real_tp);
+        assert!(real::two_pass_of(real_tp).is_some());
+        assert!(!real::is_translated_graphics(real_tp));
+
+        reset(list_ptr, 0x7250_0100, standin_tp);
+        unsafe {
+            // Seed a non-null title graphics RS so a fallthrough would visibly call SetGraphicsRootSignature.
+            set_graphics_root_signature(list_ptr, list_ptr);
+        }
+
+        // 1. Direct draw (`graphics_bound`) must return None without binding the title's RS.
+        let before = counts_snapshot();
+        let bound = unsafe { graphics_bound(list_ptr) };
+        let after = counts_snapshot();
+        assert!(bound.is_none(), "two-pass MS/GS PSO must not fall through to PC DrawInstanced");
+        assert!(after[DRAWS_SKIPPED] > before[DRAWS_SKIPPED]);
+        assert_eq!(after[DRAWS_PC], before[DRAWS_PC]);
+        assert_eq!(fake.set_graphics_rs_calls.load(Ordering::Relaxed), 0);
+
+        // 2. Unmatched `ExecuteIndirect` must skip without binding the title's RS or calling PC ExecuteIndirect.
+        let before = counts_snapshot();
+        unsafe {
+            execute_indirect(list_ptr, 0x7250_00F0, 1, 0, 0, 0, 0);
+        }
+        let after = counts_snapshot();
+        assert!(after[DRAWS_SKIPPED] > before[DRAWS_SKIPPED]);
+        assert_eq!(fake.set_graphics_rs_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0);
+
+        forget(list_ptr);
+        let _ = pso_async::released(standin_tp);
+        real::forget_pso_for_test(real_tp);
+        assert!(real::two_pass_of(real_tp).is_none());
     }
 
     #[test]
