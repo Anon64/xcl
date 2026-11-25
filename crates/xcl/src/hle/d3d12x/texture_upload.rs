@@ -127,6 +127,18 @@ pub(super) fn unknown(known: &Known) {
     k.forgotten += 1;
 }
 
+/// `parts` of a texture (from, to) are not what its PC texture holds (a mapping changed under
+/// them): they go up again with its next upload, with no comparison (`take_again`).
+pub(super) fn stale(known: &Known, parts: Vec<(usize, usize)>) {
+    // (sorted and joined)
+    let parts = join(Change::Parts(Vec::new()), Change::Parts(parts));
+    let mut k = known.lock().unwrap();
+    k.again = Some(match k.again.take() {
+        Some((c, behind)) => (join(c, parts), behind),
+        None => (parts, Vec::new()),
+    });
+}
+
 /// `changed` of a texture (None: all of it) went up on `to`. An older upload of the texture on
 /// another queue that has not run yet (and that `to`'s queue has not waited for: `waited`) can land
 /// over it: it goes up again, behind that one (`take_again`). True when there is such a thing.
