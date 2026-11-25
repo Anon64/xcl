@@ -498,7 +498,8 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     let drain = move || loop {
         let job = jobs.lock().unwrap().pop();
         let Some((i, job)) = job else { return };
-        let _ = send.send((i, job()));
+        // (a piece that panics fails: its result is still sent, or the caller would wait for ever)
+        let _ = send.send((i, std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).unwrap_or(0)));
     };
     // the helpers build for this worker's pipeline: the title waiting for it waits for them too
     let parent = BUILDING.with(|b| b.borrow().clone());
@@ -1382,6 +1383,24 @@ mod used_tests {
         let on_here = build_pieces(jobs);
         BUILDING.with(|b| *b.borrow_mut() = before);
         assert_eq!(on_here, vec![1; 6], "every piece on the backlog worker's thread");
+    }
+
+    /// A piece whose build panics fails (0), on the caller's thread or a helper's, and the
+    /// caller still gets every other piece.
+    #[test]
+    fn a_piece_that_panics_fails_and_the_others_are_built() {
+        let jobs: Vec<Job> = (0..8usize)
+            .map(|i| {
+                Box::new(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    if i % 2 == 1 {
+                        panic!("piece {i}");
+                    }
+                    i + 1
+                }) as Job
+            })
+            .collect();
+        assert_eq!(build_pieces(jobs), [1, 0, 3, 0, 5, 0, 7, 0]);
     }
 
     /// Work from the backlog as its workers do (a translated one goes back for its build): the
