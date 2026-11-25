@@ -893,6 +893,13 @@ unsafe fn name_for_report(obj: *mut c_void, kind: Kind) {
     }
 }
 
+/// `Release` of the COM interface pointer `p`, called through the vtable `p` itself has.
+unsafe fn release_through_its_own_vtable(p: *mut c_void) -> u32 {
+    let vt = *(p as *const *const usize);
+    let release: RefFn = std::mem::transmute(*vt.add(2));
+    release(p)
+}
+
 unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     if let Some(c) = CLASSES.lock().unwrap().iter().find(|c| c.orig == orig && c.kind == kind) {
         return c.ext;
@@ -901,13 +908,15 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     // most derived PC interface this object implements
     let chain = layout::chain(kind.base());
     let qi: QiFn = std::mem::transmute(*ot);
-    let release: RefFn = std::mem::transmute(*ot.add(2));
     let mut iface = *chain.last().expect("layout chain");
     for i in &chain {
         let iid = layout::parse_guid(i.iid);
         let mut out = std::ptr::null_mut();
         if qi(obj, &iid, &mut out) >= 0 && !out.is_null() {
-            release(out);
+            // (through the result's own vtable: under the debug layer QueryInterface gives
+            // another object than `obj`, and `obj`'s Release on it read a null pointer in
+            // D3D12Core 1.5 s into a retail title's start)
+            release_through_its_own_vtable(out);
             iface = i;
             break;
         }
