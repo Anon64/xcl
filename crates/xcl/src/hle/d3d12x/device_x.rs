@@ -1112,6 +1112,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                         super::title_textures::retire_overlapping(va as usize, bytes as usize);
                     }
                     real::note_title_address(*ppv as usize, va as usize);
+                    super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
                 }
                 return hr;
             }
@@ -1131,6 +1132,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
+                super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
                 return hr;
             }
             Err(e) if once(&M, 4) => {
@@ -1146,6 +1148,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     }
     if hr >= 0 && !(*ppv).is_null() {
         real::note_title_address(*ppv as usize, va as usize);
+        if !buffer {
+            super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+        }
     }
     if hr < 0 || once(&N, 4) {
         let w = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());

@@ -1977,6 +1977,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             super::sparse::forget_buffer(this as usize);
         }
         super::vram::forget(this as usize);
+        super::depth_uav::forget(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         // a buffer may be over a heap of pages that are freed next; a texture, and a buffer of XCL's
@@ -2322,6 +2323,9 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
         note_mixed_copy();
         return;
     }
+    if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 {
+        super::depth_uav::dsvs_copied(this, n, dst, src);
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, n, dst, src, ty);
 }
@@ -2337,6 +2341,9 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
         if !srcs.is_null() && ns > 0 && slot(*srcs).is_some() {
             note_mixed_copy();
             return;
+        }
+        if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 {
+            super::depth_uav::dsv_ranges_copied(this, nd, dsts, dsizes, ns, srcs, ssizes);
         }
         type F = unsafe extern "system" fn(*mut c_void, u32, *const u64, *const u32, u32, *const u64, *const u32, u32);
         let f: F = std::mem::transmute(orig_fn(this, 23));
@@ -2487,7 +2494,9 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
             }
         }
     }
-    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
+    let flags = copy.as_ref().map_or(0, |c| c.Flags.0 as u32);
+    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
+    super::depth_uav::note_dsv(cpu as usize, res as usize, flags);
 }
 
 /// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
@@ -3171,6 +3180,9 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         super::device_x::pc_initial_state_for_desc(orig_flags, pc_flags, state as u32)
     });
     let hr = dev_create_committed_resource(this, props, flags, desc, st as usize, clear, riid, ppv);
+    if hr >= 0 && pc_full.is_some() && !ppv.is_null() && !(*ppv).is_null() {
+        super::depth_uav::note_created(*ppv, &(console_desc as *const [u8; 0x38]).read_unaligned(), None, st);
+    }
     if hr < 0 {
         let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
         crate::xlog_warn!(
@@ -3624,7 +3636,11 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
             u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x2C), u(0x30)
         );
     }
-    hr3.unwrap_or(hr2)
+    let hr = hr3.unwrap_or(hr2);
+    if hr >= 0 && is_texture && !ppv.is_null() && !(*ppv).is_null() {
+        super::depth_uav::note_created(*ppv, &x, None, st);
+    }
+    hr
 }
 
 /// A texture the title placed in a heap by the console's size (`get_resource_allocation_info_x`
@@ -3652,10 +3668,15 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
     let h = pc_heap_desc(heap)?;
     let st = super::device_x::pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state as u32);
     let mut hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv);
+    let mut made_in = st;
     if hr < 0 && st != 0 {
         // as in the past-the-end fallback: a state the PC refuses for this desc (e.g. UAV
         // without the UAV flag) – COMMON rather than falling back to the overlapping placement
         hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, 0, clear, riid, ppv);
+        made_in = 0;
+    }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::depth_uav::note_created(*ppv, &x, None, made_in);
     }
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 8 {
