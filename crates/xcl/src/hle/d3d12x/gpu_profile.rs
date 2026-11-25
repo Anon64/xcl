@@ -75,6 +75,15 @@ struct Op {
     /// a dispatch's groups, a draw's (vertices or indices, instances, 0), an ExecuteIndirect's
     /// (max count, 0, 0)
     size: [u32; 3],
+    /// an ExecuteIndirect whose counts XCL reads (`indirect_guard`): where they are
+    counts: Option<u32>,
+}
+
+impl Op {
+    /// its size, with the counts the GPU read where they are known
+    fn size_now(&self) -> [u32; 3] {
+        self.counts.and_then(super::indirect_guard::counts).unwrap_or(self.size)
+    }
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -359,7 +368,7 @@ pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32
             s.mark(2 * k).store(0, Ordering::Release);
             s.mark(2 * k + 1).store(0, Ordering::Release);
             s.running.remove(&k);
-            s.ops[k] = Some(Op { key, size });
+            s.ops[k] = Some(Op { key, size, counts: None });
             (k as u32, s.heap, s.buf, s.marks_va)
         },
     )?;
@@ -367,6 +376,14 @@ pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32
     mark_done(list, marks_va + 8 * k as u64);
     (pair.end_query)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
     Some(pair)
+}
+
+/// The op of `pair` runs the counts in slot `slot` (`indirect_guard`).
+pub(super) fn note_counts(pair: &Option<Pair>, slot: u32) {
+    let Some(p) = pair else { return };
+    if let Some(op) = STATE.lock().unwrap().as_mut().and_then(|s| s.ops[p.k as usize].as_mut()) {
+        op.counts = Some(slot);
+    }
 }
 
 /// After the PC call of the op `begin` gave `pair` for.
@@ -400,7 +417,7 @@ fn poll() {
             Stamps::Bad => None,
             Stamps::Span(t) => Some(t),
         };
-        let (key, size) = (op.key, op.size);
+        let (key, size) = (op.key, op.size_now());
         match span {
             Some(t) => {
                 add(&mut s.window, key, t, size);
@@ -441,6 +458,7 @@ fn size_text(kind: Kind, size: [u32; 3]) -> String {
     match kind {
         Kind::Dispatch => format!("{}x{}x{} groups", size[0], size[1], size[2]),
         Kind::Draw => format!("{} vertices or indices x {} instances", size[0], size[1]),
+        Kind::IndirectDispatch if size[1..] != [0, 0] => format!("{}x{}x{} groups, the GPU's", size[0], size[1], size[2]),
         Kind::IndirectDispatch | Kind::IndirectDraw | Kind::PcIndirect => format!("max count {} (its counts are the GPU's)", size[0]),
     }
 }
@@ -464,7 +482,7 @@ fn report(elapsed: Duration, since_start: bool) -> bool {
         let mut running: Vec<(u128, Key, [u32; 3])> = s
             .running
             .iter()
-            .filter_map(|(&k, t)| s.ops[k].as_ref().map(|op| (t.elapsed().as_millis(), op.key, op.size)))
+            .filter_map(|(&k, t)| s.ops[k].as_ref().map(|op| (t.elapsed().as_millis(), op.key, op.size_now())))
             .filter(|r| r.0 >= 500)
             .collect();
         running.sort_by(|a, b| b.0.cmp(&a.0));

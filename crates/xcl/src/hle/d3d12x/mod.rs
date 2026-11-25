@@ -20,6 +20,7 @@ mod fence_x;
 pub mod frame;
 mod gpu_profile;
 pub mod guard;
+mod indirect_guard;
 mod late_release;
 pub mod layout;
 pub mod list_x;

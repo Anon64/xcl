@@ -303,11 +303,19 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if !gfx && super::real::skip_named_cs(pso) {
         return;
     }
+    // (binds a compute root signature and pipeline: before the dispatch's own)
+    let checked = if gfx { None } else { super::indirect_guard::check(this, pso, sig, max, args, args_off, count_buf) };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
             let t = super::gpu_profile::begin(this, pso, if gfx { super::gpu_profile::Kind::IndirectDraw } else { super::gpu_profile::Kind::IndirectDispatch }, [max, 0, 0]);
-            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+            match &checked {
+                Some(c) => {
+                    super::gpu_profile::note_counts(&t, c.slot);
+                    c.run(this, |buffer, off| pc(this, sig, 1, buffer, off, 0, 0));
+                }
+                None => fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off)),
+            }
             super::gpu_profile::end(this, t);
         }
         Err(e) => {
