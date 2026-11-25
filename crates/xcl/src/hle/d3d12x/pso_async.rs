@@ -443,10 +443,12 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+type Work = Box<dyn FnOnce() + Send>;
+
+fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
     Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
+        let (tx, rx) = mpsc::channel::<Work>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
@@ -454,21 +456,54 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
-                // (released by the title meanwhile)
-                if p.orphan.load(Ordering::Acquire) {
-                    let _ = p.job.lock().unwrap().take();
-                    continue;
-                }
-                // (None: a bind took it and builds it itself)
-                let job = p.job.lock().unwrap().take();
-                if let Some(job) = job {
-                    build(&p, job, false);
-                }
+                let Ok(work) = next else { return };
+                work();
             });
         }
         Mutex::new(tx)
     })
+}
+
+fn enqueue(p: Arc<Pending>) {
+    let _ = queue().lock().unwrap().send(Box::new(move || {
+        // (released by the title meanwhile)
+        if p.orphan.load(Ordering::Acquire) {
+            let _ = p.job.lock().unwrap().take();
+            return;
+        }
+        // (None: a bind took it and builds it itself)
+        let job = p.job.lock().unwrap().take();
+        if let Some(job) = job {
+            build(&p, job, false);
+        }
+    }));
+}
+
+/// The caller also drains its batch. Multiple workers can therefore build
+/// different chains without ever waiting for a free worker to start a piece.
+pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
+    let count = jobs.len();
+    let jobs = Arc::new(Mutex::new(jobs.into_iter().enumerate().collect::<Vec<_>>()));
+    let (send, recv) = mpsc::channel();
+    let drain = move || loop {
+        let job = jobs.lock().unwrap().pop();
+        let Some((i, job)) = job else { return };
+        let _ = send.send((i, job()));
+    };
+    // the helpers build for this worker's pipeline: the title waiting for it waits for them too
+    let parent = BUILDING.with(|b| b.borrow().clone());
+    for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
+        let (drain, parent) = (drain.clone(), parent.clone());
+        let _ = queue().lock().unwrap().send(Box::new(move || {
+            let before = BUILDING.with(|b| b.replace(parent));
+            drain();
+            BUILDING.with(|b| *b.borrow_mut() = before);
+        }));
+    }
+    drain();
+    let mut results = vec![0; count];
+    for (i, result) in recv.iter().take(count) { results[i] = result; }
+    results
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -568,7 +603,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, warm
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = queue().lock().unwrap().send(p);
+        enqueue(p);
         return;
     }
     let known = used::known(key);
@@ -1734,7 +1769,7 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                enqueue(p);
             }
             pso
         }
@@ -1973,7 +2008,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         return built(p);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = queue().lock().unwrap().send(p.clone());
+        enqueue(p.clone());
     }
     if p.late.load(Ordering::Acquire) {
         return pso;
@@ -2058,7 +2093,7 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
 /// stood in the queue behind them. Without the backlog (`XCL_PSO_PRELOAD=0`): to those workers.
 fn send_spared(p: Arc<Pending>, q: Option<&Preload>) {
     let Some(q) = q else {
-        let _ = queue().lock().unwrap().send(p);
+        enqueue(p);
         return;
     };
     let mut b = q.list.lock().unwrap();

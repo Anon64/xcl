@@ -1344,6 +1344,18 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let checked = super::indirect_guard::check(this, pso, sig, max, args, args_off, count_buf);
     match bind_abi(this, list, pso, gfx, None) {
         Ok(()) => {
+            if compute {
+                match super::real::dispatch_chain::whole(pso) {
+                    Ok(Some(whole)) => list.SetPipelineState(&whole),
+                    Ok(None) => {}
+                    Err(e) => {
+                        crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
+                        ei_work(this, sig, super::targets::SKIPPED);
+                        count(DISPATCHES_SKIPPED);
+                        return;
+                    }
+                }
+            }
             ei_work(this, sig, super::targets::RAN);
             count(if gfx { DRAWS } else { DISPATCHES });
             let t = super::gpu_profile::begin(this, pso, if gfx { super::gpu_profile::Kind::IndirectDraw } else { super::gpu_profile::Kind::IndirectDispatch }, [max, 0, 0]);
@@ -2055,10 +2067,11 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         return Ok(());
     }
     bind_abi(this, list, pso, false, Some([x, y, z]))?;
+    // (one span for a split program's whole chain of dispatches)
     let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::Dispatch, [x, y, z]);
-    list.Dispatch(x, y, z);
+    let ran = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
     super::gpu_profile::end(this, t);
-    Ok(())
+    ran
 }
 
 /// Window 0's GPU address (`window0`: `real::uma_window_va(0)`), which a bind on XCL's ABI
