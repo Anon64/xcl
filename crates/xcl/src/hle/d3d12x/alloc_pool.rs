@@ -201,6 +201,78 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     found
 }
 
+/// How long a submit waits for the previous submits of its lists (`XCL_RESUBMIT_WAIT_MS`, 2 000;
+/// 0: not at all, as before).
+fn resubmit_wait() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| std::env::var("XCL_RESUBMIT_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000)))
+}
+
+/// `lists` are about to be submitted: the ones whose previous submit the GPU has not finished
+/// (`note_resubmits`) wait for it first, `limit` at most for all of them; then they go as they
+/// are. On the PC a list must not be executed again before its previous execution is done (debug
+/// layer id 553); a console lets a title do it, and a retail title did it about once a second in
+/// its world – 128 times before its device was removed with shader memory faults, and not once in
+/// a run that ended well. Returns (lists waited for, of them not done in time).
+pub unsafe fn wait_for_previous_submits(lists: &[*mut c_void]) -> (usize, usize) {
+    wait_for_previous_submits_within(lists, resubmit_wait())
+}
+
+unsafe fn wait_for_previous_submits_within(lists: &[*mut c_void], limit: std::time::Duration) -> (usize, usize) {
+    if !enabled() || limit.is_zero() {
+        return (0, 0);
+    }
+    // (the fences are taken out: nothing is waited for with STATE held)
+    let pending: Vec<(ID3D12Fence, u64)> = {
+        let g = STATE.lock().unwrap();
+        let Some(s) = g.as_ref() else { return (0, 0) };
+        lists
+            .iter()
+            .filter_map(|&l| s.last_submit.get(&(l as usize)))
+            .filter(|l| super::real::fence_completed(&l.fence) < l.value)
+            .map(|l| (l.fence.clone(), l.value))
+            .collect()
+    };
+    if pending.is_empty() {
+        return (0, 0);
+    }
+    let start = std::time::Instant::now();
+    let mut late = 0;
+    for (fence, value) in &pending {
+        // (XCL's own fence, read without the title's hook; a removed device reads as the largest
+        // value: no wait then. Such a submit is milliseconds from done: a short poll)
+        let mut polls = 0u32;
+        while super::real::fence_completed(fence) < *value {
+            if start.elapsed() >= limit {
+                late += 1;
+                break;
+            }
+            if polls < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            polls += 1;
+        }
+    }
+    static WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if late > 0 {
+        crate::xlog_warn!(
+            "D3D12.X: {late} of {} previous submits of lists submitted again were not done after {} ms – they go as they are (#{n} such submits)",
+            pending.len(),
+            limit.as_millis()
+        );
+    } else if n <= 8 || n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: a submit waited {:.1} ms for the previous submits of {} of its lists (#{n} such submits)",
+            start.elapsed().as_secs_f64() * 1e3,
+            pending.len()
+        );
+    }
+    (pending.len(), late)
+}
+
 /// Whether the GPU has not finished the last submit of the PC list `list` (#1452: it must not be
 /// submitted again before that; `title_list` records the title's next recording elsewhere).
 /// (`fence_completed`: XCL's own fence, without the title's hook, STATE held)
@@ -724,6 +796,49 @@ mod tests {
             assert_eq!(while_running, 1, "a submit while the previous one runs must be noticed");
             assert_eq!(after_done, 0, "a finished previous submit is not a resubmit");
             assert_eq!(after_forget, 0, "a forgotten list has no previous submit");
+        }
+    }
+
+    /// A list whose previous submit still runs is waited for before it is submitted again: until
+    /// that submit is done, or the limit; a list with nothing running is not waited for.
+    #[test]
+    fn a_resubmit_waits_for_the_previous_submit() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            // a fence the GPU has not reached stands for a submit still running
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut ids = Box::new([0u8; 2]);
+            let (alloc, list) = (ids.as_mut_ptr() as usize, ids.as_mut_ptr() as usize + 1);
+            created_on(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                let recording = s.recordings[&list];
+                s.last_submit.insert(list, LastSubmit { queue: 0x10, fence: fence.clone(), value: 1, recording });
+            }
+            let lists = [list as *mut c_void];
+            // it never finishes: the limit ends the wait, and says so
+            let t = std::time::Instant::now();
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::from_millis(30)), (1, 1));
+            assert!(t.elapsed() >= std::time::Duration::from_millis(30));
+            // no limit: no wait
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::ZERO), (0, 0));
+            // it finishes meanwhile: the wait ends then, far before the limit
+            let signal = fence.clone();
+            let done = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                signal.Signal(1).unwrap();
+            });
+            let t = std::time::Instant::now();
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::from_secs(20)), (1, 0));
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the wait ends when the submit is done");
+            done.join().unwrap();
+            // nothing runs now: nothing to wait for
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::from_secs(20)), (0, 0));
+            forget_list(list);
+            forget(alloc);
         }
     }
 }
