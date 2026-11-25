@@ -902,6 +902,56 @@ fn rgb(format: DXGI_FORMAT, t: u32) -> Option<[u8; 3]> {
     })
 }
 
+/// A texel of `format` (its bytes: `targets::texel_bytes` of them) as a colour to look at, for
+/// the formats `rgb` does not take: a frame's HDR and data targets (`XCL_DUMP_TARGETS`). A
+/// float channel is tone-mapped as the HDR formats are, its sign dropped (a normal, a motion
+/// vector); an integer target shows its low bytes. A flat picture over a scene that was drawn
+/// could not be followed through these: they were written black, "format not decoded".
+fn texel_rgb(format: DXGI_FORMAT, t: &[u8]) -> Option<[u8; 3]> {
+    let u16_at = |i: usize| u16::from_le_bytes([t[i], t[i + 1]]);
+    let u32_at = |i: usize| u32::from_le_bytes([t[i], t[i + 1], t[i + 2], t[i + 3]]);
+    // (NaN and infinities: white, so that they show)
+    let tm = |v: f32| if v.is_finite() { ((v.abs() / (1.0 + v.abs())).sqrt() * 255.0) as u8 } else { 255 };
+    let half = |i: usize| half_float(u16_at(i));
+    let float = |i: usize| f32::from_bits(u32_at(i));
+    if t.len() < super::targets::texel_bytes(format) {
+        return None;
+    }
+    Some(match format {
+        DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => [tm(half(0)), tm(half(2)), tm(half(4))],
+        DXGI_FORMAT_R16G16B16A16_UNORM => [t[1], t[3], t[5]],
+        DXGI_FORMAT_R32G32B32A32_FLOAT | DXGI_FORMAT_R32G32B32A32_TYPELESS => [tm(float(0)), tm(float(4)), tm(float(8))],
+        DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_TYPELESS => [tm(half(0)), tm(half(2)), 0],
+        DXGI_FORMAT_R16G16_UNORM => [t[1], t[3], 0],
+        DXGI_FORMAT_R32G32_FLOAT => [tm(float(0)), tm(float(4)), 0],
+        DXGI_FORMAT_R32G32_UINT => [t[0], t[4], t[1]],
+        DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_D32_FLOAT | DXGI_FORMAT_R32_TYPELESS => [tm(float(0)); 3],
+        DXGI_FORMAT_R32_UINT => [t[0], t[1], t[2]],
+        DXGI_FORMAT_R16_FLOAT | DXGI_FORMAT_R16_TYPELESS => [tm(half(0)); 3],
+        DXGI_FORMAT_R16_UNORM | DXGI_FORMAT_D16_UNORM => [t[1]; 3],
+        DXGI_FORMAT_R16_UINT => [t[0], t[1], 0],
+        DXGI_FORMAT_R8G8_UNORM | DXGI_FORMAT_R8G8_TYPELESS => [t[0], t[1], 0],
+        DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_A8_UNORM | DXGI_FORMAT_R8_TYPELESS => [t[0]; 3],
+        DXGI_FORMAT_R8_UINT => [t[0].wrapping_mul(37), t[0].wrapping_mul(91), t[0].wrapping_mul(151)],
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => [t[0], t[1], t[2]],
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => [t[2], t[1], t[0]],
+        DXGI_FORMAT_R10G10B10A2_TYPELESS => return rgb(DXGI_FORMAT_R10G10B10A2_UNORM, u32_at(0)),
+        _ if t.len() >= 4 => return rgb(format, u32_at(0)),
+        _ => return None,
+    })
+}
+
+/// An IEEE half float.
+fn half_float(h: u16) -> f32 {
+    let (sign, e, m) = (if h >> 15 != 0 { -1.0f32 } else { 1.0 }, (h >> 10 & 31) as i32, (h & 0x3FF) as f32 / 1024.0);
+    sign * match e {
+        0 => m * 2f32.powi(-14),
+        31 if m == 0.0 => f32::INFINITY,
+        31 => f32::NAN,
+        _ => (1.0 + m) * 2f32.powi(e - 15),
+    }
+}
+
 /// the largest render target the draws `XCL_TRACE_SHADERS` picked drew into (AddRef'd): the
 /// one the `XCL_TRACE_FRAME` dumps show instead of the busiest
 static WATCHED_RT: Mutex<Option<usize>> = Mutex::new(None);
@@ -986,12 +1036,18 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     }
     let (mut lit, mut decoded) = (0usize, true);
     let mut raw: HashMap<u32, usize> = HashMap::new();
+    // (a texel of 1, 2, 8 or 16 bytes is read at its own size: read as 4 bytes at a 4-byte
+    // stride, an HDR target showed every other half texel and a one-byte one ran past its row)
+    let bytes = super::targets::texel_bytes(format);
     for y in (0..oh).rev() {
         let start = bmp.len();
         for x in 0..ow {
-            let t = ((p as *const u8).add(fp.Offset as usize + step * y * pitch + 4 * step * x) as *const u32).read_unaligned();
+            let texel = std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + step * y * pitch + bytes * step * x), bytes);
+            let mut first = [0u8; 4];
+            first[..bytes.min(4)].copy_from_slice(&texel[..bytes.min(4)]);
+            let t = u32::from_le_bytes(first);
             *raw.entry(t).or_default() += 1;
-            let c = rgb(format, t).unwrap_or_else(|| {
+            let c = texel_rgb(format, texel).unwrap_or_else(|| {
                 decoded = false;
                 [0; 3]
             });
@@ -1044,6 +1100,31 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dumped_texels_of_hdr_and_data_formats_have_a_colour() {
+        assert_eq!(half_float(0x3C00), 1.0);
+        assert_eq!(half_float(0xC000), -2.0);
+        assert_eq!(half_float(0x0000), 0.0);
+        assert!(half_float(0x0001) > 0.0 && half_float(0x0001) < 1e-6, "a denormal");
+        assert!(half_float(0x7C00).is_infinite() && half_float(0x7E00).is_nan());
+        // RGBA16F (1, 0, 4, 1): tone-mapped x / (1 + x), square root
+        let hdr: Vec<u8> = [0x3C00u16, 0, 0x4400, 0x3C00].iter().flat_map(|h| h.to_le_bytes()).collect();
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16B16A16_FLOAT, &hdr), Some([180, 0, 228]));
+        // a NaN shows (white), a negative value by its size
+        let odd: Vec<u8> = [0x7E00u16, 0xBC00, 0, 0].iter().flat_map(|h| h.to_le_bytes()).collect();
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16B16A16_FLOAT, &odd), Some([255, 180, 0]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R8_UNORM, &[200]), Some([200; 3]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R32_UINT, &[1, 2, 3, 4]), Some([1, 2, 3]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16_UNORM, &[0, 10, 0, 20]), Some([10, 20, 0]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R32_FLOAT, &1.0f32.to_le_bytes()), Some([180; 3]));
+        // the formats `rgb` knows go through it
+        assert_eq!(texel_rgb(DXGI_FORMAT_R8G8B8A8_UNORM, &[1, 2, 3, 4]), Some([1, 2, 3]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_B8G8R8A8_UNORM, &[1, 2, 3, 4]), Some([3, 2, 1]));
+        // fewer bytes than the format's texel: no colour (and no read past them)
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16B16A16_FLOAT, &hdr[..4]), None);
+        assert_eq!(texel_rgb(DXGI_FORMAT_BC1_UNORM, &[0; 4]), None, "a format with no texels of its own");
+    }
 
     #[test]
     fn frame_rate_uses_frame_and_time_deltas() {

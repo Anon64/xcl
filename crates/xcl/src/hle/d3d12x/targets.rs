@@ -239,7 +239,7 @@ fn census(data: &[u8], width: usize, height: usize, pitch: usize, format: DXGI_F
 
 /// bytes of a texel of a render-target format (or of the plane of a planar format a footprint
 /// names: a copied depth-stencil's depth plane is R32 / R24X8 typeless, 4 bytes)
-fn texel_bytes(f: DXGI_FORMAT) -> usize {
+pub(super) fn texel_bytes(f: DXGI_FORMAT) -> usize {
     match f {
         DXGI_FORMAT_R32G32B32A32_FLOAT | DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R32G32B32A32_TYPELESS => 16,
         DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_UNORM | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16B16A16_SNORM
