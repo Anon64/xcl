@@ -840,21 +840,20 @@ unsafe fn write_title(p: usize, bytes: &[u8]) -> bool {
 /// Where the CPU reads or writes `[p, p + n)` of the title's memory for a request: a GPU view of
 /// its memory in a view window (`d3d12x::view_want`; the CPU cannot touch it) at the CPU view
 /// behind it, whose pages the view's tiles show – a retail title gives DirectStorage the GPU
-/// view's addresses; any other address as it is. None: the range runs past its GPU view.
+/// view's addresses; any other address as it is. None: the range runs past its GPU view, or its
+/// pages are kept apart (the queue's page mappings: written there, it would land in another
+/// page's bytes).
 fn cpu_range(p: usize, n: usize) -> Option<usize> {
     cpu_range_in(p, n, |a| crate::hle::d3d12x::view_want::is_view(a as u64))
 }
 
 /// `cpu_range`, with `in_view` saying which addresses lie in a view window.
 fn cpu_range_in(p: usize, n: usize, in_view: impl Fn(usize) -> bool) -> Option<usize> {
-    use crate::hle::d3d12x::view_want::cpu;
     if p == 0 || !in_view(p) {
         return Some(p);
     }
-    let c = cpu(p as u64) as usize;
-    let last = n.saturating_sub(1);
-    // (the pair maps its range in one piece: the last byte tells whether it ran past it)
-    (cpu(p.checked_add(last)? as u64) as usize == c.checked_add(last)?).then_some(c)
+    // (every page of the range, not only its first and last byte)
+    crate::hle::d3d12x::view_want::cpu_run(p as u64, n as u64).map(|c| c as usize)
 }
 
 /// Whether `n` bytes at `p` are committed, writable memory.

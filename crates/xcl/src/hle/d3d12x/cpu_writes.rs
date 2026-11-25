@@ -106,8 +106,23 @@ fn cpu_at_in(va: usize, in_view: impl Fn(usize) -> bool) -> usize {
 
 /// The dwords at `va`, if the memory is still there and writable.
 unsafe fn write_now(va: usize, words: &[u32]) {
-    let va = cpu_at(va);
+    write_now_in(va, words, &|a, n| if super::view_want::is_view(a as u64) { super::view_want::cpu_run(a as u64, n as u64).map(|c| c as usize) } else { Some(a) });
+}
+
+/// `write_now`, with `run` giving where the CPU writes `[a, a + n)` (`cpu_at`) when that is one
+/// piece, None when the range covers pages of a GPU view kept apart (the queue's page mappings):
+/// then the dwords are written in two calls, split at the first 64 KiB page boundary, each part
+/// where its own pages are.
+unsafe fn write_now_in(va: usize, words: &[u32], run: &dyn Fn(usize, usize) -> Option<usize>) {
     let bytes = 4 * words.len();
+    let Some(va) = run(va, bytes) else {
+        let first = ((va | 0xFFFF) - va + 1).div_ceil(4);
+        if first < words.len() {
+            write_now_in(va, &words[..first], run);
+            write_now_in(va + 4 * first, &words[first..], run);
+        }
+        return;
+    };
     if !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
         use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
@@ -257,6 +272,32 @@ mod tests {
         assert_eq!(cpu_at_in(c + 0x10, view), c + 0x10);
         assert_eq!(cpu_at_in(g + 0x10, |_| false), g + 0x10, "no view windows: as it was");
         mirrors::released(c);
+    }
+
+    /// Dwords for the GPU over two pages of a GPU view whose pages are kept apart land, each,
+    /// where its own page is; a write that is one piece is made in one.
+    #[test]
+    fn a_write_over_pages_kept_apart_is_made_page_by_page() {
+        unsafe {
+            const PAGE: usize = 0x1_0000;
+            // (two pages of a view, kept in two buffers of their own)
+            let (mut one, mut two) = (vec![0u32; 8], vec![0u32; 8]);
+            let (p1, p2) = (one.as_mut_ptr() as usize, two.as_mut_ptr() as usize);
+            let g = 0x7268_0000_0000usize;
+            let place = |a: usize| if a < g + PAGE { p1 + 16 + (a - (g + PAGE - 16)) } else { p2 + (a - (g + PAGE)) };
+            let calls = std::cell::Cell::new(0);
+            let run = |a: usize, n: usize| {
+                calls.set(calls.get() + 1);
+                ((a ^ (a + n.max(1) - 1)) < PAGE).then(|| place(a))
+            };
+            write_now_in(g + PAGE - 8, &[1, 2, 3, 4, 5], &run);
+            assert_eq!(one[4..], [0, 0, 1, 2]);
+            assert_eq!(two[..4], [3, 4, 5, 0]);
+            assert_eq!(calls.get(), 3, "split once, at the page boundary");
+            write_now_in(g + PAGE + 4, &[6, 7], &run);
+            assert_eq!(two[..4], [3, 6, 7, 0]);
+            assert_eq!(calls.get(), 4, "inside one page: one piece");
+        }
     }
 
     /// A ReadbackU64 write copies the 64-bit value from the mapped readback buffer after the queue finishes.

@@ -1500,10 +1500,16 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
     }
     let mut views = Vec::new();
     for &(slot, (va, bytes, stride), _) in &vbs {
-        // (a buffer in a GPU view is read where the CPU has it, its CPU view)
-        let cpu = if in_views(va) { super::view_want::cpu(va) } else { va };
-        let (s, at) = (stride as usize, cpu as usize + first_vertex as usize * stride as usize);
+        let (s, start) = (stride as usize, va as usize + first_vertex as usize * stride as usize);
         let len = rects * 3 * s;
+        // (a buffer in a GPU view is read where the CPU has it, its CPU view: the range of the
+        // vertices, which must be one piece there)
+        let at = if in_views(va) {
+            let Some(c) = super::view_want::cpu_run(start as u64, len as u64) else { return false };
+            c as usize
+        } else {
+            start
+        };
         if va == 0 || s == 0 || s % 4 != 0 || first_vertex as usize * s + len > bytes as usize || !crate::gpu::shader::readable(at, len) {
             return false;
         }
