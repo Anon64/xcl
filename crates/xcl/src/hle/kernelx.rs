@@ -697,6 +697,26 @@ pub mod mirrors {
         gone
     }
 
+    /// The memory `[base, base + len)` was released: the shown pages kept there have no place
+    /// from now on (they show nothing until their page is placed again; a change of what they
+    /// show). Returns those GPU-view pages.
+    pub(super) fn place_gone(base: usize, len: usize) -> Vec<usize> {
+        if MAPPED.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let end = base.saturating_add(len);
+        if read_pages().by_at.range((base, 0)..(end, 0)).next().is_none() {
+            return Vec::new();
+        }
+        let mut p = write_pages();
+        let gone: Vec<usize> = p.by_at.range((base, 0)..(end, 0)).map(|&(_, g)| g).collect();
+        let call = calls();
+        for &g in &gone {
+            p.place(g, 0, false, Some(call));
+        }
+        gone
+    }
+
     /// The GPU-view pages in `[lo, hi)` whose content changed after cursor `seen` (0 at first),
     /// each once, with the call that last changed it, in the order of their last change – at
     /// most `most` – and the cursor to pass next. Nothing is drained: each reader keeps a cursor
@@ -1068,12 +1088,22 @@ fn keep_last_error<R>(f: impl FnOnce() -> R) -> R {
 
 /// The part of `[a, a + n)` (`n == 0`: to the end of the reservation at `a`) that lies in a
 /// paired CPU view (`mirrors`): the pages `source_going` tells sparse about. One atomic load
-/// while nothing is paired; else a look at the pairs.
+/// while nothing is paired; else a look at the pairs. While the page-mapping method shows pages
+/// in GPU views (`mirrors::any_mapped`) any memory may hold the place of one that a tile shows:
+/// all of `[a, a + n)` then (sparse decides by its own index whether a tile shows it); one atomic
+/// load more while nothing is mapped.
 unsafe fn source_part(a: usize, n: usize) -> Option<(usize, usize)> {
-    let (lo, len) = mirrors::cpu_view_part(a, n)?;
-    #[cfg(test)]
-    tests::SOURCES_GOING.with(|s| s.borrow_mut().push((lo, len, committed_page(lo))));
-    Some((lo, len))
+    if let Some((lo, len)) = mirrors::cpu_view_part(a, n) {
+        #[cfg(test)]
+        tests::SOURCES_GOING.with(|s| s.borrow_mut().push((lo, len, committed_page(lo))));
+        return Some((lo, len));
+    }
+    if n != 0 && mirrors::any_mapped() {
+        #[cfg(test)]
+        tests::KEPT_GOING.with(|s| s.borrow_mut().push((a, n, committed_page(a))));
+        return Some((a, n));
+    }
+    None
 }
 
 /// `os` decommits (or, with `release`, releases) pages of `[a, a + n)` (`n == 0`: to the end of
@@ -1125,6 +1155,11 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             mirrors::released(a);
             u.sparse_release(a);
             forget_title_mappings(a, n);
+            // (tiles may show pages kept here; the pages kept here show nothing from now on)
+            if mirrors::any_mapped() {
+                crate::hle::d3d12x::sparse::forget_mirrors(a, n);
+                mirrors::place_gone(a, n);
+            }
         }
         return 1;
     }
@@ -1163,8 +1198,10 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     // a decommit, or a release (of the whole reservation: size 0), of a paired CPU view – the
     // title's CPU view is plain write-watched memory – is told to sparse before Windows does it
     let release = t & mem::MEM_RELEASE != 0;
-    // (looked up before the pair goes: a graphics reservation is unpaired below, before Windows)
-    let part = if release != (t & mem::MEM_DECOMMIT != 0) && !(release && size != 0) { source_part(addr as usize, size) } else { None };
+    // (looked up before the pair goes: a graphics reservation is unpaired below, before Windows;
+    // size 0 is the whole of a graphics reservation, which may hold places of shown pages)
+    let whole = if size == 0 { GRAPHICS_RESERVATIONS.lock().unwrap().get(&(addr as usize)).copied().unwrap_or(0) } else { size };
+    let part = if release != (t & mem::MEM_DECOMMIT != 0) && !(release && size != 0) { source_part(addr as usize, whole) } else { None };
     // a graphics reservation is unpaired before Windows can hand its address out again
     let graphics = t & 0x8000 != 0 && size == 0 && GRAPHICS_RESERVATIONS.lock().unwrap().contains_key(&(addr as usize));
     if graphics {
@@ -1179,6 +1216,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
                 mirrors::released(addr as usize);
             }
             forget_title_mappings(addr as usize, len);
+            mirrors::place_gone(addr as usize, len);
         }
     }
     ok
@@ -1943,7 +1981,8 @@ unsafe fn give_back_homes(away: &mut Away) {
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(start)) {
             crate::hle::d3d12x::sparse::decommitted(start, end - start);
         }
-        mem::VirtualFree(start as *mut c_void, end - start, mem::MEM_DECOMMIT);
+        // (a tile may show a page kept at its home: `source_part`)
+        source_going(start, end - start, false, || mem::VirtualFree(start as *mut c_void, end - start, mem::MEM_DECOMMIT));
     }
 }
 
@@ -2267,13 +2306,16 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         e.1 = e.1.saturating_sub(1);
         if e.1 == 0 {
             g.remove(&first);
-            if u.is_sparse(home) {
-                crate::hle::d3d12x::sparse::free(home);
-            } else if u.contains(home) {
-                u.free(home);
-            } else {
-                mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE);
-            }
+            // (a tile may show a page kept in the block: `source_part`)
+            source_going(home, count * PHYS_PAGE, true, || {
+                if u.is_sparse(home) {
+                    crate::hle::d3d12x::sparse::free(home);
+                } else if u.contains(home) {
+                    u.free(home);
+                } else {
+                    mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE);
+                }
+            });
         }
     }
     1
@@ -3800,6 +3842,10 @@ mod tests {
         /// what `source_going` told sparse on this thread: (start, bytes, whether the first page
         /// was still committed then)
         pub(super) static SOURCES_GOING: std::cell::RefCell<Vec<(usize, usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// what `source_going` told sparse on this thread of memory of no pair while pages were
+        /// shown (`mirrors::any_mapped`): (start, bytes, whether the first page was still
+        /// committed then)
+        pub(super) static KEPT_GOING: std::cell::RefCell<Vec<(usize, usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
         /// the ranges `mirrors::released` had sparse forget on this thread
         pub(super) static FORGOTTEN: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
@@ -4466,6 +4512,73 @@ mod tests {
             assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, std::ptr::null_mut()) as usize, r);
             assert_eq!(FreeTitlePhysicalPages(null, 1, pages.as_mut_ptr()), 1);
             for q in [space, r] {
+                assert_eq!(VirtualFree(q as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            }
+        }
+    }
+
+    /// While GPU views show mapped pages, memory of no pair is told to sparse before it goes (a
+    /// tile may show a page kept there): the address a page leaves, while still committed; the
+    /// home given back once the page was mapped away from it again; the release of the block's
+    /// home. The release of the pool leaves the page kept there showing nothing.
+    #[test]
+    fn memory_under_a_shown_page_is_told_to_sparse_before_it_goes() {
+        use mirrors::{apply_batches, shows, Shows, PAGE};
+        const SIZE: usize = 151 * PAGE;
+        let g = 0x72B0_0000_0000usize;
+        let null = std::ptr::null_mut();
+        let kept = || KEPT_GOING.with(|s| s.take());
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
+            let [a, b] = pages;
+            let home = page_home(a).unwrap();
+            let cv = cpu_view(SIZE, g);
+            let pool = reserve_watched(2 * PAGE, 0x2000, mem::PAGE_READWRITE) as usize;
+            let r = reserve_watched(2 * PAGE, 0x2000, mem::PAGE_READWRITE) as usize;
+            assert!(pool != 0 && r != 0);
+            for (at, page) in [(pool, a), (pool + PAGE, b)] {
+                let mut one = [page];
+                assert_eq!(MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, at);
+                *(at as *mut u32) = page as u32;
+            }
+            // a at view page 1, b at 2
+            let ranges = [[0, 0, 2]];
+            assert!(apply_batches(1, [batch(g + PAGE, &ranges)].as_ptr() as usize, pool, 2).is_some());
+            assert_eq!(shows(g + PAGE), Shows::Page { at: pool, tile: true });
+            SOURCES_GOING.with(|s| s.borrow_mut().clear());
+            kept();
+
+            // a mapped elsewhere: the address it leaves is told while still committed
+            let (mut one, mut none) = ([a], [0usize]);
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, r);
+            assert_eq!(kept(), vec![(pool, PAGE, true)]);
+            assert!(!committed_page(pool));
+            // unmapped there (home), then mapped elsewhere again: the home is given back, told while
+            // still committed (a home in committed memory stays)
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, none.as_mut_ptr()) as usize, r);
+            assert_eq!(kept(), vec![(r, PAGE, true)]);
+            assert_eq!(shows(g + PAGE), Shows::Page { at: home, tile: true });
+            assert_eq!(MapTitlePhysicalPages((r + PAGE) as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, r + PAGE);
+            assert_eq!(*((r + PAGE) as *const u32), a as u32);
+            assert_eq!(kept(), if lazy_home(home) { vec![(home, PAGE, true)] } else { Vec::new() });
+            assert_eq!(shows(g + PAGE), Shows::Page { at: r + PAGE, tile: true });
+            assert!(SOURCES_GOING.with(|s| s.take()).is_empty(), "no pair");
+
+            // the pool released: b, kept there, shows nothing; a is kept elsewhere
+            assert_eq!(VirtualFree(pool as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert_eq!(kept(), vec![(pool, 2 * PAGE, false)]);
+            assert_eq!(shows(g + 2 * PAGE), Shows::Nothing);
+            assert_eq!(shows(g + PAGE), Shows::Page { at: r + PAGE, tile: true });
+            // a home again, then both freed: the release of their home block is told
+            assert_eq!(MapTitlePhysicalPages((r + PAGE) as *mut c_void, 1, 0, 4, none.as_mut_ptr()) as usize, r + PAGE);
+            kept();
+            assert_eq!(FreeTitlePhysicalPages(null, 2, pages.as_mut_ptr()), 1);
+            assert_eq!(kept(), vec![(home, 2 * PAGE, true)]);
+            assert_eq!(shows(g + PAGE), Shows::Nothing);
+            for q in [cv, r] {
                 assert_eq!(VirtualFree(q as *mut c_void, 0, mem::MEM_RELEASE), 1);
             }
         }
