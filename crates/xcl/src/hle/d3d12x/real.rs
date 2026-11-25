@@ -8850,6 +8850,12 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    // (to rule the system's memory in or out: a removal with no fault of the GPU's had 30 GB of
+    // commit left)
+    let (commit, limit) = crate::host::system_commit();
+    if limit != 0 {
+        crate::xlog_error!("system commit at the removal: {} of {} MB ({} MB left)", commit >> 20, limit >> 20, limit.saturating_sub(commit) >> 20);
+    }
     unsafe {
         // (DRED 1.2: 3 hung, 6 fault, 7 page fault; 0 when the removal did not come from work
         // the GPU was doing – then there is no page fault and there are no breadcrumbs either)
