@@ -1342,9 +1342,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if !gfx && super::real::skip_named_cs(pso) {
         return;
     }
-    // an indirect draw gets its frame trace line as a direct one (`graphics_bound`)
+    // an indirect draw gets its frame trace line as a direct one (`graphics_bound`), marked
     if gfx && super::present::trace_frame() {
-        trace_ui_draw(this, raw_pso);
+        trace_ui_draw(this, raw_pso, true);
     }
     // (binds a compute root signature and a pipeline: before the dispatch's or draw's own)
     let checked = super::indirect_guard::check(this, pso, sig, max, args, args_off, count_buf);
@@ -1662,7 +1662,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         return Some(list);
     }
     if super::present::trace_frame() {
-        trace_ui_draw(this, pso);
+        trace_ui_draw(this, pso, false);
     }
     match bind_abi(this, &list, pso, true, None, 0) {
         Ok(_) => {
@@ -1688,10 +1688,11 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
 /// (format, size, kept in step with title memory or not). The first 24.
 /// `XCL_TRACE_FRAME`, after 300 presents: one line per distinct (VS, PS, render target) drawn –
 /// the shaders' dump hashes, the target and the textures of the first descriptor table.
-unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
+/// ExecuteIndirect draws (`indirect`) are kinds of their own, marked.
+unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize, indirect: bool) {
     // keyed by the target's shape, not the object: a UI library's transient targets (Renoir's
     // layers) are new objects every frame and would fill the list at once
-    static SEEN: Mutex<Vec<(u64, u64, Option<(u64, u32, i32, u32)>)>> = Mutex::new(Vec::new());
+    static SEEN: Mutex<Vec<(u64, u64, Option<(u64, u32, i32, u32)>, bool)>> = Mutex::new(Vec::new());
     if super::present::activity().0 < 300 {
         return;
     }
@@ -1717,7 +1718,7 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
     }
     {
         let mut g = SEEN.lock().unwrap();
-        let key = (vs, ps, desc(rt));
+        let key = (vs, ps, desc(rt), indirect);
         if g.len() >= 160 || g.contains(&key) {
             return;
         }
@@ -1742,9 +1743,10 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
         }
     }
     crate::xlog_info!(
-        "frame trace: draws vs {vs:016x} ps {ps:016x} into {:?}{} – textures {}; {}",
+        "frame trace: draws vs {vs:016x} ps {ps:016x} into {:?}{}{} – textures {}; {}",
         desc(rt),
         if super::present::is_presented(rt) { " (presented)" } else { "" },
+        if indirect { " (ExecuteIndirect)" } else { "" },
         tex.join(", "),
         super::list_x::state_summary(this)
     );
@@ -1766,8 +1768,9 @@ fn traced_shaders() -> &'static [u64] {
 }
 
 /// `XCL_TRACE_FRAME` with a watched target (`present::watch_rt`): draws whose descriptor
-/// tables name it – that object, or another at its title address (the first 16).
-unsafe fn trace_reads_of_watched(this: *mut c_void, pso: usize) {
+/// tables name it – that object, or another at its title address (the first 16). An
+/// ExecuteIndirect draw (`indirect`) has no arguments XCL reads: no line of them.
+unsafe fn trace_reads_of_watched(this: *mut c_void, pso: usize, indirect: bool) {
     let Some(w) = super::present::watched_rt() else { return };
     let w_addr = super::real::title_address(w).or_else(|| super::title_textures::address(w));
     let Some(u) = crate::gpu::uma::get() else { return };
@@ -1807,6 +1810,9 @@ unsafe fn trace_reads_of_watched(this: *mut c_void, pso: usize) {
                     if super::present::is_presented(rt) { " (presented)" } else { "" },
                     root_args_summary(this, 32)
                 );
+                if indirect {
+                    return;
+                }
                 let args = DRAW_ARGS.with(|d| d.get());
                 crate::xlog_info!(
                     "frame trace: … that draw: {args:?} (indexed, count, instances, first, base vertex); input layout [{}]; {}",
@@ -1846,9 +1852,11 @@ unsafe fn follow_layer_sources(this: *mut c_void) {
     }
 }
 
-unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
-    trace_draw_kinds(this, pso);
-    trace_reads_of_watched(this, pso);
+/// `indirect`: an ExecuteIndirect draw, whose arguments are in GPU memory (`DRAW_ARGS` holds the
+/// last direct draw's).
+unsafe fn trace_ui_draw(this: *mut c_void, pso: usize, indirect: bool) {
+    trace_draw_kinds(this, pso, indirect);
+    trace_reads_of_watched(this, pso, indirect);
     follow_layer_sources(this);
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     // `XCL_TRACE_MANY=n`: n draws instead of 24 (a whole frame of a UI)
@@ -1871,8 +1879,8 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
     }
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let sh = super::real::pso_shaders(super::pso_async::resolve(pso)).map(|(v, p)| format!("vs {v:016x} ps {p:016x}"));
-    crate::xlog_info!("frame trace: UI draw (pipeline {pso:#x}, {}): {}", sh.unwrap_or_default(), root_args_summary(this, 16));
-    if !wanted.is_empty() {
+    crate::xlog_info!("frame trace: UI draw (pipeline {pso:#x}, {}{}): {}", sh.unwrap_or_default(), if indirect { ", ExecuteIndirect" } else { "" }, root_args_summary(this, 16));
+    if !wanted.is_empty() && !indirect {
         // the picked shaders' geometry too (vertices dumped at the next present)
         let args = DRAW_ARGS.with(|d| d.get());
         crate::xlog_info!(
