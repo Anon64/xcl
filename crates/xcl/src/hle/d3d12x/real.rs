@@ -1304,7 +1304,8 @@ fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
 static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 
 /// V# of a buffer view (raw: 4-byte elements, num_records in bytes; structured / typed:
-/// stride = element size, num_records in elements); empty when the buffer is not in UMA.
+/// stride = element size, num_records in elements); empty when the buffer is not in UMA. A
+/// buffer placed in a GPU view asks for the tiles of the range viewed (`view_want`).
 fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
     let Some((at, bytes)) = console_buffer(res) else {
         note_buffer_view();
@@ -1322,6 +1323,7 @@ fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_
     let base = at as u64 + first * elem as u64;
     let room = (bytes as u64).saturating_sub(first * elem as u64);
     let records = if stride == 0 { (n as u64 * 4).min(room) } else { (n as u64).min(room / stride as u64) };
+    super::view_want::want(super::view_want::Path::BufferView, base, if stride == 0 { records } else { records * stride as u64 });
     crate::gpu::desc::buffer_words(base, stride, records as u32, fmt)
 }
 
@@ -1527,25 +1529,54 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
     Some(hr)
 }
 
+/// Where a buffer of `bytes` the title places at `va` goes in unified memory: (its window, whether
+/// it lies over the window's tiles – a sparse window, or a view window holding a GPU view of the
+/// title's memory – rather than in the window's heap). None: not in a window, or past its end. A
+/// buffer in a GPU view may run on into the next view windows (the view is one range across them,
+/// `sparse::place_buffer` maps the tiles of each); any other may not.
+fn title_buffer_window(u: &crate::gpu::uma::Uma, va: usize, bytes: usize) -> Option<(usize, bool)> {
+    let k = u.window_of(va)?;
+    let (base, size) = u.window(k);
+    if bytes == 0 {
+        return None;
+    }
+    if u.is_view_window(k) {
+        let last = u.window_of(va.checked_add(bytes - 1)?)?;
+        return (k..=last).all(|j| u.is_view_window(j)).then_some((k, true));
+    }
+    if va - base + bytes > size {
+        return None;
+    }
+    Some((k, u.is_sparse_window(k)))
+}
+
 /// A buffer the title places at its own address (CreatePlacedResourceX): at a placement
 /// boundary (64 KiB) in unified memory it is that memory, placed in the window's heap; the
 /// title's allocation stays the title's.
 pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: &[u8; 0x38], state: u32, clear: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     let u = crate::gpu::uma::get()?;
-    let k = u.window_of(va)?;
-    let (base, size) = u.window(k);
     let mut d: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(desc.as_ptr() as *const D3D12_RESOURCE_DESC);
     let bytes = d.Width as usize;
+    let (k, tiles) = title_buffer_window(u, va, bytes)?;
+    let base = u.window(k).0;
     // a placed PC buffer starts at 64 KiB: one at another address starts below it and XCL adds
     // the difference where PC methods take an offset into it (`buffer_delta`)
     let start = va & !0xFFFF;
     let delta = va - start;
-    if bytes == 0 || va - base + bytes > size {
-        return None;
-    }
-    // the title's own memory (a sparse window): a resource over its video-memory tiles
-    if u.is_sparse(va) {
-        let (hr, delta) = super::sparse::place_buffer(this, va, &d, state, riid, ppv)?;
+    // the title's own memory (a sparse window), or a GPU view of it: a resource over the window's
+    // video-memory tiles (a GPU view's show its CPU view), so its GPU address is the title's and
+    // what reads it (indirect arguments, copies, vertex buffers) reads the title's bytes
+    if tiles {
+        let view = super::view_want::want(super::view_want::Path::PlacedBuffer, va as u64, bytes as u64);
+        let Some((hr, delta)) = super::sparse::place_buffer(this, va, &d, state, riid, ppv) else {
+            if view {
+                static ONCE: AtomicU64 = AtomicU64::new(0);
+                if ONCE.fetch_add(1, Ordering::Relaxed) == 0 {
+                    crate::xlog_warn!("D3D12.X: a buffer at GPU-view address {va:#x} ({bytes:#x} bytes) is not over its tiles – a resource of its own (the GPU does not see the title's bytes there)");
+                }
+            }
+            return None;
+        };
         UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
         if delta != 0 {
             BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
@@ -1622,15 +1653,19 @@ fn pc_mappable(props: Option<D3D12_HEAP_PROPERTIES>) -> bool {
 /// the console gives; the CPU's writes there reach the texture (`title_textures`).
 unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_void, data: *mut *mut c_void) -> HRESULT {
     // a resource in unified memory: its console address (no PC mapping – the PC's would be
-    // the start of the PC resource, before the address for a buffer placed below it)
+    // the start of the PC resource, before the address for a buffer placed below it). One in a
+    // GPU view gives its GPU-view address too (the console's; the CPU cannot touch it there):
+    // what the GPU wrote in the range read lands in its CPU view (`sparse::readback_now` reads
+    // and writes a GPU view's tiles at their CPU view).
     if let Some((p, bytes)) = console_buffer(this as usize) {
-        if crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(p)) {
+        if crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(p) || u.is_view(p)) {
             if !range.is_null() {
                 let r = *(range as *const D3D12_RANGE);
                 if r.End > r.Begin {
                     let begin = r.Begin.min(bytes);
                     let end = r.End.min(bytes);
                     if end > begin {
+                        super::view_want::want(super::view_want::Path::MapRead, (p + begin) as u64, (end - begin) as u64);
                         super::sparse::readback_now(p + begin, end - begin);
                     }
                 }
@@ -1760,9 +1795,9 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         // a buffer may be over a heap of pages that are freed next; a texture, and a buffer of XCL's
-        // in video memory, is not
+        // in video memory (or over a GPU view's tiles), is not
         let texture = held && ID3D12Resource::from_raw_borrowed(&this).is_some_and(|r| r.GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER);
-        let in_video_memory = gone.as_ref().is_some_and(|b| crate::gpu::uma::get().is_some_and(|u| u.shadowed() || u.is_sparse(b.0)));
+        let in_video_memory = gone.as_ref().is_some_and(|b| crate::gpu::uma::get().is_some_and(|u| u.shadowed() || u.is_sparse(b.0) || u.is_view(b.0)));
         pinned = !texture && !in_video_memory;
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -1986,19 +2021,28 @@ fn note_buffer_view() {
 
 /// #17 CreateConstantBufferView: a V# of float4 rows at the buffer's console address
 /// (`desc::cbv_words`; unified memory, anything else gets an empty V#). No PC CBV: translated
-/// shaders read buffers through `mem`.
+/// shaders read buffers through `mem`. One in a GPU view of the title's memory asks for its
+/// tiles (`view_want`).
 unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC, cpu: u64) {
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| !s.sampler) else {
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
         return f(this, desc, cpu);
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
-    let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
-    if !in_uma {
+    let words = cbv_at(crate::gpu::uma::get(), va, size).unwrap_or_else(|| {
         note_buffer_view();
-    }
-    let (va, size) = if in_uma { (va, size) } else { (0, 0) };
-    super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
+        crate::gpu::desc::cbv_words(0, 0)
+    });
+    super::view_want::want(super::view_want::Path::Cbv, va, size as u64);
+    super::console_heap::write(&slot, &words);
+}
+
+/// The V# of a constant buffer view of `size` bytes at `va`, when shaders reach it there: the
+/// CPU's unified memory, or a view window (a GPU view of the title's memory: the CPU cannot touch
+/// it, its tiles show the CPU view). None: anywhere else.
+fn cbv_at(u: Option<&crate::gpu::uma::Uma>, va: u64, size: u32) -> Option<[u32; 4]> {
+    let u = u?;
+    (u.contains(va as usize) || u.is_view(va as usize)).then(|| crate::gpu::desc::cbv_words(va, size))
 }
 
 /// #22 CreateSampler: the PC sampler at the slot's index, the S# in XCL ABI form (word 3
@@ -2223,7 +2267,11 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // so write the RDNA2 BVH descriptor directly and skip forwarding the console VA to PC.
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) {
         let va = v.Anonymous.RaytracingAccelerationStructure.Location;
-        let in_uma = va != 0 && crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
+        // in a GPU view: its tiles are asked for from the root's on (the size is not known; the
+        // build wrote the nodes through views that asked for theirs, and a buffer placed there
+        // has all its tiles)
+        let view = super::view_want::want(super::view_want::Path::ViewAt, va, 0x1_0000);
+        let in_uma = va != 0 && (view || crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize)));
         if in_uma {
             let w = crate::gpu::desc::bvh_words(va, true);
             return super::console_heap::write(&slot, &[w[0], w[1], w[2], w[3], 0, 0, 0, 0]);
@@ -2351,7 +2399,8 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
         let Some(slot) = super::console_heap::slot(cpu) else { return };
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        let (words, at, len) = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        super::view_want::want(super::view_want::Path::ViewAt, at, len);
         return super::console_heap::write(&slot, &words);
     }
     dev_create_srv_x(this, resource_at(this, rdesc, va), &v, cpu);
@@ -2369,14 +2418,16 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let Some(slot) = super::console_heap::slot(cpu) else { return };
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        let (words, at, len) = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        super::view_want::want(super::view_want::Path::ViewAt, at, len);
         return super::console_heap::write(&slot, &words);
     }
     dev_create_uav_x(this, resource_at(this, rdesc, va), std::ptr::null_mut(), &v, cpu);
 }
 
-/// V# of `n` elements from element `first` of the buffer at `va`.
-fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
+/// V# of `n` elements from element `first` of the buffer at `va`, and the bytes it covers
+/// (address, length): what a view in a GPU view asks the tiles of (`view_want`).
+fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> ([u32; 4], u64, u64) {
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
     let (stride, elem) = match (raw, stride) {
         (true, _) => (0, 4),
@@ -2387,7 +2438,9 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
         (false, s) => (s, s),
     };
     let records = if stride == 0 { n.saturating_mul(4) } else { n };
-    crate::gpu::desc::buffer_words(va + first * elem as u64, stride, records, fmt)
+    let at = va + first * elem as u64;
+    let len = if stride == 0 { records as u64 } else { records as u64 * stride as u64 };
+    (crate::gpu::desc::buffer_words(at, stride, records, fmt), at, len)
 }
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
@@ -8030,6 +8083,91 @@ mod console_format_query_tests {
             let r = ID3D12Resource::from_raw(p);
             assert_eq!(r.GetDesc().Format.0, 44, "made R24G8_TYPELESS");
         }
+    }
+}
+
+#[cfg(test)]
+mod gpu_view_tests {
+    use super::*;
+    use crate::gpu::uma::{Uma, MAX_HEAP_WINDOWS, VIEW_WINDOWS, WINDOW};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_UNKNOWN};
+
+    /// The 16-window layout of its own (the process's `uma::get()` is whatever the environment
+    /// chose) and a GPU view of `bytes` in its view windows.
+    fn sixteen_with_view(bytes: usize) -> (Uma, usize) {
+        let u = Uma::for_runtime_windows(16 << 20, 512 << 20, MAX_HEAP_WINDOWS).expect("16-window aperture");
+        let g = u.view_reserve(bytes).expect("a GPU view");
+        (u, g)
+    }
+
+    /// A buffer view by address (device #70 / #71) covers exactly its elements: from element
+    /// `first` on, `n` of them – 4-byte words of a raw view, `stride` bytes of a structured one,
+    /// the format's bytes of a typed one. That range, no more, is what asks for a GPU view's tiles.
+    #[test]
+    fn a_view_by_address_covers_its_elements() {
+        let va = 0x7_0000_1000u64;
+        let (w, at, len) = buffer_words_at(va, DXGI_FORMAT_R32_TYPELESS, 3, 10, 0, true);
+        assert_eq!((at, len), (va + 12, 40), "raw: 4-byte words");
+        assert_eq!((w[0], w[1] & 0xFFFF, w[2]), ((va + 12) as u32, ((va + 12) >> 32) as u32, 40));
+        let (w, at, len) = buffer_words_at(va, DXGI_FORMAT_UNKNOWN, 2, 5, 24, false);
+        assert_eq!((at, len), (va + 48, 120), "structured: 24-byte elements");
+        assert_eq!((w[0], w[1] >> 16, w[2]), ((va + 48) as u32, 24, 5));
+        let (w, at, len) = buffer_words_at(va, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 4, 0, false);
+        assert_eq!((at, len), (va + 16, 64), "typed: the format's 16 bytes");
+        assert_eq!((w[0], w[1] >> 16, w[2]), ((va + 16) as u32, 16, 4));
+        let (_, at, len) = buffer_words_at(va, DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true);
+        assert_eq!((at, len), (va, 0), "an empty view asks for nothing");
+    }
+
+    /// A constant buffer view in a GPU view carries its address: shaders read the view window
+    /// there (its tiles show the CPU view). It was left empty: the address is no CPU memory.
+    #[test]
+    fn a_constant_buffer_view_in_a_gpu_view_carries_its_address() {
+        let (u, g) = sixteen_with_view(1 << 20);
+        let va = (g + 0x2_0100) as u64;
+        let w = cbv_at(Some(&u), va, 256).expect("a CBV in a GPU view reaches the shaders");
+        assert_eq!(w, crate::gpu::desc::cbv_words(va, 256));
+        assert_eq!((w[0], w[1] & 0xFFFF, w[2]), (va as u32, (va >> 32) as u32, 16), "the address and 16 float4 rows");
+        // the CPU's unified memory as before; past the view windows, and without unified memory,
+        // nothing
+        let sparse = (u.base() + 0x10_0000) as u64;
+        assert_eq!(cbv_at(Some(&u), sparse, 64), Some(crate::gpu::desc::cbv_words(sparse, 64)));
+        let first_view = (0..MAX_HEAP_WINDOWS).find(|&k| u.is_view_window(k)).unwrap();
+        let after = (u.base() + (first_view + VIEW_WINDOWS) * WINDOW + 0x100) as u64;
+        assert_eq!(cbv_at(Some(&u), after, 64), None, "an empty window");
+        assert_eq!(cbv_at(None, va, 256), None);
+        // the 4-window layout has no view windows: the same address is nothing there
+        let four = Uma::for_runtime(16 << 20).expect("4-window aperture");
+        assert_eq!(cbv_at(Some(&four), va, 256), None);
+        assert_eq!(u.view_release(g), Some(1 << 20));
+    }
+
+    /// A buffer the title places in a GPU view goes over the view window's tiles, as one in a
+    /// sparse window does, and may run on into the next view window (the view is one range across
+    /// them); not into a window that is no view. It became a resource of its own that stayed zero.
+    #[test]
+    fn a_buffer_placed_in_a_gpu_view_goes_over_its_tiles() {
+        let (u, g) = sixteen_with_view(2 * WINDOW);
+        let k = u.window_of(g).unwrap();
+        assert!(u.is_view_window(k) && u.is_view_window(k + 1));
+        assert_eq!(title_buffer_window(&u, g + 0x3_0000, 0x1000), Some((k, true)));
+        assert_eq!(title_buffer_window(&u, g + WINDOW - 0x1_0000, 0x2_0000), Some((k, true)), "across two view windows");
+        assert_eq!(title_buffer_window(&u, g + WINDOW + 0x10, 0x100), Some((k + 1, true)));
+        assert_eq!(title_buffer_window(&u, g, 0), None, "no bytes");
+        // the last view window runs into an empty one
+        let last = (0..MAX_HEAP_WINDOWS).rfind(|&j| u.is_view_window(j)).unwrap();
+        let end = u.base() + (last + 1) * WINDOW;
+        assert!(!u.is_view_window(last + 1));
+        assert_eq!(title_buffer_window(&u, end - 0x1_0000, 0x2_0000), None, "past the view windows");
+        // sparse and coherent windows as before: whole in their window
+        assert_eq!(title_buffer_window(&u, u.base() + 0x1_0000, 0x100), Some((0, true)));
+        assert_eq!(title_buffer_window(&u, u.base() + WINDOW - 0x1_0000, 0x2_0000), None, "across a sparse window's end");
+        let coh = u.committed_window().unwrap();
+        let (c, c_len) = u.window(coh);
+        assert_eq!(title_buffer_window(&u, c + 0x1_0000, 0x100), Some((coh, false)));
+        assert_eq!(title_buffer_window(&u, c + c_len - 0x100, 0x200), None);
+        assert_eq!(title_buffer_window(&u, end + 0x1_0000, 0x100), None, "an empty window");
+        assert_eq!(u.view_release(g), Some(2 * WINDOW));
     }
 }
 
