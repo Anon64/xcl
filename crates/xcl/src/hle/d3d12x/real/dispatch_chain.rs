@@ -8,7 +8,13 @@ static PROGRAMS: AtomicU64 = AtomicU64::new(0);
 static PIECES: AtomicU64 = AtomicU64::new(0);
 static DISPATCHES: AtomicU64 = AtomicU64::new(0);
 
+/// (only when a count changed since the last line: called every 10 s in every run)
 pub(crate) fn log_counts() {
+    static LAST: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+    let now = [&PROGRAMS, &PIECES, &DISPATCHES, &SCRATCH_HELD].map(|c| c.load(Ordering::Relaxed));
+    if std::mem::replace(&mut *LAST.lock().unwrap(), now) == now {
+        return;
+    }
     crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued, {} MiB of scratch held",
         PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed), SCRATCH_HELD.load(Ordering::Relaxed) >> 20);
 }
