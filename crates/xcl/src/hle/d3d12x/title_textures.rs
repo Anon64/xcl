@@ -2073,22 +2073,17 @@ pub(super) unsafe fn copy_readable(at: usize, to: &mut [u8]) {
     let mut read = 0usize;
     if ReadProcessMemory(GetCurrentProcess(), at as *const c_void, to.as_mut_ptr() as *mut c_void, to.len(), &mut read) == 0 || read < to.len() {
         to.fill(0);
-        copy_committed_region(at, to.as_mut_ptr(), to.len());
+        copy_regions(at, to);
     }
 }
 
-/// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
-/// has only some of its pages mapped).
-pub(super) unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
+/// The committed, readable regions of `[at, at + to.len())` into `to` (zeros before). A question a
+/// region: `copy_committed_region` finds what is not there by failing at every page of it, 2 calls
+/// a page (a retail title makes its textures before it maps their memory: 13.6 GB of them went up
+/// at 0.5 GB/s while its world loaded).
+unsafe fn copy_regions(at: usize, to: &mut [u8]) {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-    let mut out = vec![0u8; len];
-    let Some(limit) = at.checked_add(len) else { return out };
-    // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
-    // walking it)
-    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
-        std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
-        return out;
-    }
+    let Some(limit) = at.checked_add(to.len()) else { return };
     let mut p = at;
     while p < limit {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
@@ -2101,10 +2096,26 @@ pub(super) unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
         }
         let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
         if readable {
-            copy_committed_region(p, out.as_mut_ptr().add(p - at), end - p);
+            copy_committed_region(p, to.as_mut_ptr().add(p - at), end - p);
         }
         p = end;
     }
+}
+
+/// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
+/// has only some of its pages mapped).
+pub(super) unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    if at.checked_add(len).is_none() {
+        return out;
+    }
+    // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
+    // walking it)
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
+        std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
+        return out;
+    }
+    copy_regions(at, &mut out);
     out
 }
 
