@@ -116,6 +116,15 @@ pub(super) fn forget(known: &Known) {
     k.again = None;
 }
 
+/// What a texture's memory holds from here on is not taken for what the PC texture holds (an
+/// upload going on keeps nothing it reads): its next write sends all of it. What is to go up
+/// again stays.
+pub(super) fn unknown(known: &Known) {
+    let mut k = known.lock().unwrap();
+    k.hashes.clear();
+    k.forgotten += 1;
+}
+
 /// `changed` of a texture (None: all of it) went up on `to`. An older upload of the texture on
 /// another queue that has not run yet (and that `to`'s queue has not waited for: `waited`) can land
 /// over it: it goes up again, behind that one (`take_again`). True when there is such a thing.
@@ -822,6 +831,15 @@ mod tests {
         assert_eq!(unsafe { changed(&[Written { src, size, dirty: &dirty[2..3], known: &known }], false) }.0, vec![Change::Parts(vec![(0x800, PAGE + 0x800)])]);
         forget(&known);
         assert_eq!(look(&dirty[2..3]).0, vec![Change::All]);
+        // nothing taken for what the PC texture holds: all of it at the next write, and what was to
+        // go up again stays
+        all_sent(&known, src, size);
+        assert_eq!(look(&dirty[3..5]).0, vec![Change::Parts(vec![(PAGE + 0x800, 3 * PAGE + 0x800)])]);
+        known.lock().unwrap().again = Some((Change::Parts(vec![(0, 64)]), Vec::new()));
+        unknown(&known);
+        assert!(known.lock().unwrap().again.is_some());
+        assert_eq!(look(&dirty[3..5]).0, vec![Change::All]);
+        known.lock().unwrap().again = None;
         // several textures at once, many pages: the same as one by one
         let big = vec![7u8; 600 * PAGE];
         let at = (big.as_ptr() as usize).next_multiple_of(PAGE);
