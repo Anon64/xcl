@@ -209,8 +209,9 @@ pub fn uma_window_vas() -> Vec<u64> {
     UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
 }
 
-/// the windows' addresses again, for what asks for every draw and dispatch (0: no such window)
-static UMA_WINDOW_VAS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// the windows' addresses again, for what asks for every draw and dispatch (0: no such window);
+/// one for each window of the widest layout (16: a GPU view at window 8 or past had no PC address)
+static UMA_WINDOW_VAS: [AtomicU64; crate::gpu::uma::MAX_HEAP_WINDOWS] = [const { AtomicU64::new(0) }; crate::gpu::uma::MAX_HEAP_WINDOWS];
 /// how many there are
 static UMA_WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -228,10 +229,12 @@ fn set_uma_windows(bufs: Vec<(usize, u64)>) {
     *UMA_BUFFER.lock().unwrap() = bufs;
 }
 
-/// The window buffer holding `len` bytes at UMA address `p`, and their offset in it.
+/// The window buffer holding `len` bytes at UMA address `p`, and their offset in it. Not for a
+/// view window: what the lists' memory operations write is read back to the CPU at its own
+/// address (`sparse::readback_after_execute`), and a GPU view has no CPU memory there.
 pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
     let u = crate::gpu::uma::get()?;
-    let k = u.window_of(p)?;
+    let k = u.window_of(p).filter(|&k| !u.is_view_window(k))?;
     let (base, size) = u.window(k);
     if p - base + len > size {
         return None;
@@ -6610,6 +6613,13 @@ mod init_tests {
             }
         });
         assert!(OPENED.load(Ordering::Relaxed) <= 1, "{} devices were opened", OPENED.load(Ordering::Relaxed));
+    }
+
+    /// Each window of the widest layout keeps its GPU address for `uma_window_va`: with 8 places,
+    /// windows 8..15 had none, and their addresses went to the PC as they were.
+    #[test]
+    fn every_window_of_sixteen_has_a_place_for_its_gpu_address() {
+        assert_eq!(UMA_WINDOW_VAS.len(), crate::gpu::uma::MAX_HEAP_WINDOWS);
     }
 }
 

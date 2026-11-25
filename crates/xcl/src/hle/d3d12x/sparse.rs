@@ -715,13 +715,14 @@ pub unsafe fn shadow_window(dev: &ID3D12Device, base: usize, size: usize, buf: &
 }
 
 /// The sparse windows' buffers on `dev`: `(window_index, buffer_raw, gpu_va)` for each
-/// sparse window in `gpu::uma` (empty: no sparse windows).
+/// sparse window in `gpu::uma` and each view window, made the same way (empty: no sparse
+/// windows). Nothing of a view window is mapped here: its tiles get video memory when asked for.
 pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     let Some(u) = crate::gpu::uma::get() else { return Vec::new() };
     let mut out = Vec::new();
     let mut windows = Vec::new();
     for k in 0..u.shader_windows() {
-        if !u.is_sparse_window(k) {
+        if !u.is_sparse_window(k) && !u.is_view_window(k) {
             continue;
         }
         let (base, size) = u.window(k);
@@ -740,7 +741,8 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     let made = new_state(dev, windows);
     match made {
         Ok(s) => {
-            crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
+            let views = out.iter().filter(|w| u.is_view_window(w.0)).count();
+            crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory and {views} for GPU views of it (tiled buffers on video memory)", out.len() - views);
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
             // (the queue first: `queue()` never answers with one older than the state's)

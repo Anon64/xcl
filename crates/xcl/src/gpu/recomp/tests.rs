@@ -4045,12 +4045,15 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     }
     assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "real D3D12.X backend");
     let u = crate::gpu::uma::get().expect("UMA");
-    assert_eq!(u.shader_windows(), 4, "runtime layout has 4 shader windows");
+    // 4 windows, or 16 with `XCL_UMA_WINDOWS=16` (windows 0..3 as with 4; then view windows and
+    // windows without memory)
+    assert_eq!(u.shader_windows(), crate::gpu::uma::configured_runtime_windows(), "runtime layout has the configured shader windows");
     assert!(u.is_sparse_window(0) && u.is_sparse_window(1) && u.is_sparse_window(2), "windows 0..2 sparse VRAM");
     assert!(u.is_committed_window(3), "window 3 coherent committed RAM");
     let windows = crate::hle::d3d12x::real::uma_window_vas();
-    assert_eq!(windows.len(), 4);
-    assert!(windows.iter().all(|&va| va != 0), "all 4 window GPU VAs must be valid: {windows:x?}");
+    assert_eq!(windows.len(), u.shader_windows());
+    assert!(windows.iter().enumerate().all(|(k, &va)| (va != 0) == (u.window(k).1 > 0)), "every window with memory has a GPU VA, the others none: {windows:x?}");
+    assert!(windows[..4].iter().all(|&va| va != 0), "the 4 root-UAV windows' GPU VAs must be valid: {windows:x?}");
 
     // 1. Console descriptor heap in Window 0 sparse VRAM (32-bit hi = 0 table addressing)
     let heap_obj = 0xDEAD_5EA7usize;
@@ -4142,7 +4145,8 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
             list.SetComputeRootSignature(&rs);
             list.SetComputeRootUnorderedAccessView(0, crate::hle::d3d12x::real::uma_va_of(io_buf).unwrap());
             list.SetComputeRootUnorderedAccessView(1, crate::hle::d3d12x::real::uma_va_of(res_buf).unwrap());
-            for (k, &va) in windows.iter().enumerate() {
+            // (the root signature has 4 window UAVs, u2..u5, whatever the layout)
+            for (k, &va) in windows.iter().take(crate::gpu::uma::MAX_WINDOWS).enumerate() {
                 list.SetComputeRootUnorderedAccessView(2 + k as u32, va);
             }
             list.Dispatch(1, 1, 1);

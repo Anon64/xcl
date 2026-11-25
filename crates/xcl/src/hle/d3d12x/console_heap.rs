@@ -210,8 +210,10 @@ pub fn window_views_failed() -> bool {
 
 /// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
 /// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
-/// Active windows (`bytes > 0`) in wider layouts (8 / 16) must all have a valid buffer; unused
-/// trailing slots (`(0, 0)`) safely alias window 0's buffer.
+/// Active windows (`bytes > 0`) in wider layouts (8 / 16) must all have a valid buffer; a slot
+/// without one (`(0, 0)`: a window with no memory) gets a null raw UAV – shaders read 0 there and
+/// their stores go nowhere. (It once aliased window 0: what was at such an address read window
+/// 0's bytes, and GPU writes there overwrote its descriptor heaps.)
 pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -> bool {
     let count = windows.len().max(crate::gpu::uma::MAX_WINDOWS);
     let complete = count <= crate::gpu::uma::MAX_WINDOWS || windows.iter().all(|&(raw, bytes)| raw != 0 || bytes == 0);
@@ -223,11 +225,18 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
         };
         // The device may be adopted: its UAV hook re-enters descriptor bookkeeping.
         for k in 0..count {
-            let (raw, bytes) = windows.get(k).copied().filter(|w| w.0 != 0).unwrap_or(windows[0]);
+            let (raw, bytes) = windows.get(k).copied().unwrap_or((0, 0));
             let raw = raw as *mut std::ffi::c_void;
-            let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
             let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + (crate::gpu::recomp::MEM_HEAP_BASE as u64 + k as u64) * inc as u64) as usize };
-            device.CreateUnorderedAccessView(r, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(bytes as u64)), at);
+            match ID3D12Resource::from_raw_borrowed(&raw) {
+                Some(r) => device.CreateUnorderedAccessView(r, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(bytes as u64)), at),
+                None => device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&crate::gpu::recomp::runner::raw_window_uav(crate::gpu::uma::MAX_SIZE as u64)),
+                    at,
+                ),
+            }
         }
         true
     };
@@ -633,13 +642,19 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static UNLOCKED: AtomicBool = AtomicBool::new(true);
         static CALLS: AtomicU32 = AtomicU32::new(0);
+        // slot k (bit k) got a null resource
+        static NULLS: AtomicU32 = AtomicU32::new(0);
         #[repr(C)]
         struct Object { vt: *const usize }
         unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
-        unsafe extern "system" fn create_uav(_this: *mut c_void, _resource: *mut c_void, _counter: *mut c_void, _desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, _at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        unsafe extern "system" fn create_uav(_this: *mut c_void, resource: *mut c_void, _counter: *mut c_void, _desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             // The adopted device hook can re-enter descriptor bookkeeping.
             UNLOCKED.fetch_and(GLOBAL.try_lock().is_ok(), Ordering::Relaxed);
             CALLS.fetch_add(1, Ordering::Relaxed);
+            if resource.is_null() {
+                let k = (at.ptr - 0x1000) / 32 - crate::gpu::recomp::MEM_HEAP_BASE as usize;
+                NULLS.fetch_or(1 << k, Ordering::Relaxed);
+            }
         }
         let mut vt = [0usize; 20];
         vt[1] = retain as usize;
@@ -657,16 +672,21 @@ mod tests {
                 next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(),
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
+            // the root-UAV slots past the windows there are: null views, not window 0 again
             assert!(set_window_views(&dev, &[window]));
             assert_eq!(CALLS.swap(0, Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32);
+            assert_eq!(NULLS.swap(0, Ordering::Relaxed), 0b1110);
             let mut windows = [window; crate::gpu::uma::MAX_HEAP_WINDOWS];
             assert!(set_window_views(&dev, &windows));
             assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32);
-            // Unused trailing window `(0, 0)` safely aliases window 0; an active window that failed
-            // to open `(0, bytes > 0)` is rejected.
+            assert_eq!(NULLS.swap(0, Ordering::Relaxed), 0);
+            // A window without memory `(0, 0)` (16 windows: the ones after the views) gets a null
+            // view; an active window that failed to open `(0, bytes > 0)` is rejected.
             windows[7] = (0, 0);
+            windows[15] = (0, 0);
             assert!(set_window_views(&dev, &windows));
             assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32);
+            assert_eq!(NULLS.swap(0, Ordering::Relaxed), 1 << 7 | 1 << 15);
             windows[7] = (0, 0x10000);
             assert!(!set_window_views(&dev, &windows));
             assert_eq!(CALLS.load(Ordering::Relaxed), 0);

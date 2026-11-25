@@ -1352,6 +1352,7 @@ fn note_dirty_regions(u: &crate::gpu::uma::Uma) {
                     let w = u.window_of(a);
                     let kind = match w {
                         Some(k) if u.is_committed_window(k) => "committed",
+                        Some(k) if u.is_view_window(k) => "GPU view",
                         Some(_) => "sparse",
                         None => "outside",
                     };

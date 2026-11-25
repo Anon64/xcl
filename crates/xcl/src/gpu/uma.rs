@@ -7,7 +7,8 @@
 //! The aperture has 4 windows by default and can grow to 8 or 16 with heap-backed shaders
 //! (`XCL_HEAP_WINDOWS=1` + `XCL_UMA_WINDOWS=8|16`). The base is aligned to the aperture size,
 //! so shaders compute the window index from `(address >> 32) - (base >> 32)` and the byte
-//! offset from the low 32 bits. Allocations never straddle windows.
+//! offset from the low 32 bits. Allocations never straddle windows. With 16 windows, 6 of them
+//! hold GPU views of the title's CPU memory (`Uma::view_reserve`), memory only the GPU reaches.
 //!
 //! Measured on Windows 11 + RX 9070 (2026-11-20): the heap must cover a fully committed
 //! `VirtualAlloc` allocation (a reservation with partial commit is rejected); up to
@@ -17,7 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
 
 /// VirtualAlloc: track CPU writes (GetWriteWatch)
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
@@ -39,11 +40,23 @@ pub const MAX_HEAP_WINDOWS: usize = 16;
 /// sparse pool bloat), while still giving expanded 8/16-window layouts extra coherent windows.
 const MAX_RUNTIME_SPARSE_WINDOWS: usize = 3;
 
+/// View windows of the 16-window layout (`WindowKind::View`, 24 GiB): GPU views of the title's
+/// CPU memory go there (`Uma::view_reserve`). A retail title reserves 24 GiB of 64 KiB pages as
+/// a CPU view and the same again as a GPU-only view of it, and gives the GPU only addresses of
+/// the second; outside the windows every shader read of it is 0.
+pub const VIEW_WINDOWS: usize = 6;
+
+/// View windows of a runtime layout of `windows` windows (none below 16: no room for them).
+fn view_windows(windows: usize) -> usize {
+    if windows == MAX_HEAP_WINDOWS { VIEW_WINDOWS } else { 0 }
+}
+
 /// Maximum number of committed coherent windows in an expanded runtime layout.
-/// Always leaves 3 sparse VRAM windows (12 GiB): 1 coherent for 4-window, 5 for 8-window, 13 for 16-window.
+/// Always leaves 3 sparse VRAM windows (12 GiB) and the view windows: 1 coherent for 4-window,
+/// 5 for 8-window, 7 for 16-window.
 fn max_coherent_windows(windows: usize) -> usize {
     if windows > MAX_WINDOWS {
-        windows.saturating_sub(MAX_RUNTIME_SPARSE_WINDOWS).max(1)
+        windows.saturating_sub(MAX_RUNTIME_SPARSE_WINDOWS + view_windows(windows)).max(1)
     } else {
         1
     }
@@ -103,6 +116,10 @@ enum WindowKind {
     None,
     Committed(usize),
     Sparse,
+    /// GPU views of the title's CPU memory (`view_reserve`): reserved PAGE_NOACCESS, never
+    /// committed nor write-watched – the CPU never touches them. The GPU reaches them through
+    /// the window's tiled buffer (`d3d12x::sparse`), whose tiles get video memory on demand.
+    View,
 }
 
 pub struct Uma {
@@ -113,6 +130,8 @@ pub struct Uma {
     inner: Mutex<Inner>,
     /// free ranges of the sparse windows (address → length) and the reservations in them
     sparse_free: Mutex<(BTreeMap<usize, usize>, BTreeMap<usize, usize>)>,
+    /// the same for the view windows (`view_reserve`)
+    views: Mutex<(BTreeMap<usize, usize>, BTreeMap<usize, usize>)>,
     /// the committed windows are not the GPU's memory: it has copies of them (`set_shadowed`)
     shadowed: AtomicBool,
     /// XCL's own pool in window 0 for `Arena` blocks: (start, end, free blocks). The title
@@ -179,6 +198,43 @@ fn take_sparse_in(
     }
     g.1.insert(at, size);
     Some(at)
+}
+
+/// The reservation of `take_sparse_in` at `p` goes back to the free ranges (merged with its
+/// neighbours): its bytes.
+fn give_back(g: &mut (BTreeMap<usize, usize>, BTreeMap<usize, usize>), p: usize) -> Option<usize> {
+    let size = g.1.remove(&p)?;
+    let (mut start, mut len) = (p, size);
+    if let Some((&o, &l)) = g.0.range(..p).next_back() {
+        if o + l == p {
+            g.0.remove(&o);
+            start = o;
+            len += l;
+        }
+    }
+    if let Some(l) = g.0.remove(&(p + size)) {
+        len += l;
+    }
+    g.0.insert(start, len);
+    Some(size)
+}
+
+/// The reservation of `take_sparse_in` holding `p`: (start, bytes).
+fn reservation_at(g: &(BTreeMap<usize, usize>, BTreeMap<usize, usize>), p: usize) -> Option<(usize, usize)> {
+    g.1.range(..=p).next_back().map(|(&a, &l)| (a, l)).filter(|&(a, l)| p < a + l)
+}
+
+/// `VirtualAlloc` of `len` bytes exactly at `at` (false: Windows has something there, or put
+/// it elsewhere – then nothing stays reserved).
+fn reserve_exactly(at: usize, len: usize, flags: u32, protect: u32) -> bool {
+    let p = unsafe { VirtualAlloc(at as *const std::ffi::c_void, len, flags, protect) };
+    if p as usize != at {
+        if !p.is_null() {
+            unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+        }
+        return false;
+    }
+    true
 }
 
 impl Uma {
@@ -260,42 +316,65 @@ impl Uma {
         Self::reserve_runtime(size, coherent, MAX_WINDOWS).or_else(|| Self::new(size))
     }
 
-    /// `for_runtime_with` using `windows` total shader-visible windows: `windows - coh_wins`
-    /// sparse VRAM windows followed by `coh_wins` committed coherent windows sized to hold
-    /// `coherent` bytes (up to `max_coherent_windows(windows)`).
+    /// `for_runtime_with` using `windows` total shader-visible windows: up to 3 sparse VRAM
+    /// windows followed by `coh_wins` committed coherent windows sized to hold `coherent` bytes
+    /// (up to `max_coherent_windows(windows)`), then, with 16, `VIEW_WINDOWS` view windows.
     pub fn for_runtime_windows(size: usize, coherent: usize, windows: usize) -> Option<Uma> {
         let windows = if matches!(windows, MAX_WINDOWS | 8 | MAX_HEAP_WINDOWS) { windows } else { MAX_WINDOWS };
         Self::reserve_runtime(size, coherent, windows)
     }
 
+    /// The layout: sparse windows (at most `MAX_RUNTIME_SPARSE_WINDOWS`), then the coherent
+    /// windows, then (16 windows only) the view windows. With view windows the whole aperture
+    /// is reserved – the coherent windows' uncommitted tails and the windows after the views
+    /// too, PAGE_NOACCESS – so Windows never places anything at an address shaders read as a
+    /// window (it read the memory of whatever was there, or of window 0).
     fn reserve_runtime(size: usize, coherent: usize, windows: usize) -> Option<Uma> {
         let coh_sizes = coherent_window_sizes(size, coherent, windows);
         let coh_wins = coh_sizes.len();
         let sparse_wins = (windows - coh_wins).min(MAX_RUNTIME_SPARSE_WINDOWS);
         let sparse_len = sparse_wins * WINDOW;
+        let view_wins = view_windows(windows);
+        let views_at = sparse_wins + coh_wins;
+        let whole = view_wins > 0;
+        if views_at + view_wins > windows {
+            return None;
+        }
         for slot in (windows..slot_limit(windows)).step_by(windows) {
             let base = slot << 32;
-            let sp = unsafe { VirtualAlloc(base as *const std::ffi::c_void, sparse_len, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) };
-            if sp as usize != base {
-                if !sp.is_null() {
-                    unsafe { VirtualFree(sp, 0, MEM_RELEASE) };
-                }
+            if !reserve_exactly(base, sparse_len, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) {
                 continue;
             }
-            let mut win_allocs = Vec::with_capacity(1 + coh_wins);
+            let mut win_allocs = Vec::with_capacity(4 + 2 * coh_wins);
             win_allocs.push(base);
             let mut ok = true;
             for (c, &c_size) in coh_sizes.iter().enumerate() {
                 let c_base = base + (sparse_wins + c) * WINDOW;
-                let cp = unsafe { VirtualAlloc(c_base as *const std::ffi::c_void, c_size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
-                if cp as usize != c_base {
-                    if !cp.is_null() {
-                        unsafe { VirtualFree(cp, 0, MEM_RELEASE) };
-                    }
+                if !reserve_exactly(c_base, c_size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) {
                     ok = false;
                     break;
                 }
                 win_allocs.push(c_base);
+                if whole && c_size < WINDOW {
+                    if !reserve_exactly(c_base + c_size, WINDOW - c_size, MEM_RESERVE, PAGE_NOACCESS) {
+                        ok = false;
+                        break;
+                    }
+                    win_allocs.push(c_base + c_size);
+                }
+            }
+            if ok && whole {
+                // the view windows, then the rest of the aperture: one reservation each
+                for (lo, hi) in [(views_at, views_at + view_wins), (views_at + view_wins, windows)] {
+                    if lo == hi {
+                        continue;
+                    }
+                    if !reserve_exactly(base + lo * WINDOW, (hi - lo) * WINDOW, MEM_RESERVE, PAGE_NOACCESS) {
+                        ok = false;
+                        break;
+                    }
+                    win_allocs.push(base + lo * WINDOW);
+                }
             }
             if !ok {
                 for p in win_allocs {
@@ -311,14 +390,20 @@ impl Uma {
                 inner.free.insert(k * WINDOW, c_size);
                 kinds[k] = WindowKind::Committed(c_size);
             }
+            kinds[views_at..views_at + view_wins].fill(WindowKind::View);
             let mut sparse_free: (BTreeMap<usize, usize>, BTreeMap<usize, usize>) = Default::default();
             sparse_free.0.insert(base, sparse_len);
+            let mut views: (BTreeMap<usize, usize>, BTreeMap<usize, usize>) = Default::default();
+            if view_wins > 0 {
+                views.0.insert(base + views_at * WINDOW, view_wins * WINDOW);
+            }
             let u = Uma {
                 base,
                 kinds,
                 win_allocs,
                 inner: Mutex::new(inner),
                 sparse_free: Mutex::new(sparse_free),
+                views: Mutex::new(views),
                 shadowed: AtomicBool::new(false),
                 pool: Mutex::new((0, 0, Vec::new())),
             };
@@ -361,6 +446,13 @@ impl Uma {
         self.desc_range().map_or(self.base, |(_, end)| end)
     }
 
+    /// The end of the last sparse window: reservations and allocations in the sparse windows
+    /// stay below it, never in the view windows (a CPU view of 24 GiB there would be tiled
+    /// video memory again).
+    fn sparse_end(&self) -> usize {
+        self.base + self.kinds.iter().rposition(|w| matches!(w, WindowKind::Sparse)).map_or(0, |k| k + 1) * WINDOW
+    }
+
     /// Whether window `k` is a sparse VRAM window.
     pub fn is_sparse_window(&self, k: usize) -> bool {
         self.kinds.get(k).is_some_and(|w| matches!(w, WindowKind::Sparse))
@@ -369,6 +461,37 @@ impl Uma {
     /// Whether window `k` is a committed coherent window.
     pub fn is_committed_window(&self, k: usize) -> bool {
         self.kinds.get(k).is_some_and(|w| matches!(w, WindowKind::Committed(_)))
+    }
+
+    /// Whether window `k` is a view window (GPU views of the title's CPU memory, `view_reserve`).
+    pub fn is_view_window(&self, k: usize) -> bool {
+        self.kinds.get(k).is_some_and(|w| matches!(w, WindowKind::View))
+    }
+
+    /// Whether `p` is in a view window, reserved for a GPU view or not. Not memory the CPU can
+    /// touch: `contains`, `is_sparse` and `is_committed` are false there.
+    pub fn is_view(&self, p: usize) -> bool {
+        self.window_of(p).is_some_and(|k| self.is_view_window(k))
+    }
+
+    /// Address space for a GPU view of `size` bytes in the view windows, starting at a window's
+    /// start (so a view of 24 GiB fits the 6 windows whole). None: no view windows (layouts
+    /// below 16 windows), or no room left.
+    pub fn view_reserve(&self, size: usize) -> Option<usize> {
+        let lo = self.kinds.iter().position(|w| matches!(w, WindowKind::View))?;
+        let hi = self.kinds.iter().rposition(|w| matches!(w, WindowKind::View))? + 1;
+        let size = size.max(1).checked_next_multiple_of(GRAIN)?;
+        take_sparse_in(&mut self.views.lock().unwrap(), self.base + lo * WINDOW, self.base + hi * WINDOW, size, WINDOW, false)
+    }
+
+    /// The bytes of the view reservation starting at `p` (it is gone after this).
+    pub fn view_release(&self, p: usize) -> Option<usize> {
+        give_back(&mut self.views.lock().unwrap(), p)
+    }
+
+    /// The view reservation holding `p`: (start, bytes).
+    pub fn view_reservation(&self, p: usize) -> Option<(usize, usize)> {
+        reservation_at(&self.views.lock().unwrap(), p)
     }
 
     /// Whether this Uma has any sparse VRAM windows.
@@ -430,7 +553,7 @@ impl Uma {
         }
         let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
         let mut g = self.sparse_free.lock().unwrap();
-        let end = self.base + self.kinds.len() * WINDOW;
+        let end = self.sparse_end();
         let lo = self.title_sparse_start();
         if let Some(at) = take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, false) {
             return Some(at);
@@ -469,7 +592,7 @@ impl Uma {
         let size = size.max(1).checked_next_multiple_of(GRAIN)?;
         let align = align.max(GRAIN).checked_next_power_of_two()?;
         let mut g = self.sparse_free.lock().unwrap();
-        let end = self.base + self.kinds.len() * WINDOW;
+        let end = self.sparse_end();
         let lo = self.title_sparse_start();
         let above_0 = (self.base + WINDOW).max(lo);
         if size <= WINDOW {
@@ -488,27 +611,12 @@ impl Uma {
 
     /// The bytes of the sparse reservation starting at `p` (it is gone after this).
     pub fn sparse_release(&self, p: usize) -> Option<usize> {
-        let mut g = self.sparse_free.lock().unwrap();
-        let size = g.1.remove(&p)?;
-        let (mut start, mut len) = (p, size);
-        if let Some((&o, &l)) = g.0.range(..p).next_back() {
-            if o + l == p {
-                g.0.remove(&o);
-                start = o;
-                len += l;
-            }
-        }
-        if let Some(l) = g.0.remove(&(p + size)) {
-            len += l;
-        }
-        g.0.insert(start, len);
-        Some(size)
+        give_back(&mut self.sparse_free.lock().unwrap(), p)
     }
 
     /// The sparse reservation holding `p`: (start, bytes).
     pub fn sparse_reservation(&self, p: usize) -> Option<(usize, usize)> {
-        let g = self.sparse_free.lock().unwrap();
-        g.1.range(..=p).next_back().map(|(&a, &l)| (a, l)).filter(|&(a, l)| p < a + l)
+        reservation_at(&self.sparse_free.lock().unwrap(), p)
     }
 
     /// Bytes currently reserved/allocated in sparse windows.
@@ -548,6 +656,7 @@ impl Uma {
                     win_allocs,
                     inner: Mutex::new(inner),
                     sparse_free: Mutex::new(Default::default()),
+                    views: Mutex::new(Default::default()),
                     shadowed: AtomicBool::new(false),
                     pool: Mutex::new((0, 0, Vec::new())),
                 });
@@ -579,11 +688,11 @@ impl Uma {
         self.kinds.iter().filter(|w| matches!(w, WindowKind::Committed(_))).count()
     }
 
-    /// (address, bytes) of window `k` (a sparse window: all 4 GiB)
+    /// (address, bytes) of window `k` (a sparse or view window: all 4 GiB)
     pub fn window(&self, k: usize) -> (usize, usize) {
         let len = match self.kinds.get(k).copied().unwrap_or(WindowKind::None) {
             WindowKind::Committed(s) => s,
-            WindowKind::Sparse => WINDOW,
+            WindowKind::Sparse | WindowKind::View => WINDOW,
             WindowKind::None => 0,
         };
         (self.base + k * WINDOW, len)
@@ -591,13 +700,13 @@ impl Uma {
 
     /// Underlying write-watched `VirtualAlloc` regions `(base, size)` for `GetWriteWatch`:
     /// contiguous sparse windows belong to a single reservation, while each committed window
-    /// is its own allocation.
+    /// is its own allocation (view windows are not write-watched: the CPU never writes there).
     pub fn watch_regions(&self) -> Vec<(usize, usize)> {
         let mut out: Vec<(usize, usize)> = Vec::with_capacity(self.kinds.len());
         let mut k = 0;
         while k < self.kinds.len() {
             match self.kinds[k] {
-                WindowKind::None => k += 1,
+                WindowKind::None | WindowKind::View => k += 1,
                 WindowKind::Committed(s) => {
                     out.push((self.base + k * WINDOW, s));
                     k += 1;
@@ -622,18 +731,23 @@ impl Uma {
         (k < self.kinds.len() && len > 0 && p - start < len).then_some(k)
     }
 
+    /// Whether `p` is unified memory the CPU can address (a committed or sparse window; never
+    /// a view window, which only the GPU reaches).
     pub fn contains(&self, p: usize) -> bool {
-        self.window_of(p).is_some()
+        self.window_of(p).is_some_and(|k| !self.is_view_window(k))
     }
 
     /// Whether `p` is memory the title has here: a block handed out in a committed window, or
-    /// one of its reservations in a sparse window. The windows' ranges are wide (4 GiB each) and
-    /// a PC resource's GPU address can fall in one by number – that address is not the
-    /// window's memory (Minecraft's dynamic vertex buffer, a PC upload buffer, was read from an
-    /// empty sparse window: nothing drew).
+    /// one of its reservations in a sparse or view window. The windows' ranges are wide (4 GiB
+    /// each) and a PC resource's GPU address can fall in one by number – that address is not
+    /// the window's memory (a title's dynamic vertex buffer, a PC upload buffer, was read from
+    /// an empty sparse window: nothing drew).
     pub fn is_title_address(&self, p: usize) -> bool {
         if self.is_sparse(p) {
             return self.sparse_reservation(p).is_some();
+        }
+        if self.is_view(p) {
+            return self.view_reservation(p).is_some();
         }
         if !self.is_committed(p) {
             return false;
@@ -893,7 +1007,15 @@ pub fn get() -> Option<&'static Uma> {
             let coherent = coherent_hint_for(req);
             let u = if req > MAX_WINDOWS {
                 Uma::for_runtime_windows((mb << 20).max(coherent), coherent, req).or_else(|| {
-                    crate::xlog_warn!("UMA: could not reserve {req} aligned windows below 1 TiB – falling back to {MAX_WINDOWS}");
+                    crate::xlog_error!(
+                        "UMA: XCL_UMA_WINDOWS={req} asked for, but {req} aligned windows ({} GiB) could not be reserved below 1 TiB – falling back to {MAX_WINDOWS}: {}",
+                        req * 4,
+                        if view_windows(req) > 0 {
+                            "GPU views of the title's memory stay outside the windows and shaders read 0 there (an empty 3D world)"
+                        } else {
+                            "the extra windows are not there"
+                        }
+                    );
                     let fallback = coherent_hint_for(MAX_WINDOWS);
                     Uma::for_runtime_with((mb << 20).max(fallback), fallback)
                 })
@@ -904,12 +1026,14 @@ pub fn get() -> Option<&'static Uma> {
                 Some(u) => {
                     let sparse_n = (0..u.shader_windows()).filter(|&k| u.is_sparse_window(k)).count();
                     let coh_n = u.windows();
+                    let view_n = (0..u.shader_windows()).filter(|&k| u.is_view_window(k)).count();
                     crate::xlog_info!(
-                        "UMA: {} sparse VRAM window(s) ({} GiB VA) + {} coherent window(s) ({} MB) at {:#x}",
+                        "UMA: {} sparse VRAM window(s) ({} GiB VA) + {} coherent window(s) ({} MB) + {} view window(s) for GPU views at {:#x}",
                         sparse_n,
                         sparse_n * 4,
                         coh_n,
                         u.size() >> 20,
+                        view_n,
                         u.base()
                     );
                 }
@@ -1143,6 +1267,14 @@ mod tests {
         assert_eq!(u.watch_regions(), vec![(u.base(), 3 * WINDOW), (u.base() + 3 * WINDOW, 16 << 20)]);
     }
 
+    /// Whether Windows has nothing at `p` (MEM_FREE: it may place an allocation there).
+    fn free_at(p: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_FREE};
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(p as *const std::ffi::c_void, &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        n != 0 && m.State == MEM_FREE
+    }
+
     #[test]
     fn runtime_layout_supports_eight_and_sixteen_heap_windows() {
         for windows in [8usize, MAX_HEAP_WINDOWS] {
@@ -1157,8 +1289,12 @@ mod tests {
                 assert!(u.is_sparse_window(k), "window {k} should be sparse");
             }
             assert_eq!(u.committed_window(), Some(MAX_RUNTIME_SPARSE_WINDOWS));
+            // 8 windows: the trailing windows stay unreserved; 16: views right after the coherent
+            // window, the rest kept empty (and reserved: `sixteen_windows_reserve_the_whole_aperture`)
+            let views = MAX_RUNTIME_SPARSE_WINDOWS + 1..MAX_RUNTIME_SPARSE_WINDOWS + 1 + view_windows(windows);
             for k in (MAX_RUNTIME_SPARSE_WINDOWS + 1)..windows {
-                assert!(!u.is_sparse_window(k) && !u.is_committed_window(k), "unused trailing window {k} stays unreserved");
+                assert!(!u.is_sparse_window(k) && !u.is_committed_window(k), "window {k} holds no CPU memory");
+                assert_eq!(u.is_view_window(k), views.contains(&k), "window {k}: a view window in 16 only");
             }
             let c = u.alloc(0x2_0000, 0).unwrap() as usize;
             assert_eq!(u.window_of(c), Some(MAX_RUNTIME_SPARSE_WINDOWS));
@@ -1181,6 +1317,64 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// With 16 windows nothing of Windows' lands in the aperture: shaders read every window of
+    /// it, and a window without memory of its own once read whatever Windows had put there.
+    #[test]
+    fn sixteen_windows_reserve_the_whole_aperture() {
+        let u = Uma::for_runtime_windows(16 << 20, RUNTIME_COMMITTED_CAP, MAX_HEAP_WINDOWS).expect("16-window aperture");
+        let base = u.base();
+        let coh = u.committed_window().unwrap();
+        let (c, c_len) = u.window(coh);
+        // each window's start and end, the coherent window's uncommitted tail
+        let mut probes: Vec<usize> = (0..MAX_HEAP_WINDOWS).flat_map(|k| [base + k * WINDOW, base + (k + 1) * WINDOW - 1]).collect();
+        probes.push(c + c_len);
+        for &p in &probes {
+            assert!(!free_at(p), "{:#x} (window {}) is free: Windows may place memory there", p, (p - base) / WINDOW);
+        }
+        // the view windows and the empty ones are no CPU memory and nobody's write-watched region
+        for k in coh + 1..MAX_HEAP_WINDOWS {
+            let p = base + k * WINDOW + 0x1234;
+            assert!(!u.contains(p) && !u.is_sparse(p) && !u.is_committed(p) && !u.is_gpu_copy(p) && !u.is_title_address(p), "window {k}");
+            assert!(!u.is_sparse_window(k) && !u.is_committed_window(k));
+            assert_eq!(u.window_of(p).is_some(), u.is_view_window(k), "window {k}: only view windows are windows of their own");
+        }
+        assert!(u.watch_regions().iter().all(|&(a, n)| a + n <= c + c_len), "{:x?}", u.watch_regions());
+    }
+
+    /// GPU views go to the view windows, window-aligned: one of 24 GiB fills them, and its
+    /// release gives the range back whole. The CPU view never goes there.
+    #[test]
+    fn view_windows_hold_gpu_views() {
+        let u = Uma::for_runtime_windows(16 << 20, RUNTIME_COMMITTED_CAP, MAX_HEAP_WINDOWS).expect("16-window aperture");
+        let first = (0..MAX_HEAP_WINDOWS).find(|&k| u.is_view_window(k)).expect("view windows");
+        assert_eq!((first..MAX_HEAP_WINDOWS).filter(|&k| u.is_view_window(k)).count(), VIEW_WINDOWS);
+        let g = u.view_reserve(VIEW_WINDOWS * WINDOW).expect("24 GiB in the view windows");
+        assert_eq!(g, u.base() + first * WINDOW);
+        assert!(u.view_reserve(GRAIN).is_none(), "the views are full");
+        for x in [0, 0x1234, 5 * WINDOW + 0x10_0000, VIEW_WINDOWS * WINDOW - 1] {
+            assert!(u.is_view(g + x) && u.is_title_address(g + x), "{x:#x}");
+            assert_eq!(u.window_of(g + x), Some(first + x / WINDOW));
+            assert!(!u.contains(g + x) && !u.is_sparse(g + x), "{x:#x}: the CPU cannot touch a GPU view");
+            assert_eq!(u.view_reservation(g + x), Some((g, VIEW_WINDOWS * WINDOW)));
+        }
+        // a CPU view of the same size does not fit the sparse windows and never takes the views
+        assert!(u.sparse_reserve(VIEW_WINDOWS * WINDOW).is_none());
+        assert!(u.sparse_alloc(2 * WINDOW, GRAIN).is_some_and(|(a, n)| a + n <= u.base() + MAX_RUNTIME_SPARSE_WINDOWS * WINDOW));
+        assert_eq!(u.view_release(g), Some(VIEW_WINDOWS * WINDOW));
+        assert_eq!(u.view_release(g), None);
+        assert!(!u.is_title_address(g) && u.is_view(g));
+        // smaller views start at a window each, and their room comes back merged
+        let a = u.view_reserve(GRAIN).unwrap();
+        let b = u.view_reserve(WINDOW + GRAIN).unwrap();
+        assert_eq!((a, b), (g, g + WINDOW));
+        assert_eq!(u.view_release(a), Some(GRAIN));
+        assert_eq!(u.view_release(b), Some(WINDOW + GRAIN));
+        assert_eq!(u.view_reserve(VIEW_WINDOWS * WINDOW), Some(g));
+        // no view windows below 16
+        let four = Uma::for_runtime(16 << 20).unwrap();
+        assert!(four.view_reserve(GRAIN).is_none() && (0..MAX_WINDOWS).all(|k| !four.is_view_window(k)));
     }
 
     #[test]
@@ -1206,8 +1400,9 @@ mod tests {
     fn expanded_runtime_layout_splits_large_coherent_heaps_across_multiple_windows() {
         // Legacy 4-window layout stays capped at 1 coherent window (4095 MiB).
         assert_eq!(coherent_window_sizes(6 << 30, 6 << 30, MAX_WINDOWS), vec![MAX_SIZE]);
-        // 8- and 16-window layouts split >4 GiB coherent heaps across up to 5 / 13 committed windows
-        // with exact remainder sizing while keeping sparse windows capped at 3 (12 GiB).
+        // 8- and 16-window layouts split >4 GiB coherent heaps across up to 5 / 7 committed windows
+        // with exact remainder sizing while keeping sparse windows capped at 3 (12 GiB) and, with
+        // 16, the 6 view windows free.
         let want = MAX_SIZE + (512 << 20);
         for w in [8usize, MAX_HEAP_WINDOWS] {
             assert_eq!(coherent_window_sizes(want, want, w), vec![MAX_SIZE, 512 << 20]);
@@ -1215,9 +1410,13 @@ mod tests {
         }
         assert_eq!(coherent_window_sizes(20 << 30, 20 << 30, 8).len(), 5);
         assert_eq!(coherent_window_sizes(20 << 30, 20 << 30, MAX_HEAP_WINDOWS).len(), 6);
+        // a coherent need past 7 windows (`uma_coherent.txt` only grows) stops at 7: windows
+        // 10..15 stay the views'
+        assert_eq!(coherent_window_sizes(40 << 30, 40 << 30, MAX_HEAP_WINDOWS), vec![MAX_SIZE; 7]);
         assert_eq!(max_coherent_windows(MAX_WINDOWS), 1);
         assert_eq!(max_coherent_windows(8), 5);
-        assert_eq!(max_coherent_windows(MAX_HEAP_WINDOWS), 13);
+        assert_eq!(max_coherent_windows(MAX_HEAP_WINDOWS), MAX_HEAP_WINDOWS - MAX_RUNTIME_SPARSE_WINDOWS - VIEW_WINDOWS);
+        assert_eq!(max_coherent_bytes(MAX_HEAP_WINDOWS), 7 * MAX_SIZE);
         // Multi-window Uma::alloc seamlessly spills into the 2nd committed window.
         let u = Uma::with_windows(2, 8 << 20).unwrap();
         let a = u.alloc(6 << 20, GRAIN).unwrap() as usize;
