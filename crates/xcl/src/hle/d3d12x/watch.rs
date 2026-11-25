@@ -354,7 +354,8 @@ fn watch_step(s: Stall, now: u64, longest: Option<(u64, u32, u32)>, limit: u64) 
 
 /// the watch thread runs (`XCL_GPU_WATCH` is not 0)
 static WATCHING: AtomicBool = AtomicBool::new(false);
-/// one more after each of the watch thread's polls of the device
+/// the watch thread's heartbeat: when its last poll of the device returned (`now_ms`; when it
+/// was started, before the first)
 static BEAT: AtomicU64 = AtomicU64::new(0);
 
 /// The watching thread and the stop file's, once the device is made.
@@ -367,14 +368,15 @@ pub(super) fn start() {
     if std::env::var("XCL_GPU_WATCH").is_ok_and(|v| v.trim() == "0") {
         return;
     }
+    BEAT.store(now_ms(), Ordering::Relaxed);
     let watch = std::thread::Builder::new().name("xcl-gpu-watch".into()).spawn(move || {
         let limit = stall_ms();
         let mut stall = Stall::default();
         loop {
             std::thread::sleep(Duration::from_millis(100));
             super::real::stop_if_device_removed();
-            BEAT.fetch_add(1, Ordering::Relaxed);
             let now = now_ms();
+            BEAT.store(now, Ordering::Relaxed);
             let (next, say) = watch_step(stall, now, longest_call(now), limit);
             stall = next;
             match say {
@@ -456,18 +458,15 @@ fn stop_asked(fault: bool) -> ! {
         // mappings and pipeline creation go on. The hold stays into `end_title`, whose drain
         // signals and submits no list.
         HOLD.store(true, Ordering::Release);
-        let (mut beat, mut moved) = (BEAT.load(Ordering::Relaxed), Instant::now());
         for _ in 0..120 {
             std::thread::sleep(Duration::from_millis(100));
-            let b = BEAT.load(Ordering::Relaxed);
-            if b != beat {
-                (beat, moved) = (b, Instant::now());
-            }
         }
+        // (since the last poll that returned, which may be before the stop was asked)
+        let quiet = now_ms().saturating_sub(BEAT.load(Ordering::Relaxed));
         let check = if !WATCHING.load(Ordering::Acquire) {
             " – no check of the device runs (XCL_GPU_WATCH=0)".to_string()
-        } else if moved.elapsed() > Duration::from_secs(1) {
-            format!(" – the check of the device has itself not returned ({} ms since the last one)", moved.elapsed().as_millis())
+        } else if quiet > 1000 {
+            format!(" – the check of the device has itself not returned ({quiet} ms since the last one)")
         } else {
             String::new()
         };
