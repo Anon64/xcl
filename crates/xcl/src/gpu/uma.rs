@@ -831,6 +831,20 @@ impl Uma {
         Some(p)
     }
 
+    /// The bytes of the block from `alloc` at `p` (None: not one of ours).
+    pub fn block_len(&self, p: usize) -> Option<usize> {
+        if !self.is_committed(p) {
+            return None;
+        }
+        {
+            let g = self.pool.lock().unwrap();
+            if p >= g.0 && p < g.1 {
+                return Some(ARENA_BLOCK);
+            }
+        }
+        self.inner.lock().unwrap().used.get(&(p - self.base)).copied()
+    }
+
     /// Release a block from `alloc` (false: not one of ours).
     pub fn free(&self, p: usize) -> bool {
         if !self.is_committed(p) {

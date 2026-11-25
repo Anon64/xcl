@@ -1194,15 +1194,17 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             }
         }
         if release {
-            // unpaired before the address can be handed out again
+            // unpaired before the address can be handed out again; and the pages kept here show
+            // nothing from now on, before then too (a submit would link a tile over it)
             mirrors::released(a);
-            u.sparse_release(a);
             forget_title_mappings(a, n);
-            // (tiles may show pages kept here; the pages kept here show nothing from now on)
+            let gone = mirrors::place_gone(a, n);
+            u.sparse_release(a);
+            // (tiles may show pages kept here)
             if mirrors::any_mapped() {
                 crate::hle::d3d12x::sparse::forget_mirrors(a, n);
-                crate::hle::d3d12x::sparse::remapped(&mirrors::place_gone(a, n));
             }
+            crate::hle::d3d12x::sparse::remapped(&gone);
         }
         return 1;
     }
@@ -1228,10 +1230,17 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     }
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.contains(addr as usize)) {
         if t & 0x8000 != 0 {
-            // (the block stays committed in its window: nothing goes in Windows, the tiles do)
-            source_going(addr as usize, 0, true, || ());
-            mirrors::released(addr as usize);
-            return u.free(addr as usize) as BOOL;
+            // (the block stays committed in its window: nothing goes in Windows, the tiles do; the
+            // pages the title mapped here, and the shown pages kept here, go before the block can
+            // be handed out again)
+            let a = addr as usize;
+            let n = u.block_len(a).unwrap_or(0);
+            forget_title_mappings(a, n);
+            let gone = mirrors::place_gone(a, n);
+            source_going(a, n, true, || ());
+            mirrors::released(a);
+            crate::hle::d3d12x::sparse::remapped(&gone);
+            return u.free(a) as BOOL;
         }
         if t & 0x4000 != 0 && size > 0 {
             std::ptr::write_bytes(addr as *mut u8, 0, size);
@@ -1793,7 +1802,16 @@ static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
 /// The title released `[base, base + len)`: the pages it mapped there are mapped there no more.
 fn forget_title_mappings(base: usize, len: usize) {
     if let Some(a) = AWAY.lock().unwrap().as_mut() {
-        a.title.retain(|&at, _| at < base || at >= base.saturating_add(len));
+        let end = base.saturating_add(len);
+        // (a range of fewer pages than there are entries: each of its pages, not every entry)
+        let (first, pages) = (base & !(PHYS_PAGE - 1), len.div_ceil(PHYS_PAGE) + 1);
+        if pages < a.title.len() {
+            for at in (first..end).step_by(PHYS_PAGE).filter(|&at| at >= base) {
+                a.title.remove(&at);
+            }
+        } else {
+            a.title.retain(|&at, _| at < base || at >= end);
+        }
     }
 }
 
@@ -4490,6 +4508,42 @@ mod tests {
                 assert_eq!(VirtualFree(q as *mut c_void, 0, mem::MEM_RELEASE), 1);
             }
             mem::VirtualFree(plain as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// The title's release of a block of unified memory (MEM_GRAPHICS) that holds the place of a
+    /// shown page is told to sparse as the whole block; the page shows nothing from then on and
+    /// the title's mapping there is forgotten – before the block can be handed out again.
+    #[test]
+    fn the_release_of_unified_memory_under_a_shown_page_leaves_it_showing_nothing() {
+        use mirrors::{apply_batches, shows, Shows, PAGE};
+        const SIZE: usize = 227 * PAGE;
+        let g = 0x72E0_0000_0000usize;
+        let null = std::ptr::null_mut();
+        let kept = || KEPT_GOING.with(|s| s.take());
+        unsafe {
+            let Some(u) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no unified memory") };
+            let Some(block) = u.alloc(2 * PAGE, PAGE).map(|p| p as usize) else { return crate::gpu::recomp::runner::skip_test("no room in unified memory") };
+            let mut n = 1usize;
+            let mut pages = [0usize; 1];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
+            let cv = cpu_view(SIZE, g);
+            // the page mapped in the block, at view page 1
+            let mut one = [pages[0]];
+            assert_eq!(MapTitlePhysicalPages((block + PAGE) as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, block + PAGE);
+            let ranges = [[0, 1, 1]];
+            assert!(apply_batches(1, [batch(g + PAGE, &ranges)].as_ptr() as usize, block, 2).is_some());
+            assert_eq!(shows(g + PAGE), Shows::Page { at: block + PAGE, tile: true });
+            kept();
+
+            assert_eq!(VirtualFree(block as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert_eq!(kept(), vec![(block, 2 * PAGE, true)], "the whole block, still committed");
+            assert_eq!(shows(g + PAGE), Shows::Nothing);
+            assert!(AWAY.lock().unwrap().as_ref().is_some_and(|a| !a.title.contains_key(&(block + PAGE))), "the title's mapping there is forgotten");
+
+            // (freed while mapped there: the address keeps its bytes)
+            assert_eq!(FreeTitlePhysicalPages(null, 1, pages.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(cv as *mut c_void, 0, mem::MEM_RELEASE), 1);
         }
     }
 
