@@ -2073,6 +2073,15 @@ fn first_window(window0: Option<u64>, shadowed: bool) -> Result<u64, String> {
     Ok(first)
 }
 
+/// Whether dispatches pass `recomp::dispatch_loop_budget` (`XCL_DISPATCH_LOOP_BUDGET=0`, read
+/// once: they leave `IO_LOOP_BUDGET` at 0 and every loop has the lane's 65 536 passes in both
+/// translators, as before, to compare). Here, not in `recomp`: that module's source is part of
+/// every translation's cache identity, and the switch changes no translated code.
+pub(super) fn dispatch_loop_budget_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DISPATCH_LOOP_BUDGET").map_or(true, |v| v.trim() != "0"))
+}
+
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline. `groups`: the thread groups of a
@@ -2110,7 +2119,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
-    if let Some(groups) = groups.filter(|_| crate::gpu::recomp::dispatch_loop_budget_wanted()) {
+    if let Some(groups) = groups.filter(|_| dispatch_loop_budget_wanted()) {
         io[crate::gpu::recomp::IO_LOOP_BUDGET] = crate::gpu::recomp::dispatch_loop_budget(groups);
     }
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;

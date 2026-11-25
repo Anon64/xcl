@@ -888,7 +888,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         };
                         io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
                         io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
-                        if crate::gpu::recomp::dispatch_loop_budget_wanted() {
+                        if super::bind::dispatch_loop_budget_wanted() {
                             io[crate::gpu::recomp::IO_LOOP_BUDGET] = crate::gpu::recomp::dispatch_loop_budget([x, y, z]);
                         }
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
