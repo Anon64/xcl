@@ -35,9 +35,12 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// a heap of views is bound (`list_x::ensure_view_heap`)
+    heap_bound: bool,
 }
 
-static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
+/// the state of each list's recording
+static STATES: super::sharded::Sharded<State> = super::sharded::Sharded::new();
 
 /// draws / dispatches of console code: with a translated pipeline, skipped, with a PC one
 static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -67,7 +70,7 @@ fn count(k: usize) {
 }
 
 fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
-    f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
+    STATES.with(list as usize, f)
 }
 
 /// The list was created or reset onto the PC allocator `allocator` with `initial_pso`: the
@@ -77,6 +80,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     let (old, blocks) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
+        s.heap_bound = false;
         s.pso = initial_pso;
         s.layout = None;
         s.args.clear();
@@ -92,6 +96,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
 /// with `pso` bound, keeping the current recording's allocator and UMA arena intact.
 pub(super) fn clear_state(list: *mut c_void, pso: usize) {
     with(list, |s| {
+        s.heap_bound = false;
         s.pso = pso;
         s.layout = None;
         s.args.clear();
@@ -111,6 +116,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     let (old, blocks) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
+        s.heap_bound = false;
         s.layout = layout;
         s.args = args;
         s.layout_gfx = layout_gfx;
@@ -122,9 +128,14 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     console_list::hold_until_reset(old, blocks);
 }
 
+/// The title changed what descriptor heaps the list has: they are looked at again.
+pub(super) fn heaps_changed(list: *mut c_void) {
+    with(list, |s| s.heap_bound = false);
+}
+
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
+    if let Some(s) = STATES.remove(list as usize) {
         console_list::hold_until_reset(s.allocator, s.uma);
     }
 }
@@ -149,7 +160,7 @@ pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>,
 
 #[cfg(test)]
 pub(crate) fn remove_state_for_test(list: *mut c_void) {
-    STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+    STATES.remove(list as usize);
 }
 
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
@@ -988,10 +999,11 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
-    super::list_x::ensure_view_heap(this);
+    if !with(this, |s| std::mem::replace(&mut s.heap_bound, true)) {
+        super::list_x::ensure_view_heap(this);
+    }
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
-    let windows = super::real::uma_window_vas();
-    let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
+    let first = super::real::uma_window_va(0).ok_or("unified memory is not open on the GPU")?;
     // shadowed unified memory whose sparse windows could not be made (no reserved resources
     // either): descriptor tables are read from window 0, and a null root descriptor is not bound
     if first == 0 && u.shadowed() {
@@ -1026,7 +1038,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| super::real::uma_window_va(k).unwrap_or(first)));
     if gfx {
         list.SetGraphicsRootSignature(rs);
         for (k, v) in views.enumerate() {
@@ -1056,12 +1068,7 @@ pub(super) fn counts_snapshot() -> [u64; 5] {
 
 #[cfg(test)]
 pub(super) fn tracked_pso(list: *mut c_void) -> usize {
-    STATES
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|m| m.get(&(list as usize)))
-        .map_or(0, |s| s.pso)
+    if STATES.contains(list as usize) { with(list, |s| s.pso) } else { 0 }
 }
 
 #[cfg(test)]

@@ -23,6 +23,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use super::sharded::Sharded;
+
 use serde::Serialize;
 use windows::core::{Interface, PCSTR};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -198,6 +200,25 @@ pub fn uma_window_vas() -> Vec<u64> {
     UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
 }
 
+/// the windows' addresses again, for what asks for every draw and dispatch (0: no such window)
+static UMA_WINDOW_VAS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// how many there are
+static UMA_WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `uma_window_vas()[k]`, without its lock.
+pub(super) fn uma_window_va(k: usize) -> Option<u64> {
+    (k < UMA_WINDOWS.load(Ordering::Acquire)).then(|| UMA_WINDOW_VAS[k].load(Ordering::Relaxed))
+}
+
+fn set_uma_windows(bufs: Vec<(usize, u64)>) {
+    UMA_WINDOWS.store(0, Ordering::Release);
+    for (at, b) in UMA_WINDOW_VAS.iter().zip(&bufs) {
+        at.store(b.1, Ordering::Relaxed);
+    }
+    UMA_WINDOWS.store(bufs.len().min(UMA_WINDOW_VAS.len()), Ordering::Release);
+    *UMA_BUFFER.lock().unwrap() = bufs;
+}
+
 /// The window buffer holding `len` bytes at UMA address `p`, and their offset in it.
 pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
     let u = crate::gpu::uma::get()?;
@@ -213,7 +234,7 @@ pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
 pub fn uma_va_of(p: usize) -> Option<u64> {
     let u = crate::gpu::uma::get()?;
     let k = u.window_of(p)?;
-    Some(*uma_window_vas().get(k)? + (p - u.window(k).0) as u64)
+    Some(uma_window_va(k)? + (p - u.window(k).0) as u64)
 }
 
 /// What the start-up check of the coherent UMA windows found (`check_uma_import`): empty – not
@@ -423,7 +444,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
             crate::xlog_info!("D3D12.X: memory windows from the shared descriptor heap (no per-access switch)");
         }
     }
-    *UMA_BUFFER.lock().unwrap() = bufs;
+    set_uma_windows(bufs);
 }
 
 pub fn stats() -> D3d12Stats {
@@ -1721,10 +1742,10 @@ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
 /// A pipeline state is gone: drop what XCL keeps by its address (a later pipeline may get the
 /// same address and must not inherit its root signature or compute pass).
 /// compute pipelines that run a translated console shader
-static TRANSLATED_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static TRANSLATED_COMPUTE: Sharded<()> = Sharded::new();
 
 /// graphics pipelines built from translated console shaders
-static TRANSLATED_GRAPHICS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static TRANSLATED_GRAPHICS: Sharded<()> = Sharded::new();
 
 /// Whether `pso` is a graphics pipeline of translated console shaders.
 /// `XCL_TRACE_FRAME`: the console VS and PS (their dump names' hashes) of a translated PSO.
@@ -1750,7 +1771,7 @@ pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
 }
 
 pub fn is_translated_graphics(pso: usize) -> bool {
-    pso != 0 && TRANSLATED_GRAPHICS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+    pso != 0 && TRANSLATED_GRAPHICS.contains(pso)
 }
 
 /// graphics pipelines given the generated rect list GS (`rect_list_gs`)
@@ -1773,7 +1794,7 @@ fn note_rect_list_gs(pso: usize, copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect
 
 /// Whether `pso` runs a translated console compute shader.
 pub fn is_translated_compute(pso: usize) -> bool {
-    pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+    pso != 0 && TRANSLATED_COMPUTE.contains(pso)
 }
 
 /// compute pipelines the title made from a console shader that runs untranslated: a background
@@ -1802,7 +1823,7 @@ pub(super) fn register_console_compute_for_test(pso: usize) {
 #[cfg(test)]
 pub(super) fn register_translated_compute_for_test(pso: usize) {
     if pso != 0 {
-        TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        TRANSLATED_COMPUTE.insert(pso, ());
     }
 }
 
@@ -1816,7 +1837,7 @@ pub(super) fn register_rect_list_gs_for_test(pso: usize) {
 #[cfg(test)]
 pub(super) fn register_translated_graphics_for_test(pso: usize) {
     if pso != 0 {
-        TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        TRANSLATED_GRAPHICS.insert(pso, ());
     }
 }
 
@@ -1826,24 +1847,16 @@ pub(super) fn forget_pso_for_test(pso: usize) {
 }
 
 fn forget_pso(pso: usize) {
-    if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
-        s.remove(&pso);
-    }
+    TRANSLATED_COMPUTE.remove(pso);
     if let Some(s) = CONSOLE_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
-    if let Some(s) = TRANSLATED_GRAPHICS.lock().unwrap().as_mut() {
-        s.remove(&pso);
-    }
+    TRANSLATED_GRAPHICS.remove(pso);
     if let Some(s) = RECT_LIST_GS.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
-    if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
-        m.remove(&pso);
-    }
-    if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
-        m.remove(&pso);
-    }
+    PSO_RS.remove(pso);
+    PSO_USER_SGPRS.remove(pso);
     if let Some(m) = PSO_SHADERS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
@@ -3539,28 +3552,28 @@ unsafe fn shader_bytes<'a>(b: &D3D12_SHADER_BYTECODE) -> Option<&'a [u8]> {
 
 /// Root signature of every pipeline built from translated console shaders (static samplers
 /// make it per pipeline): the draw binds it instead of the title's.
-static PSO_RS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+static PSO_RS: Sharded<usize> = Sharded::new();
 
 fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
     if !pso.is_null() {
-        PSO_RS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, rs as usize);
+        PSO_RS.insert(pso as usize, rs as usize);
     }
 }
 
 /// user SGPRs of the console CS of a translated compute pipeline
-static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+static PSO_USER_SGPRS: Sharded<u32> = Sharded::new();
 
 /// How many user SGPRs the console compute shader of a translated pipeline has (None: not
 /// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
 pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
     let pso = super::pso_async::resolve(pso);
-    PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
+    PSO_USER_SGPRS.get(pso)
 }
 
 /// The root signature a translated pipeline state was created with.
 pub fn pso_root_signature(pso: usize) -> Option<usize> {
     let pso = super::pso_async::resolve(pso);
-    PSO_RS.lock().unwrap().as_ref()?.get(&pso).copied()
+    PSO_RS.get(pso)
 }
 
 /// ABI root signatures with static samplers, by sampler set (owned here, never released).
@@ -3987,7 +4000,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+        PSO_USER_SGPRS.insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
     PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (record, 0));
@@ -4381,7 +4394,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
-    TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    TRANSLATED_GRAPHICS.insert(*ppv as usize, ());
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::gpu_profile::on() && !super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
@@ -4714,7 +4727,7 @@ unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID
 
 unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+        TRANSLATED_COMPUTE.insert(*ppv as usize, ());
     }
 }
 
