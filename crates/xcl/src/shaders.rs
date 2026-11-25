@@ -814,11 +814,17 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    // the runtime's memory windows: from the descriptor heap with `XCL_HEAP_WINDOWS=1`
-    // (`pso::mem_windows`), as `--precompile`
-    let runtime_windows = || {
-        let windows = opt("--windows").unwrap_or(4) as u32;
-        if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows }
+    // the runtime's memory windows: as many as a run has (`XCL_UMA_WINDOWS`), from the
+    // descriptor heap with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`), as `--precompile`
+    let runtime_windows = {
+        let windows = opt("--windows").unwrap_or_else(crate::gpu::uma::configured_runtime_windows);
+        let heap = windows > 1 && recomp::pso::heap_windows();
+        if !recomp::valid_window_count(windows, heap) {
+            eprintln!("xcl shaders: --windows {windows}: 1 to 4, or 8 or 16 with XCL_HEAP_WINDOWS=1");
+            return 2;
+        }
+        let windows = windows as u32;
+        move || if heap { windows | recomp::HEAP_WINDOWS } else { windows }
     };
     let top = opt("--top").unwrap_or(60);
     let json = args.iter().any(|a| a == "--json");

@@ -78,10 +78,18 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 /// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
     let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
-    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
+    windows_for(n, heap_windows() && !SWITCH_FORM.with(|s| s.get()))
+}
+
+/// `n` windows as shaders take them: from the descriptor heap (`heap`), or in the switch form
+/// over the root UAVs – of which there are `MAX_WINDOWS`, so never more there (the HLSL path
+/// refused a wider switch, and DXIL quietly made it 4: a 16-window run whose heap views could
+/// not be made, or a pipeline the driver refused with them, lost every shader on HLSL).
+fn windows_for(n: u32, heap: bool) -> u32 {
+    if n > 1 && heap {
         n | super::HEAP_WINDOWS
     } else {
-        n
+        n.min(crate::gpu::uma::MAX_WINDOWS as u32)
     }
 }
 
@@ -1097,6 +1105,24 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
 #[cfg(test)]
 mod shader_cache_tests {
     use super::*;
+
+    /// The switch form (no heap windows, or a pipeline retried in it) has 4 root UAVs: a wider
+    /// count there is 4, which every translator takes; the heap form keeps all of them.
+    #[test]
+    fn the_switch_form_never_asks_for_more_windows_than_root_uavs() {
+        let heap = super::super::HEAP_WINDOWS;
+        assert_eq!(windows_for(16, false), 4);
+        assert_eq!(windows_for(8, false), 4);
+        assert_eq!(windows_for(16, true), 16 | heap);
+        assert_eq!((windows_for(4, false), windows_for(4, true)), (4, 4 | heap));
+        assert_eq!((windows_for(1, false), windows_for(1, true)), (1, 1));
+        for n in [1u32, 2, 4, 8, 16] {
+            for h in [false, true] {
+                let w = windows_for(n, h);
+                assert!(super::super::valid_window_count((w & !heap) as usize, w & heap != 0), "{n} windows, heap {h}: {w:#x}");
+            }
+        }
+    }
 
     #[test]
     fn translated_identity_tracks_sources_and_dxc() {
