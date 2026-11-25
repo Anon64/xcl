@@ -74,6 +74,9 @@ thread_local! {
     static JOB_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
     /// the build this thread runs gave the driver a huge program (`note_huge`)
     static JOB_HUGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// a backlog worker's build: whether it came from `Backlog::compute`; None once another
+    /// worker took this one's place (`build_parks`)
+    static PRELOAD_STEP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Run `p`'s build `job` on this thread (a worker's, or a bind's that took it): its time and
@@ -100,8 +103,9 @@ pub(super) fn note_huge() {
     JOB_HUGE.with(|h| h.set(true));
 }
 
-/// This thread is a worker and one of the title's threads waits for what it is building: the
-/// build must not stand back for the title's sake (`real::big_compile_turn`).
+/// This thread is a worker and one of the title's threads waits for what it is building: its
+/// huge driver compile does not wait for free commit and may take one of the slots kept for
+/// wanted builds, up to their cap (`real::big_compile_turn`).
 pub(super) fn build_is_wanted() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted()))
 }
@@ -110,6 +114,19 @@ pub(super) fn build_is_wanted() -> bool {
 /// compile gives its turn to any other (`real::big_compile_turn`).
 pub(super) fn build_is_ahead() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| !p.used.load(Ordering::Relaxed) && p.demand.lock().unwrap().preload_thread != 0))
+}
+
+/// The build ahead on this thread waits for its pipeline's first use before its driver compile
+/// (`real::huge_compile_turn`: no giant one is made ahead), which may never come. On a backlog
+/// worker another worker starts in its place and the lane of new compute pipelines goes to the
+/// next one (`Backlog::built`), so the backlog does not stand still behind it; this thread ends
+/// after the build.
+pub(super) fn build_parks() {
+    let Some(new_compute) = PRELOAD_STEP.with(|s| s.take()) else { return };
+    let Some(q) = preload() else { return };
+    q.list.lock().unwrap().built(new_compute);
+    q.cv.notify_one();
+    spawn_preload_worker(q);
 }
 
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and
@@ -159,8 +176,9 @@ impl Pending {
 
     /// A bind that waited for it ran out of its budget and goes on without it: when nobody else
     /// waits, the build is no longer wanted – back at the lowest priority on a preload worker and
-    /// behind the huge-pipeline gate (`real::big_compile_turn`); a wanted build skips the gate, and
-    /// many of them at once ran the process out of commit.
+    /// behind the huge-pipeline gate as an unwanted one (`real::big_compile_turn`): it waits for
+    /// free commit and for the unwanted slots, where a wanted build skips the commit wait and has
+    /// more slots, and many of those at once ran the process out of commit.
     fn unwant(&self) {
         let mut d = self.demand.lock().unwrap();
         d.waiters = d.waiters.saturating_sub(1);
@@ -526,7 +544,12 @@ impl Pending {
     /// Nobody has taken it yet: not sent to the workers (a bind wants it: they build it), not
     /// released, not being built.
     fn unclaimed(&self) -> bool {
-        !self.sent.load(Ordering::Acquire) && !self.orphan.load(Ordering::Acquire) && self.job.lock().unwrap().is_some()
+        !self.sent.load(Ordering::Acquire) && self.untaken()
+    }
+
+    /// Not released and not being built (sent or not).
+    fn untaken(&self) -> bool {
+        !self.orphan.load(Ordering::Acquire) && self.job.lock().unwrap().is_some()
     }
 }
 
@@ -664,14 +687,17 @@ struct Preload {
 /// with every worker on them the known graphics pipelines would wait for all of them and be
 /// built at their first draws instead. A pipeline a bind wants is
 /// not taken from here (`unclaimed`): the workers build it at once, and a huge driver compile
-/// ahead of its use gives its turn to any other (`real::big_compile_turn`).
+/// ahead of its use gives its turn to any other and takes no giant slot (`real::big_compile_turn`).
 #[derive(Default)]
 struct Backlog {
     known_compute: std::collections::VecDeque<Arc<Pending>>,
     /// compute pipelines no earlier run used
     compute: std::collections::VecDeque<Arc<Pending>>,
-    /// a worker builds one of `compute` (`next` hands out no other until `built`)
+    /// a worker builds one of `compute` or `spared` (`next` hands out no other until `built`)
     compute_out: bool,
+    /// compute pipelines binds go on without while they are built (`image_only`), sent here at
+    /// their first bind (`send_spared`): used, so built before `compute` and with no room or cap
+    spared: std::collections::VecDeque<Arc<Pending>>,
     known: std::collections::VecDeque<Arc<Pending>>,
     warm: std::collections::VecDeque<Arc<Pending>>,
     cold: std::collections::VecDeque<Arc<Pending>>,
@@ -702,7 +728,7 @@ impl Backlog {
     }
 
     fn len(&self) -> usize {
-        self.known_compute.len() + self.compute.len() + self.known.len() + self.warm.len() + self.cold.len()
+        self.known_compute.len() + self.compute.len() + self.spared.len() + self.known.len() + self.warm.len() + self.cold.len()
     }
 
     /// The next piece of work. `ahead`: pipelines no earlier run used may be worked on now
@@ -712,6 +738,15 @@ impl Backlog {
         while let Some(p) = self.known_compute.pop_front() {
             if p.unclaimed() {
                 return Some((p, Step::Build { ahead: false, new_compute: false }));
+            }
+        }
+        // (`sent`: its copy in another lane is passed over there)
+        if !self.compute_out {
+            while let Some(p) = self.spared.pop_front() {
+                if p.untaken() {
+                    self.compute_out = true;
+                    return Some((p, Step::Build { ahead: false, new_compute: true }));
+                }
             }
         }
         if ahead && builds && !self.compute_out {
@@ -800,55 +835,68 @@ fn preload() -> Option<&'static Preload> {
         .as_ref()?;
     STARTED.call_once(|| {
         let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
-        for k in 0..n {
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
-                unsafe {
-                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
-                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-                }
-                static DONE: AtomicUsize = AtomicUsize::new(0);
-                loop {
-                    let (p, step) = {
-                        let mut g = q.list.lock().unwrap();
-                        loop {
-                            let next = g.next(ahead_room(), AHEAD_BUILDS.load(Ordering::Relaxed) < ahead_cap());
-                            BACKLOG.store(g.len(), Ordering::Relaxed);
-                            if let Some(next) = next {
-                                break next;
-                            }
-                            // (pipelines waiting for free commit are looked at again in a second)
-                            g = q.cv.wait_timeout(g, std::time::Duration::from_secs(1)).unwrap().0;
-                        }
-                    };
-                    let (ahead, new_compute) = match step {
-                        Step::Warm(warm) => {
-                            warm();
-                            WARMED.fetch_add(1, Ordering::Relaxed);
-                            if p.unclaimed() {
-                                q.list.lock().unwrap().cold.push_back(p);
-                            }
-                            continue;
-                        }
-                        Step::Build { ahead, new_compute } => (ahead, new_compute),
-                    };
-                    // (None: a bind took it and builds it itself)
-                    let job = p.job.lock().unwrap().take();
-                    if let Some(job) = job {
-                        if ahead {
-                            AHEAD_BUILDS.fetch_add(1, Ordering::Relaxed);
-                        }
-                        build(&p, job, true);
-                        let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n.is_power_of_two() {
-                            crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
-                        }
-                    }
-                    q.list.lock().unwrap().built(new_compute);
-                }
-            });
+        for _ in 0..n {
+            spawn_preload_worker(q);
         }
     });
     Some(q)
+}
+
+/// One more worker of the backlog (`preload`).
+fn spawn_preload_worker(q: &'static Preload) {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let k = NEXT.fetch_add(1, Ordering::Relaxed);
+    let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
+        unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        }
+        static DONE: AtomicUsize = AtomicUsize::new(0);
+        loop {
+            let (p, step) = {
+                let mut g = q.list.lock().unwrap();
+                loop {
+                    let next = g.next(ahead_room(), AHEAD_BUILDS.load(Ordering::Relaxed) < ahead_cap());
+                    BACKLOG.store(g.len(), Ordering::Relaxed);
+                    if let Some(next) = next {
+                        break next;
+                    }
+                    // (pipelines waiting for free commit are looked at again in a second)
+                    g = q.cv.wait_timeout(g, std::time::Duration::from_secs(1)).unwrap().0;
+                }
+            };
+            let (ahead, new_compute) = match step {
+                Step::Warm(warm) => {
+                    warm();
+                    WARMED.fetch_add(1, Ordering::Relaxed);
+                    if p.unclaimed() {
+                        q.list.lock().unwrap().cold.push_back(p);
+                    }
+                    continue;
+                }
+                Step::Build { ahead, new_compute } => (ahead, new_compute),
+            };
+            // (None: a bind took it and builds it itself)
+            let job = p.job.lock().unwrap().take();
+            if let Some(job) = job {
+                if ahead {
+                    AHEAD_BUILDS.fetch_add(1, Ordering::Relaxed);
+                }
+                PRELOAD_STEP.with(|s| s.set(Some(new_compute)));
+                build(&p, job, true);
+                let parked = PRELOAD_STEP.with(|s| s.take()).is_none();
+                let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
+                }
+                // (its lane went back and another worker took its place: `build_parks`)
+                if parked {
+                    return;
+                }
+            }
+            q.list.lock().unwrap().built(new_compute);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1357,6 +1405,63 @@ mod used_tests {
         assert_eq!(take(&mut b), Some((4, true)));
     }
 
+    /// A pipeline binds go on without (`image_only`) goes to the backlog at its first bind, not to
+    /// the workers builds a bind waits for go to, and is built in the lane of new compute ones:
+    /// before them and one at a time with them, also short of commit and past the cap. Its place
+    /// in a lane from when it was made is passed over.
+    #[test]
+    fn a_pipeline_binds_go_on_without_is_built_by_the_backlog_one_at_a_time() {
+        let q = Preload { list: Mutex::new(Backlog::default()), cv: Condvar::new() };
+        let spared = pending_compute(7);
+        {
+            let mut b = q.list.lock().unwrap();
+            b.push(pending_compute(3), false);
+            b.push(spared.clone(), false);
+            b.push(pending(2, false), true);
+        }
+        // (as `resolve_spared` does)
+        spared.sent.store(true, Ordering::Release);
+        send_spared(spared, Some(&q));
+        let mut b = q.list.lock().unwrap();
+        let mut take = |ahead: bool| {
+            b.next(ahead, ahead).map(|(p, step)| {
+                p.job.lock().unwrap().take();
+                let Step::Build { ahead, new_compute } = step else { panic!("{} was not built", p.key) };
+                (p.key, ahead, new_compute)
+            })
+        };
+        assert_eq!(take(false), Some((7, false, true)), "short of commit and past the cap it is built, in the new compute lane");
+        assert_eq!(take(true), Some((2, false, false)), "a known graphics one while it is built");
+        assert_eq!(take(true), None, "the next new compute one waits for it");
+        b.built(true);
+        assert_eq!(b.next(true, true).map(|(p, _)| p.key), Some(3));
+        b.built(true);
+        assert!(b.next(true, true).is_none(), "its place from when it was made is passed over");
+        assert_eq!(b.len(), 0);
+    }
+
+    /// Bound under a wait budget, a pipeline binds go on without is built by a backlog worker,
+    /// not by the workers builds a bind waits for go to.
+    #[test]
+    fn a_pipeline_binds_go_on_without_is_not_built_by_the_workers_binds_wait_for() {
+        let standin = 0x7E57_B0A3usize;
+        let (tx, rx) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = tx.send(std::thread::current().name().map(str::to_owned));
+            0x5C5C
+        }), 0);
+        image_only(standin);
+        assert_eq!(resolve_wait_for(standin, Some(std::time::Duration::from_millis(30))), standin, "still being built: the stand-in");
+        let on = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker builds it");
+        assert!(on.as_deref().is_some_and(|n| n.starts_with("xcl-pso-pre-")), "built on {on:?}");
+        let start = std::time::Instant::now();
+        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(resolve_wait_for(standin, None), 0x5C5C);
+        let _ = released(standin);
+    }
+
     /// A lazy compute pipeline of shaders no run used yet is built with no bind – when commit is
     /// free.
     #[test]
@@ -1716,8 +1821,8 @@ fn gfx_wait_budget() -> Option<std::time::Duration> {
 
 /// How long a bind waits for a compute pipeline still being built (`XCL_CS_PSO_WAIT_MS`; unset
 /// or 0: as `wait_budget`). With it the bind's thread never builds the pipeline itself: the build
-/// goes to the workers (`resolve_within`; a huge driver compile behind the gate once nobody
-/// waits), and past the budget the pipeline's dispatches are skipped until it is built – what
+/// goes to the workers (`resolve_within`; a huge driver compile also waits for free commit at the
+/// gate once nobody waits), and past the budget the pipeline's dispatches are skipped until it is built – what
 /// they compute is missing or old meanwhile, the counts of later ExecuteIndirects among it
 /// (`indirect_guard` zeroes only counts out of range). A retail title's thread spent 57 s in the
 /// driver's compiler on one program no earlier run had used, and another of its threads waited
@@ -1808,7 +1913,7 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p.clone());
+                send_spared(p.clone(), preload());
             }
             if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
                 static N: AtomicUsize = AtomicUsize::new(0);
@@ -1821,6 +1926,22 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
         }
         r => r,
     }
+}
+
+/// The build of a pipeline binds do not wait for (`image_only`) goes to the backlog `q`, in the
+/// lane of new compute pipelines (`Backlog::spared`: one at a time), not to the workers builds a
+/// bind waits for go to (`queue`): there each of them, unwanted, waited for the one unwanted
+/// slot of huge driver compiles, and with more of them than workers a build a bind waited for
+/// stood in the queue behind them. Without the backlog (`XCL_PSO_PRELOAD=0`): to those workers.
+fn send_spared(p: Arc<Pending>, q: Option<&Preload>) {
+    let Some(q) = q else {
+        let _ = queue().lock().unwrap().send(p);
+        return;
+    };
+    let mut b = q.list.lock().unwrap();
+    b.spared.push_back(p);
+    BACKLOG.store(b.len(), Ordering::Relaxed);
+    q.cv.notify_one();
 }
 
 /// For binding: compute pipelines are waited for, graphics ones are not.

@@ -4303,11 +4303,18 @@ struct Slots {
     wanted_most: usize,
     /// compiles that are not built ahead of their first use waiting for a slot (`big_compile_turn`)
     urgent: AtomicUsize,
+    /// a build ahead of its pipeline's first use may take a slot (`big_compile_turn`)
+    ahead: bool,
 }
 
 impl Slots {
     const fn new(most: usize, wanted_most: usize) -> Slots {
-        Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most, wanted_most, urgent: AtomicUsize::new(0) }
+        Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most, wanted_most, urgent: AtomicUsize::new(0), ahead: true }
+    }
+
+    /// `new` for a lane whose slots no build ahead of its pipeline's first use takes.
+    const fn closed_to_ahead(most: usize, wanted_most: usize) -> Slots {
+        Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most, wanted_most, urgent: AtomicUsize::new(0), ahead: false }
     }
 
     fn most(&self) -> usize {
@@ -4330,15 +4337,19 @@ impl Drop for SlotGuard {
 
 static BIG_COMPILES: Slots = Slots::new(0, 0);
 const GIANT_DRIVER_COMPILE: usize = 4 << 20;
-static GIANT_COMPILES: Slots = Slots::new(1, 1);
+/// One giant driver compile at a time, a wanted one too, and none of a pipeline nobody has used
+/// yet: such a compile takes minutes, and one made ahead of its use held the only slot while a
+/// bind waited for another giant one.
+static GIANT_COMPILES: Slots = Slots::closed_to_ahead(1, 1);
 
 fn compile_slots(bytes: usize) -> &'static Slots {
     if bytes >= GIANT_DRIVER_COMPILE { &GIANT_COMPILES } else { &BIG_COMPILES }
 }
 
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
-/// waits for its slot first (`big_compile_turn`; not a title thread's, nor one the title waits
-/// for). Logs its time, size and whether it was gated. (Every pipeline path passes its record
+/// waits for its slot first (`big_compile_turn`; not a title thread's; one the title waits for
+/// does not wait for free commit and may take one of `Slots::wanted_most`). Logs its time, size
+/// and whether it was gated. (Every pipeline path passes its record
 /// to `driver_compile_identified` now; the gate's tests use this form.)
 #[cfg(test)]
 fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() -> R) -> R {
@@ -4357,7 +4368,7 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted, super::pso_async::build_is_ahead));
+    let _slot = huge.then(|| huge_compile_turn(bytes));
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4425,7 +4436,10 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 /// build is not stuck behind 1 background build while a burst of lazy binds still cannot spike
 /// driver compiler commit into OOM. A build ahead of the pipeline's first use (`ahead`,
 /// `pso_async::Backlog`) takes a free slot only when no other build waits for one: one a bind
-/// waits for, or waited for and gave up on (`XCL_GFX_PSO_WAIT_MS`), goes first.
+/// waits for, or waited for and gave up on (`XCL_GFX_PSO_WAIT_MS`), goes first. In a lane closed
+/// to builds ahead (`Slots::ahead`: giant compiles) it takes no slot at all and waits until its
+/// pipeline is used: a slot is never given back before the compile ends, so a giant compile
+/// nobody wants made a bind wait minutes for another one.
 fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool, ahead: impl Fn() -> bool) -> SlotGuard {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let mut n = slots.n.lock().unwrap();
@@ -4435,7 +4449,8 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
         let is_wanted = wanted();
         let cap = if is_wanted { slots.wanted_most() } else { slots.most() };
         let ahead = !is_wanted && ahead();
-        if *n < cap && (is_wanted || commit_free()) && !(ahead && slots.urgent.load(Ordering::Acquire) > 0) {
+        let open = slots.ahead || !ahead;
+        if open && *n < cap && (is_wanted || commit_free()) && !(ahead && slots.urgent.load(Ordering::Acquire) > 0) {
             *n += 1;
             break SlotGuard(slots);
         }
@@ -4449,6 +4464,17 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
         slots.urgent.fetch_sub(1, Ordering::AcqRel);
     }
     guard
+}
+
+/// `big_compile_turn` of a huge driver compile of `bytes` on a worker. A build ahead of its
+/// pipeline's first use in a lane closed to it waits there until the pipeline is used; on a
+/// backlog worker another worker takes its place meanwhile (`pso_async::build_parks`).
+fn huge_compile_turn(bytes: usize) -> SlotGuard {
+    let slots = compile_slots(bytes);
+    if !slots.ahead && super::pso_async::build_is_ahead() {
+        super::pso_async::build_parks();
+    }
+    big_compile_turn(slots, || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted, super::pso_async::build_is_ahead)
 }
 
 /// Commit headroom a big driver compile waits for: 3 GB for the class that starts at
@@ -4599,6 +4625,31 @@ mod big_compile_tests {
         other.join().unwrap();
         ahead.join().unwrap();
         assert_eq!(*ORDER.lock().unwrap(), ["other", "ahead"]);
+        assert_eq!((*S.n.lock().unwrap(), S.urgent.load(Ordering::Acquire)), (0, 0));
+    }
+
+    /// In the lane of giant compiles (`most == 1, wanted_most == 1`) a build ahead of its
+    /// pipeline's first use takes no slot, not even a free one, so a wanted giant build goes at
+    /// once instead of waiting for its whole compile; once its pipeline is used it takes its turn.
+    #[test]
+    fn a_build_ahead_takes_no_giant_slot_until_its_pipeline_is_used() {
+        assert!(!GIANT_COMPILES.ahead && BIG_COMPILES.ahead, "only the giant lane is closed to builds ahead");
+        static S: Slots = Slots::closed_to_ahead(1, 1);
+        static USED: AtomicBool = AtomicBool::new(false);
+        let ahead = std::thread::spawn(|| {
+            let _g = big_compile_turn(&S, || true, || false, || !USED.load(Ordering::Acquire));
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!ahead.is_finished(), "a build ahead waits although the slot is free");
+        assert_eq!(*S.n.lock().unwrap(), 0, "a build ahead must not hold the giant slot");
+        let t0 = Instant::now();
+        let wanted = big_compile_turn(&S, || false, || true, || false);
+        assert!(t0.elapsed() < Duration::from_secs(1), "a wanted giant build must take the slot at once");
+        USED.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!ahead.is_finished(), "used now, it waits for the slot the wanted build holds");
+        drop(wanted);
+        ahead.join().unwrap();
         assert_eq!((*S.n.lock().unwrap(), S.urgent.load(Ordering::Acquire)), (0, 0));
     }
 
@@ -6800,7 +6851,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mut take_cold_slot = || {
         cold_slot.get_or_insert_with(|| {
             let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
-            gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted, super::pso_async::build_is_ahead))
+            gate.then(|| huge_compile_turn(bytes))
         });
     };
 
