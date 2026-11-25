@@ -1698,6 +1698,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     // (Two last-but-one releases at once can miss each other here; the object then goes at
     // once, as before.)
     let mut held = false;
+    let mut pinned = false;
     let n = if super::late_release::enabled() {
         let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
         if add(this) == 2 {
@@ -1731,6 +1732,11 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
+        // a buffer may be over a heap of pages that are freed next; a texture, and a buffer of XCL's
+        // in video memory, is not
+        let texture = held && ID3D12Resource::from_raw_borrowed(&this).is_some_and(|r| r.GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER);
+        let in_video_memory = gone.as_ref().is_some_and(|b| crate::gpu::uma::get().is_some_and(|u| u.shadowed() || u.is_sparse(b.0)));
+        pinned = !texture && !in_video_memory;
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
                 super::sparse::free(p);
@@ -1740,7 +1746,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         }
     }
     if held {
-        super::late_release::hold(this as usize);
+        super::late_release::hold(this as usize, pinned);
     }
     n
 }
