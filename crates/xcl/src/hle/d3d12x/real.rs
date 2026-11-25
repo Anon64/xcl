@@ -10846,18 +10846,40 @@ mod depth_uav_twin_tests {
             let twin = depth_uav::twin_of(raw as usize).expect("a stencil twin");
             let twin = ID3D12Resource::from_raw_borrowed(&(twin as *mut c_void)).unwrap().clone();
 
-            // the title's call (#53) on the adopted list with the shared heap bound, then the PC
-            // vtable back
+            // the title's call (#53) with the shared heap bound, on a stand-in of the list whose
+            // PC ClearUnorderedAccessViewUint (#49) notes the resource it is given and goes on to
+            // the list's own: what the PC call gets, not only what XCL counted
+            static PC_CLEAR: AtomicUsize = AtomicUsize::new(0);
+            static LIST: AtomicUsize = AtomicUsize::new(0);
+            static GOT: AtomicUsize = AtomicUsize::new(0);
+            type ClearUint = unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const u32, u32, *const c_void);
+            unsafe extern "system" fn noting(_this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, n: u32, rects: *const c_void) {
+                GOT.store(res, Ordering::Relaxed);
+                let pc: ClearUint = std::mem::transmute(PC_CLEAR.load(Ordering::Relaxed));
+                pc(LIST.load(Ordering::Relaxed) as *mut c_void, gpu, cpu, res, values, n, rects)
+            }
             let l = &f.list;
             l.SetDescriptorHeaps(&[console_heap::global_heap()]);
             let lraw = l.as_raw();
-            adopt(lraw, Kind::CommandList);
+            LIST.store(lraw as usize, Ordering::Relaxed);
+            PC_CLEAR.store(*(*(lraw as *const *const usize)).add(49), Ordering::Relaxed);
+            let mut pc_vt = [0usize; 64];
+            pc_vt[49] = noting as usize;
+            // (`orig_fn` reads the PC table at -1 of the object's table)
+            let ext_vt = [pc_vt.as_ptr() as usize, 0];
+            let stand_in = [ext_vt.as_ptr().add(1)];
             let (done, not_done) = depth_uav::clears();
-            list_x::clear_uav_uint_x(lraw, slot, slot, raw as usize, [0x5Au32; 4].as_ptr(), 0, std::ptr::null());
-            let ext = *(lraw as *const *const usize);
-            *(lraw as *mut usize) = *ext.sub(1);
+            list_x::clear_uav_uint_x(stand_in.as_ptr() as *mut c_void, slot, slot, raw as usize, [0x5Au32; 4].as_ptr(), 0, std::ptr::null());
             let (done2, not_done2) = depth_uav::clears();
             assert_eq!((done2 - done, not_done2 - not_done), (1, 0), "the clear went to the twin");
+            assert_eq!(GOT.load(Ordering::Relaxed), twin.as_raw() as usize, "the PC clear gets the twin as its resource, not the depth buffer");
+            // a depth-plane UAV of the buffer is a null view: its clear is not done, nothing reaches the PC
+            let depth_slot = slot + console_heap::SLOT as u64;
+            dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_R24_UNORM_X8_TYPELESS, 0), depth_slot);
+            GOT.store(0, Ordering::Relaxed);
+            list_x::clear_uav_uint_x(stand_in.as_ptr() as *mut c_void, depth_slot, depth_slot, raw as usize, [0x11u32; 4].as_ptr(), 0, std::ptr::null());
+            let (done3, not_done3) = depth_uav::clears();
+            assert_eq!((done3 - done2, not_done3 - not_done2, GOT.load(Ordering::Relaxed)), (0, 1, 0), "a clear through the null view is not done");
 
             // the twin to a readback buffer
             let td = twin.GetDesc();
