@@ -2969,12 +2969,20 @@ fn uav_companion_srv(
 }
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
+    let rd_opt = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
+    // a UAV of the stencil plane of a depth buffer with unordered access: a view of its twin
+    // (`depth_uav`), made the way a UAV of a texture with unordered access is
+    let null_why = match super::depth_uav::resolve_uav(this, res, rd_opt.as_ref(), desc.as_ref()) {
+        super::depth_uav::Resolve::Twin(twin, view) => return dev_create_uav_checked_x(this, twin, std::ptr::null_mut(), &view, cpu),
+        super::depth_uav::Resolve::Null(why) => Some(why),
+        super::depth_uav::Resolve::NotOurs => None,
+    };
     // the view's format as the PC's for the resource (B5G5R5A1 of a target made R8G8B8A8,
     // `device_x::pc_resource_desc`: an invalid call, the device removed)
     let mut copy = desc.as_ref().copied();
     if let Some(c) = copy.as_mut() {
-        if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
-            let rf = r.GetDesc().Format.0 as u32;
+        if let Some(rd) = rd_opt.as_ref() {
+            let rf = rd.Format.0 as u32;
             c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
         } else {
             c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(c.Format.0 as u32) as i32);
@@ -2986,7 +2994,6 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     super::present::note_use(res as usize, super::present::USE_UAV);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
-    let rd_opt = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
     if super::present::trace_frame() {
         if rd_opt.is_some_and(|d| d.Width >= 1920 && d.Flags.0 & 1 != 0) {
             let s = super::console_heap::slot(cpu);
@@ -3006,7 +3013,9 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     let pc_uav = |at: u64| {
         if no_uav {
             static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            if let Some(why) = null_why {
+                super::depth_uav::null_view(why);
+            } else if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
             }
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
@@ -10634,3 +10643,146 @@ void main() {
     }
 }
 
+#[cfg(test)]
+mod depth_uav_twin_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    /// A stencil UAV of a console depth buffer with unordered access, made through the device
+    /// calls (`XCL_DEPTH_UAV_TWIN=1`, the shared view heap): the slot's UAV and its companion SRV
+    /// name the buffer's R8 twin and the T# reads as 8-bit uint; a depth UAV stays a null view
+    /// with its reason; the DSV is known; the twin goes with the buffer. On WARP, in a child
+    /// process (the shared heap and the switch are the process's).
+    #[test]
+    fn gpu_a_stencil_uav_of_a_console_depth_buffer_is_a_view_of_its_twin() {
+        const CHILD: &str = "XCL_TEST_DEPTH_UAV_TWIN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::real::depth_uav_twin_tests::gpu_a_stencil_uav_of_a_console_depth_buffer_is_a_view_of_its_twin", "--nocapture"])
+                .env(CHILD, "1")
+                .env("XCL_DEPTH_UAV_TWIN", "1")
+                .env("XCL_UMA_MB", "64")
+                .env("XCL_COHERENT_MB", "64")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed ({:?}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        use super::super::{console_heap, depth_uav};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                crate::gpu::recomp::runner::skip_test("no WARP device");
+                return;
+            };
+            let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                crate::gpu::recomp::runner::skip_test("no WARP device");
+                return;
+            };
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no WARP device");
+                return;
+            }
+            let dev = dev.unwrap();
+            // the DSV heap is the PC's; then the device as a title's
+            let dsv_heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0 })
+                .unwrap();
+            let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+            let d = dev.as_raw();
+            adopt(d, Kind::Device);
+
+            // a console view heap of 4 slots (in the shared heap)
+            let mut heap_raw = std::ptr::null_mut();
+            let hr = dev_create_descriptor_heap_x(d, &[0, 4, 1, 0],&ID3D12DescriptorHeap::IID as *const _ as *const GUID, &mut heap_raw);
+            assert!(hr >= 0 && !heap_raw.is_null(), "console view heap: {hr:#x}");
+            let heap = ID3D12DescriptorHeap::from_raw(heap_raw);
+            let base = console_heap::start(heap_raw as usize).expect("console heap start");
+            let slot_cpu = |k: u64| base + k * console_heap::SLOT as u64;
+
+            // a 16x16 console D24_UNORM_S8_UINT with ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS
+            let console = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut raw = std::ptr::null_mut();
+            let hr = dev_create_committed_resource_x(
+                d,
+                &props as *const _ as usize,
+                0,
+                &console as *const _ as usize,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as usize,
+                0,
+                &ID3D12Resource::IID as *const _ as *const GUID,
+                &mut raw,
+            );
+            assert!(hr >= 0 && !raw.is_null(), "the depth buffer: {hr:#x}");
+            let depth = ID3D12Resource::from_raw(raw);
+            assert!(depth_uav::kept(raw as usize), "the buffer is kept");
+
+            dev_create_dsv_x(
+                d,
+                raw,
+                &D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT_D24_UNORM_S8_UINT, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default() },
+                dsv,
+            );
+            assert_eq!(depth_uav::dsv_names(dsv as usize), Some(raw as usize), "the DSV is known");
+
+            let uav = |format, plane| D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: plane } },
+            };
+            let (made, alive, redirected, _) = depth_uav::counts();
+            dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_X24_TYPELESS_G8_UINT, 1), slot_cpu(0));
+            dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_R24_UNORM_X8_TYPELESS, 0), slot_cpu(1));
+            // a second stencil UAV takes the same twin
+            dev_create_uav_checked_x(d, raw, std::ptr::null_mut(), &uav(DXGI_FORMAT_R8_UINT, 0), slot_cpu(2));
+            let (made2, alive2, redirected2, nulls) = depth_uav::counts();
+            assert_eq!((made2 - made, alive2 - alive, redirected2 - redirected), (1, 1, 2), "one twin, two views of it");
+            assert_eq!(nulls, ["its depth plane has no twin yet"], "the depth view is a null view, with its reason");
+
+            let twin = depth_uav::twin_of(raw as usize).expect("a stencil twin");
+            let t = ID3D12Resource::from_raw_borrowed(&(twin as *mut c_void)).unwrap().GetDesc();
+            assert_eq!((t.Format, t.Width, t.Height, t.DepthOrArraySize, t.MipLevels), (DXGI_FORMAT_R8_TYPELESS, 16, 16, 1, 1));
+            assert!(t.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0);
+            assert_eq!(title_address(twin), None, "the twin is no title memory");
+            for k in [0, 2] {
+                let s = console_heap::slot(slot_cpu(k)).unwrap();
+                assert_ne!(s.shared_srv, 0, "slot {k} is in the shared heap");
+                assert_eq!(console_heap::names_of(&s), (twin, twin), "slot {k}: SRV and UAV of the twin");
+                let mut w = [0u32; 8];
+                std::ptr::copy_nonoverlapping(slot_cpu(k) as *const u32, w.as_mut_ptr(), 8);
+                assert_eq!((w[0], (w[1] >> 20) & 0x1FF), (s.index, 5), "slot {k}: the T# of an R8_UINT image");
+            }
+            let s = console_heap::slot(slot_cpu(1)).unwrap();
+            assert_eq!(console_heap::names_of(&s).1, 0, "the depth plane's UAV is a null view");
+
+            drop(heap);
+            drop(depth);
+            assert!(!depth_uav::kept(raw as usize), "the buffer is forgotten at its last release");
+            assert_eq!(depth_uav::counts().1, alive, "the twin goes with the buffer's Cell");
+            drop(dsv_heap);
+        }
+    }
+}

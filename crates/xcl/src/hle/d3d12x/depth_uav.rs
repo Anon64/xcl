@@ -5,19 +5,24 @@
 //!
 //! This module keeps what XCL knows of these buffers: each object by its address, the objects at
 //! one title address and shape together in a `Cell` (on the PC they share texels, `vram`), and the
-//! DSVs that name them. Behind `XCL_DEPTH_UAV_TWIN=1`; with the switch off nothing is registered
-//! and every hook stops at one atomic load.
+//! DSVs that name them. A UAV of the stencil plane of such a buffer is made on a twin of the
+//! plane: an R8 texture with unordered access, made at the first such UAV (`resolve_uav`). The
+//! store, the load (the slot's companion SRV) and the T# of the UAV slot then use the twin.
+//! Behind `XCL_DEPTH_UAV_TWIN=1`; with the switch off nothing is registered, a UAV of a depth
+//! buffer stays a null view and every hook stops at one atomic load.
 //!
-//! (After the depth+UAV twins of xcl-dev/xcl#1989 by raylitebull: registering at creation, DSVs and
-//! forgetting at the last release; and #1063 by IvyNotFound: the PC state a buffer was created in.)
+//! (After the depth+UAV twins of xcl-dev/xcl#1989 by raylitebull: registering at creation, DSVs,
+//! forgetting at the last release, the UAV on a twin and its formats; and #1063 by IvyNotFound:
+//! the PC state a buffer was created in.)
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::sharded::Sharded;
 
@@ -56,6 +61,10 @@ struct Key {
 
 struct Cell {
     key: Key,
+    /// the format of the console's description
+    console_format: u32,
+    /// a twin was made
+    twinned: AtomicBool,
     inner: Mutex<Inner>,
 }
 
@@ -63,10 +72,27 @@ struct Cell {
 struct Inner {
     /// registered objects of this buffer
     members: u32,
+    /// [depth, stencil]
+    twins: [Option<Twin>; 2],
+}
+
+/// A plane's twin: a colour texture of the plane's size with unordered access, resting in
+/// UNORDERED_ACCESS.
+struct Twin {
+    res: ID3D12Resource,
+}
+
+// D3D12 resources are free-threaded
+unsafe impl Send for Twin {}
+unsafe impl Sync for Twin {}
+
+impl Drop for Twin {
+    fn drop(&mut self) {
+        TWINS.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone)]
-#[allow(dead_code)] // (the state is read once twins are made)
 struct Object {
     cell: Arc<Cell>,
     /// the PC state the object was created in
@@ -91,6 +117,12 @@ static DSVS: Sharded<Dsv> = Sharded::new();
 /// The gates: entries in OBJECTS and DSVS.
 static REGISTERED: AtomicUsize = AtomicUsize::new(0);
 static DSV_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+/// Twins alive.
+static TWINS: AtomicUsize = AtomicUsize::new(0);
+/// Twins made, UAVs made on a twin, UAVs of depth buffers left null views.
+static MADE: AtomicU64 = AtomicU64::new(0);
+static REDIRECTED: AtomicU64 = AtomicU64::new(0);
+static NULL_VIEWS: AtomicU64 = AtomicU64::new(0);
 
 fn u32_at(x: &[u8; 0x38], o: usize) -> u32 {
     u32::from_le_bytes(x[o..o + 4].try_into().unwrap())
@@ -123,25 +155,35 @@ fn register(res: usize, x: &[u8; 0x38], at: Option<usize>, pc_state: u32) -> boo
     };
     let mut g = CELLS.lock().unwrap();
     let cells = g.get_or_insert_with(HashMap::new);
-    let cell = cells.entry(key).or_insert_with(|| Arc::new(Cell { key, inner: Mutex::new(Inner::default()) })).clone();
+    let cell = cells
+        .entry(key)
+        .or_insert_with(|| Arc::new(Cell { key, console_format: u32_at(x, 0x20), twinned: AtomicBool::new(false), inner: Mutex::new(Inner::default()) }))
+        .clone();
     cell.inner.lock().unwrap().members += 1;
-    match OBJECTS.insert(res, Object { cell, state: pc_state }) {
+    let gone = match OBJECTS.insert(res, Object { cell, state: pc_state }) {
         None => {
             REGISTERED.fetch_add(1, Ordering::Relaxed);
+            Default::default()
         }
         // (an object XCL did not see released: its membership goes back)
         Some(old) => leave(cells, &old.cell),
-    }
+    };
+    drop(g);
+    drop(gone);
     true
 }
 
-/// One object of `cell` is gone; the last one takes the Cell with it.
-fn leave(cells: &mut HashMap<Key, Arc<Cell>>, cell: &Arc<Cell>) {
+/// One object of `cell` is gone; the last one takes the Cell with it, and its twins, which the
+/// caller drops outside every lock (their Release goes through `real::res_release`).
+#[must_use]
+fn leave(cells: &mut HashMap<Key, Arc<Cell>>, cell: &Arc<Cell>) -> [Option<Twin>; 2] {
     let mut inner = cell.inner.lock().unwrap();
     inner.members = inner.members.saturating_sub(1);
     if inner.members == 0 && cells.get(&cell.key).is_some_and(|c| Arc::ptr_eq(c, cell)) {
         cells.remove(&cell.key);
+        return std::mem::take(&mut inner.twins);
     }
+    Default::default()
 }
 
 /// The last reference of `res` goes (`real::res_release`).
@@ -151,9 +193,183 @@ pub(super) fn forget(res: usize) {
     }
     let Some(o) = OBJECTS.remove(res) else { return };
     REGISTERED.fetch_sub(1, Ordering::Relaxed);
-    if let Some(cells) = CELLS.lock().unwrap().as_mut() {
-        leave(cells, &o.cell);
+    let gone = CELLS.lock().unwrap().as_mut().map(|cells| leave(cells, &o.cell));
+    drop(gone);
+}
+
+/// What a UAV of a resource is made on (`resolve_uav`).
+pub(super) enum Resolve {
+    /// the twin, and the view of it
+    Twin(*mut c_void, D3D12_UNORDERED_ACCESS_VIEW_DESC),
+    /// a depth buffer whose UAV stays a null view, and why
+    Null(&'static str),
+    /// not a depth buffer with unordered access
+    NotOurs,
+}
+
+/// CreateUnorderedAccessView of `res` (description `rd`) with the title's view `view` as it came:
+/// a UAV of the stencil plane of a kept two-plane depth buffer is made on the plane's twin (made
+/// now when there is none yet).
+pub(super) unsafe fn resolve_uav(dev: *mut c_void, res: *mut c_void, rd: Option<&D3D12_RESOURCE_DESC>, view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> Resolve {
+    let Some(rd) = rd.filter(|d| d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0) else {
+        return Resolve::NotOurs;
+    };
+    if !enabled() {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            crate::xlog_info!("D3D12.X: depth UAV twins are off (XCL_DEPTH_UAV_TWIN): a UAV of a depth buffer is a null view");
+        }
+        return Resolve::Null("XCL_DEPTH_UAV_TWIN is off");
     }
+    if rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd.SampleDesc.Count > 1 {
+        return Resolve::Null("not a single-sample 2D depth buffer");
+    }
+    if view.is_some_and(|v| !matches!(v.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2D | D3D12_UAV_DIMENSION_TEXTURE2DARRAY)) {
+        return Resolve::Null("not a 2D view");
+    }
+    // (no twin on a guessed state)
+    let Some(o) = OBJECTS.get(res as usize) else { return Resolve::Null("XCL did not see the buffer created") };
+    let key = o.cell.key;
+    if !matches!(key.format, 19 | 44) || !stencil_view(view) {
+        return Resolve::Null("its depth plane has no twin yet");
+    }
+    let twin = {
+        let mut inner = o.cell.inner.lock().unwrap();
+        match &inner.twins[1] {
+            Some(t) => t.res.as_raw(),
+            None => {
+                let Some(t) = make_twin(dev, &key) else { return Resolve::Null("the twin could not be made") };
+                TWINS.fetch_add(1, Ordering::Relaxed);
+                let raw = t.as_raw();
+                inner.twins[1] = Some(Twin { res: t });
+                o.cell.twinned.store(true, Ordering::Relaxed);
+                let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    crate::xlog_info!(
+                        "D3D12.X: depth UAV twin #{n}: the stencil plane of a {}x{}x{} depth buffer (PC format {}, console format {}) at {:#x} is an R8 texture; the buffer was made in state {:#x}",
+                        key.width,
+                        key.height,
+                        key.array,
+                        key.format,
+                        o.cell.console_format,
+                        key.at,
+                        o.state
+                    );
+                }
+                raw
+            }
+        }
+    };
+    REDIRECTED.fetch_add(1, Ordering::Relaxed);
+    Resolve::Twin(twin, twin_view(view, key.array))
+}
+
+/// A UAV of a depth buffer stays a null view (`Resolve::Null`).
+pub(super) fn null_view(why: &'static str) {
+    #[cfg(test)]
+    NULL_REASONS.lock().unwrap().push(why);
+    let n = NULL_VIEWS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: a UAV of a depth buffer stays a null view ({why}): {n} so far");
+    }
+}
+
+#[cfg(test)]
+static NULL_REASONS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// The stencil plane's twin of `key`: R8_TYPELESS with unordered access, of the buffer's size,
+/// array and mips, in UNORDERED_ACCESS. Made through `real::dev_create_committed_resource`:
+/// a PC resource, adopted, never in title memory.
+unsafe fn make_twin(dev: *mut c_void, key: &Key) -> Option<ID3D12Resource> {
+    if dev.is_null() {
+        return None;
+    }
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Alignment: 0,
+        Width: key.width as u64,
+        Height: key.height,
+        DepthOrArraySize: key.array.max(1),
+        MipLevels: key.mips,
+        Format: DXGI_FORMAT_R8_TYPELESS,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    };
+    let mut out = std::ptr::null_mut();
+    let hr = super::real::dev_create_committed_resource(
+        dev,
+        &heap as *const _ as usize,
+        0,
+        &desc as *const _ as usize,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as usize,
+        0,
+        &ID3D12Resource::IID as *const _ as *const windows_sys::core::GUID,
+        &mut out,
+    );
+    (hr >= 0 && !out.is_null()).then(|| ID3D12Resource::from_raw(out))
+}
+
+/// The view names the stencil plane: plane slice 1, or a stencil or 8-bit format.
+fn stencil_view(view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> bool {
+    let Some(v) = view else { return false };
+    let plane = unsafe {
+        match v.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE2D => v.Anonymous.Texture2D.PlaneSlice,
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => v.Anonymous.Texture2DArray.PlaneSlice,
+            _ => 0,
+        }
+    };
+    plane == 1 || matches!(v.Format.0, 22 | 47 | 60..=64 | 120)
+}
+
+/// The twin's view: the title's (a Texture2D or Texture2DArray one when it gave none) on plane 0,
+/// R8_UINT or the 8-bit class the title asked for (UNORM, SNORM, SINT).
+fn twin_view(view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>, array: u16) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let mut v = match view {
+        Some(v) => *v,
+        None if array > 1 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_UAV { MipSlice: 0, FirstArraySlice: 0, ArraySize: array as u32, PlaneSlice: 0 } },
+            ..Default::default()
+        },
+        None => D3D12_UNORDERED_ACCESS_VIEW_DESC { ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() },
+    };
+    v.Format = match v.Format {
+        f @ (DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_R8_SNORM | DXGI_FORMAT_R8_SINT) => f,
+        _ => DXGI_FORMAT_R8_UINT,
+    };
+    match v.ViewDimension {
+        D3D12_UAV_DIMENSION_TEXTURE2D => v.Anonymous.Texture2D.PlaneSlice = 0,
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => v.Anonymous.Texture2DArray.PlaneSlice = 0,
+        _ => {}
+    }
+    v
+}
+
+/// (tests) Whether `res` is kept.
+#[cfg(test)]
+pub(super) fn kept(res: usize) -> bool {
+    OBJECTS.contains(res)
+}
+
+/// (tests) The stencil twin of the buffer `res` is in.
+#[cfg(test)]
+pub(super) fn twin_of(res: usize) -> Option<usize> {
+    OBJECTS.get(res)?.cell.inner.lock().unwrap().twins[1].as_ref().map(|t| t.res.as_raw() as usize)
+}
+
+/// (tests) The object a DSV handle names.
+#[cfg(test)]
+pub(super) fn dsv_names(handle: usize) -> Option<usize> {
+    DSVS.get(handle).map(|d| d.res)
+}
+
+/// (tests) Twins made, twins alive, UAVs made on a twin, and the reasons of the null views so far.
+#[cfg(test)]
+pub(super) fn counts() -> (u64, usize, u64, Vec<&'static str>) {
+    (MADE.load(Ordering::Relaxed), TWINS.load(Ordering::Relaxed), REDIRECTED.load(Ordering::Relaxed), NULL_REASONS.lock().unwrap().clone())
 }
 
 /// CreateDepthStencilView of `res` at `handle` with D3D12_DSV_FLAGS `flags`.
@@ -361,5 +577,54 @@ mod tests {
         assert!(DSVS.get(other as usize).is_some_and(|d| d.cell.upgrade().is_none()), "a DSV of a buffer that went names no Cell");
         forget_dsv(heap as usize);
         forget_dsv(other as usize);
+    }
+
+    fn uav2d(format: DXGI_FORMAT, plane: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: plane } },
+        }
+    }
+
+    fn uav2d_array(format: DXGI_FORMAT, mip: u32, first: u32, n: u32, plane: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_UAV { MipSlice: mip, FirstArraySlice: first, ArraySize: n, PlaneSlice: plane } },
+        }
+    }
+
+    #[test]
+    fn a_view_names_the_stencil_plane_by_format_or_plane_slice() {
+        // X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT, the R8 formats, the console's X16_TYPELESS_G8_UINT
+        for f in [22, 47, 60, 61, 62, 63, 64, 120] {
+            assert!(stencil_view(Some(&uav2d(DXGI_FORMAT(f), 0))), "format {f}");
+        }
+        assert!(stencil_view(Some(&uav2d(DXGI_FORMAT_R32_UINT, 1))), "plane slice 1");
+        assert!(stencil_view(Some(&uav2d_array(DXGI_FORMAT_UNKNOWN, 0, 0, 2, 1))), "plane slice 1 of an array view");
+        // R24_UNORM_X8_TYPELESS, R32_FLOAT, R16_UNORM, R32_UINT, R32_FLOAT_X8X24_TYPELESS on plane 0; no view
+        for f in [46, 41, 56, 42, 21] {
+            assert!(!stencil_view(Some(&uav2d(DXGI_FORMAT(f), 0))), "format {f}");
+        }
+        assert!(!stencil_view(None));
+    }
+
+    #[test]
+    fn the_twins_view_keeps_the_slices_and_the_r8_class_asked_for() {
+        let v = twin_view(Some(&uav2d_array(DXGI_FORMAT_X24_TYPELESS_G8_UINT, 1, 2, 3, 1)), 6);
+        assert_eq!((v.Format, v.ViewDimension), (DXGI_FORMAT_R8_UINT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY));
+        let a = unsafe { v.Anonymous.Texture2DArray };
+        assert_eq!((a.MipSlice, a.FirstArraySlice, a.ArraySize, a.PlaneSlice), (1, 2, 3, 0));
+        let v = twin_view(Some(&uav2d(DXGI_FORMAT(120), 1)), 1);
+        assert_eq!((v.Format, v.ViewDimension, unsafe { v.Anonymous.Texture2D.PlaneSlice }), (DXGI_FORMAT_R8_UINT, D3D12_UAV_DIMENSION_TEXTURE2D, 0));
+        for f in [DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_SNORM, DXGI_FORMAT_R8_SINT, DXGI_FORMAT_R8_UINT] {
+            assert_eq!(twin_view(Some(&uav2d(f, 0)), 1).Format, f, "{f:?}");
+        }
+        // no view: the whole buffer
+        let v = twin_view(None, 4);
+        assert_eq!((v.Format, v.ViewDimension, unsafe { v.Anonymous.Texture2DArray.ArraySize }), (DXGI_FORMAT_R8_UINT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY, 4));
+        let v = twin_view(None, 1);
+        assert_eq!((v.Format, v.ViewDimension, unsafe { v.Anonymous.Texture2D.PlaneSlice }), (DXGI_FORMAT_R8_UINT, D3D12_UAV_DIMENSION_TEXTURE2D, 0));
     }
 }
