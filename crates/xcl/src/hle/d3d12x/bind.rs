@@ -304,8 +304,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if !gfx && super::real::skip_named_cs(pso) {
         return;
     }
-    // (binds a compute root signature and pipeline: before the dispatch's own)
-    let checked = if gfx { None } else { super::indirect_guard::check(this, pso, sig, max, args, args_off, count_buf) };
+    // (binds a compute root signature and a pipeline: before the dispatch's or draw's own)
+    let checked = super::indirect_guard::check(this, pso, sig, max, args, args_off, count_buf);
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });

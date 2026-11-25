@@ -459,6 +459,7 @@ fn size_text(kind: Kind, size: [u32; 3]) -> String {
         Kind::Dispatch => format!("{}x{}x{} groups", size[0], size[1], size[2]),
         Kind::Draw => format!("{} vertices or indices x {} instances", size[0], size[1]),
         Kind::IndirectDispatch if size[1..] != [0, 0] => format!("{}x{}x{} groups, the GPU's", size[0], size[1], size[2]),
+        Kind::IndirectDraw if size[1..] != [0, 0] => format!("{} vertices or indices x {} instances, the GPU's", size[0], size[1]),
         Kind::IndirectDispatch | Kind::IndirectDraw | Kind::PcIndirect => format!("max count {} (its counts are the GPU's)", size[0]),
     }
 }
