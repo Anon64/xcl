@@ -2153,7 +2153,11 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 8 {
             let cs = super::real::pso_shaders(pso).map_or(0, |(cs, _)| cs);
-            crate::xlog_warn!("D3D12.X: Dispatch of {x} x {y} x {z} groups with cs {cs:016x}: past the PC's 65 535 groups a dimension and not foldable – clamped to 65535 a dimension");
+            if left_out([x, y, z], folded) {
+                crate::xlog_warn!("D3D12.X: Dispatch of {x} x {y} x {z} groups with cs {cs:016x}: more groups than a dispatch may have (XCL_INDIRECT_MAX_GROUPS) – left out");
+            } else {
+                crate::xlog_warn!("D3D12.X: Dispatch of {x} x {y} x {z} groups with cs {cs:016x}: past the PC's 65 535 groups a dimension and not foldable – clamped to 65535 a dimension");
+            }
         }
     }
     bind_abi(this, list, pso, false, Some([x, y, z]), limit)?;
@@ -2194,22 +2198,46 @@ pub(super) fn fold(x: u32, y: u32, z: u32) -> (u32, [u32; 3]) {
     if limit == 0 && groups != [x, y, z] {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
-            crate::xlog_warn!("D3D12.X: a dispatch of {x}x{y}x{z} groups cannot be folded – clamped to 65535 a dimension");
+            if left_out([x, y, z], groups) {
+                crate::xlog_warn!("D3D12.X: a dispatch of {x}x{y}x{z} groups is left out: more groups than a dispatch may have (XCL_INDIRECT_MAX_GROUPS)");
+            } else {
+                crate::xlog_warn!("D3D12.X: a dispatch of {x}x{y}x{z} groups cannot be folded – clamped to 65535 a dimension");
+            }
         }
     }
     (limit, groups)
 }
 
+/// Whether `fold_counts` left a dispatch of `asked` groups out (it gave no groups for counts
+/// that had some).
+fn left_out(asked: [u32; 3], groups: [u32; 3]) -> bool {
+    groups == [0, 0, 0] && asked.iter().all(|&n| n != 0)
+}
+
 /// `fold` without its log line (for a caller that says it with the program)
 fn fold_counts(x: u32, y: u32, z: u32) -> (u32, [u32; 3]) {
+    fold_counts_within(x, y, z, super::indirect_guard::max_groups())
+}
+
+/// `fold_counts` with `most`, the groups in all a dispatch that needs folding or clamping may
+/// still run (`indirect_guard`'s bound). Counts D3D12 takes pass as they are, whatever their
+/// product. Past them, more groups than that are counts no title asks for – where the counts
+/// should be lies something else: 1 065 353 216, the bits of 1.0f, is 16 257 rows of 65 535
+/// groups once folded, and 70 000 x 70 000 x 16 clamped is still 68 thousand million – and
+/// nothing runs: such a dispatch kept an NVIDIA GPU busy until the driver reset the device.
+fn fold_counts_within(x: u32, y: u32, z: u32, most: u32) -> (u32, [u32; 3]) {
     use crate::gpu::recomp::FOLD_X;
     if x <= FOLD_X && y <= 65_535 && z <= 65_535 {
         return (0, [x, y, z]);
     }
-    if y == 1 && z <= 65_535 && x.div_ceil(FOLD_X) <= 65_535 {
-        return (x, [FOLD_X, x.div_ceil(FOLD_X), z]);
+    let (limit, groups) =
+        if y == 1 && z <= 65_535 && x.div_ceil(FOLD_X) <= 65_535 { (x, [FOLD_X, x.div_ceil(FOLD_X), z]) } else { (0, [x.min(65_535), y.min(65_535), z.min(65_535)]) };
+    // (a folded dispatch has up to one row of groups more than the console's count; the bound in
+    // 32 bits, as `clamp`'s pass takes it)
+    if groups.iter().map(|&n| n as u64).product::<u64>() > most.saturating_add(FOLD_X) as u64 {
+        return (0, [0, 0, 0]);
     }
-    (0, [x.min(65_535), y.min(65_535), z.min(65_535)])
+    (limit, groups)
 }
 
 /// What `bind_abi` set on a list, for setting it again after other work in between (`rebind`)
@@ -2337,6 +2365,23 @@ mod tests {
             assert_eq!(limit, n);
             assert!(x * y >= n && x * y - n < x, "{n}: {x}x{y}");
         }
+    }
+
+    /// A dispatch that needs folding or clamping runs at most the groups a dispatch may have: the
+    /// bits of 1.0f where a count should be are 16 257 rows of 65 535 groups once folded, and
+    /// nothing of that runs. Counts D3D12 takes are never looked at.
+    #[test]
+    fn a_dispatch_past_the_limit_with_more_groups_than_any_title_asks_for_is_left_out() {
+        let most = 1 << 22;
+        assert_eq!(fold_counts_within(most, 1, 1, most), (most, [65_535, 65, 1]), "the most that is folded");
+        assert_eq!(fold_counts_within(most + 65_536, 1, 1, most), (0, [0, 0, 0]));
+        assert_eq!(fold_counts_within(0x3F80_0000, 1, 1, most), (0, [0, 0, 0]), "1.0f in X");
+        assert_eq!(fold_counts_within(70_000, 70_000, 16, most), (0, [0, 0, 0]), "clamped it is 65 535 x 65 535 x 16");
+        assert_eq!(fold_counts_within(u32::MAX, 1, 1, most), (0, [65_535, 1, 1]), "not foldable: one row, as before");
+        assert_eq!(fold_counts_within(70_000, 2, 1, most), (0, [65_535, 2, 1]));
+        assert_eq!(fold_counts_within(4_096, 4_096, 1, most), (0, [4_096, 4_096, 1]), "within D3D12's limits: as it is, whatever the product");
+        assert_eq!(fold_counts_within(60_000, 60_000, 2, most), (0, [60_000, 60_000, 2]));
+        assert!(left_out([0x3F80_0000, 1, 1], [0, 0, 0]) && !left_out([0, 5, 1], [0, 0, 0]) && !left_out([70_000, 2, 1], [65_535, 2, 1]));
     }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.

@@ -73,7 +73,9 @@ fn on(kind: Counts) -> bool {
     *MODE == 2 || (*MODE == 1 && kind == Counts::Dispatch)
 }
 
-fn max_groups() -> u32 {
+/// The groups in all a dispatch whose counts XCL has to check, fold or clamp may have
+/// (`XCL_INDIRECT_MAX_GROUPS`, 2^22 unless set).
+pub(super) fn max_groups() -> u32 {
     static MAX: LazyLock<u32> = LazyLock::new(|| std::env::var("XCL_INDIRECT_MAX_GROUPS").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(1 << 22));
     *MAX
 }

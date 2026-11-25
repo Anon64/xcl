@@ -1,4 +1,4 @@
-//! Indirect compute dispatches with group counts D3D12 takes (`XCL_CLAMP_INDIRECT=0`: off).
+//! Indirect compute dispatches with group counts D3D12 takes (`XCL_CLAMP_INDIRECT=1`: on).
 //!
 //! The console runs up to 2^32 − 1 groups a dimension; D3D12 takes 65 535, and past that the
 //! dispatch is undefined – on an NVIDIA GPU it ran on until the driver reset the device
@@ -13,6 +13,11 @@
 //! count past 65 535 clamped. The dispatch then reads the slot. How many were folded and clamped,
 //! and the latest counts, are kept in the buffer's first 32 bytes and logged now and then (the
 //! buffer is CPU-visible memory, a custom heap).
+//!
+//! Counts that need folding or clamping and still give more groups in all than a dispatch may
+//! have (`indirect_guard::max_groups`) are not counts: the bits of 1.0f in X are 16 257 rows of
+//! 65 535 groups once folded. Such a dispatch gets no groups (`bind::fold` decides the same on
+//! the CPU).
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -25,12 +30,13 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 /// Slots of 16 bytes after the header; reused in turn (a slot is read by the dispatch recorded
 /// right after it is written, long before 65 536 more indirect dispatches come).
 const SLOTS: u64 = 1 << 16;
-/// Counts clamped (count, the last x, y, z) and folded (count, the last x) – 32 bytes.
+/// Counts clamped (count, the last x, y, z), folded (count, the last x) and left out (count,
+/// the last x) – 32 bytes.
 const HEADER: u64 = 32;
 
 const HLSL: &str = r#"
-#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0), UAV(u1), UAV(u2)"
-cbuffer C : register(b0) { uint slot; };
+#define RS "RootConstants(num32BitConstants=2, b0), UAV(u0), UAV(u1), UAV(u2)"
+cbuffer C : register(b0) { uint slot; uint bound; };
 RWByteAddressBuffer src : register(u0);
 RWByteAddressBuffer dst : register(u1);
 RWByteAddressBuffer io : register(u2);
@@ -50,8 +56,20 @@ void main() {
     } else {
         c = min(g, 65535u);
     }
+    // more groups in all than a dispatch may have (`bound`: the guard's, and the one row more a
+    // fold can add): what lies where the counts should be is something else, and nothing runs.
+    // (No count is over 65 535 here, so the product of two fits 32 bits.)
+    bool left = any(c != g) && c.z != 0u && c.x * c.y > bound / c.z;
+    if (left) {
+        folded = 0u;
+        c = uint3(0u, 0u, 0u);
+    }
     io.Store(0, folded);
-    if (folded != 0u) {
+    if (left) {
+        uint n;
+        dst.InterlockedAdd(24, 1, n);
+        dst.Store(28, g.x);
+    } else if (folded != 0u) {
         uint n;
         dst.InterlockedAdd(16, 1, n);
         dst.Store(20, g.x);
@@ -75,9 +93,15 @@ struct Clamp {
 unsafe impl Send for Clamp {}
 unsafe impl Sync for Clamp {}
 
+/// `XCL_CLAMP_INDIRECT=1`. Off unless asked for: with the pass on, a retail title's first world
+/// frames ended in a device removal on an NVIDIA GPU (0x887A0006 eight seconds after the pass
+/// first ran, the driver's breadcrumbs inside a Dispatch; a run of the same build with the pass
+/// off had none). Arguments that are not counts reach the pass there (0 x 1 065 353 216 x 16 was
+/// logged), which is what the bound on the groups in all is for – until a run with the pass on
+/// shows that this was all of it, the counts go to the PC as the title gave them.
 pub fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("XCL_CLAMP_INDIRECT").map_or(true, |v| v.trim() != "0"))
+    *E.get_or_init(|| std::env::var("XCL_CLAMP_INDIRECT").is_ok_and(|v| v.trim() == "1"))
 }
 
 fn get(list: &ID3D12GraphicsCommandList) -> Option<&'static Clamp> {
@@ -161,6 +185,11 @@ pub unsafe fn before(list: &ID3D12GraphicsCommandList, args: usize, off: u64, io
     if !enabled() {
         return None;
     }
+    pass(list, args, off, io_limit, super::indirect_guard::max_groups())
+}
+
+/// `before` with the pass on and `most` groups in all for a dispatch it folds or clamps.
+unsafe fn pass(list: &ID3D12GraphicsCommandList, args: usize, off: u64, io_limit: u64, most: u32) -> Option<(usize, u64)> {
     let raw = args as *mut c_void;
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let d = res.GetDesc();
@@ -181,6 +210,8 @@ pub unsafe fn before(list: &ID3D12GraphicsCommandList, args: usize, off: u64, io
     list.SetComputeRootSignature(&c.rs);
     set_pipeline(list, &c.pso);
     list.SetComputeRoot32BitConstant(0, slot as u32, 0);
+    // (as `bind::fold_counts_within` bounds the product)
+    list.SetComputeRoot32BitConstant(0, most.saturating_add(crate::gpu::recomp::FOLD_X), 1);
     list.SetComputeRootUnorderedAccessView(1, res.GetGPUVirtualAddress() + off);
     list.SetComputeRootUnorderedAccessView(2, c.gpu);
     list.SetComputeRootUnorderedAccessView(3, io_limit);
@@ -240,6 +271,11 @@ fn report(c: &Clamp) {
     if f != FOLDED.swap(f, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: {f} indirect dispatches folded so far (the latest of {} groups in X)", w(5));
     }
+    static LEFT: AtomicU32 = AtomicU32::new(0);
+    let l = w(6);
+    if l != LEFT.swap(l, Ordering::Relaxed) {
+        crate::xlog_warn!("D3D12.X: {l} indirect dispatches left out so far: more groups than a dispatch may have (XCL_INDIRECT_MAX_GROUPS; the latest with {:#x} in X)", w(7));
+    }
 }
 
 #[cfg(test)]
@@ -270,7 +306,8 @@ mod tests {
 
     /// The pass writes the counts D3D12 takes into its slot: 72 512 × 1 × 1 folded into
     /// 65 535 × 2 × 1 with 72 512 in io; 70 000 × 2 × 1 clamped with 0 in io; 300 × 4 × 2 as
-    /// it was.
+    /// it was; and no groups for counts that would still run more than a dispatch may have (the
+    /// bits of 1.0f in X; 65 535 × 65 535 × 16 once clamped).
     #[test]
     fn indirect_group_counts_are_folded_or_clamped_on_the_gpu() {
         use crate::gpu::recomp::runner;
@@ -285,13 +322,19 @@ mod tests {
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-            // (the last three at the top of the range: 65 535² folds into exactly 65 535 rows,
-            // one more or u32::MAX would need 65 536 rows – clamped, as `bind::fold` does)
+            // (65 535² would fold into exactly 65 535 rows, far more groups than a dispatch may
+            // have; one more or u32::MAX would need 65 536 rows – clamped to one row, as
+            // `bind::fold` does; 2^22 is the most that is folded)
             for (k, (args, want, io_want)) in [
                 ([72_512u32, 1, 1], [65_535u32, 2, 1], 72_512u32),
                 ([70_000, 2, 1], [65_535, 2, 1], 0),
                 ([300, 4, 2], [300, 4, 2], 0),
-                ([65_535 * 65_535, 1, 1], [65_535, 65_535, 1], 65_535 * 65_535),
+                ([1 << 22, 1, 1], [65_535, 65, 1], 1 << 22),
+                ([(1 << 22) + 65_536, 1, 1], [0, 0, 0], 0),
+                ([65_535 * 65_535, 1, 1], [0, 0, 0], 0),
+                ([0x3F80_0000, 1, 1], [0, 0, 0], 0),
+                ([70_000, 70_000, 16], [0, 0, 0], 0),
+                ([70_000, 70_000, 0], [65_535, 65_535, 0], 0),
                 ([65_535 * 65_535 + 1, 1, 1], [65_535, 1, 1], 0),
                 ([u32::MAX, 1, 1], [65_535, 1, 1], 0),
             ]
@@ -306,7 +349,7 @@ mod tests {
                 *iop = 0xDEAD;
                 let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
                 let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
-                let (buf, off) = before(&list, a.as_raw() as usize, 64, io.GetGPUVirtualAddress()).expect("clamped");
+                let (buf, off) = pass(&list, a.as_raw() as usize, 64, io.GetGPUVirtualAddress(), super::super::indirect_guard::max_groups()).expect("clamped");
                 done(&list);
                 list.Close().unwrap();
                 queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
