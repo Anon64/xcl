@@ -23,8 +23,6 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use super::sharded::Sharded;
-
 use serde::Serialize;
 use windows::core::{Interface, PCSTR};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -34,12 +32,23 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows_sys::core::GUID;
 
 use super::layout::{self, Iface};
+use super::sharded::Sharded;
 use crate::stubs;
 use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, E_OUTOFMEMORY, S_FALSE, S_OK};
 
 const DLL: &str = "d3d12_xs.dll";
 const EXTRA_SLOTS: usize = 64;
 const MAX_SCAN: usize = 512;
+
+/// Where `$method` is in the PC interface `$iface` and every later version of it, looked up once
+/// (`slot_of` asks for an object's class, by name, under one lock: a title records thousands of
+/// these calls a frame on many threads).
+macro_rules! pc_slot {
+    ($iface:literal, $method:literal) => {{
+        static SLOT: OnceLock<usize> = OnceLock::new();
+        *SLOT.get_or_init(|| layout::find($iface).and_then(|i| layout::slot(i, $method)).expect("method in layout"))
+    }};
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
@@ -1603,7 +1612,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     // the PC's Map only on a resource it can map: on a reserved one or one without CPU pages it is
     // an invalid call (debug layer 824 / 822) that the runtime answers with E_INVALIDARG
     let hr = if pc_can_map(this) {
-        let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
+        let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Resource", "Map")));
         f(this, sub, range, data)
     } else {
         E_INVALIDARG
@@ -1634,7 +1643,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
 /// Every console resource is CPU-visible memory, a PC texture only in a CPU-visible heap.
 unsafe extern "system" fn res_write_to_subresource(this: *mut c_void, sub: u32, dst_box: *const D3D12_BOX, data: *const c_void, row_pitch: u32, depth_pitch: u32) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_BOX, *const c_void, u32, u32) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "WriteToSubresource")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Resource", "WriteToSubresource")));
     let hr = f(this, sub, dst_box, data, row_pitch, depth_pitch);
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static FAILED: AtomicU64 = AtomicU64::new(0);
@@ -1671,7 +1680,7 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
     if UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
         return;
     }
-    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Resource", "Unmap")));
     f(this, sub, range)
 }
 
@@ -2672,11 +2681,11 @@ macro_rules! as_usize {
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     super::list_x::before_close(this);
     let ext = *(this as *const usize);
-    let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
+    let f: RefFn = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "Close")));
     let hr = f(this) as HRESULT;
     preserve_vtable(this, ext);
     if hr < 0 {
-        let ty: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "GetType")));
+        let ty: RefFn = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "GetType")));
         crate::xlog_warn!("D3D12.X: command list {this:p} (type {}) Close → {:#x}", ty(this), hr as u32);
     }
     hr
@@ -2686,7 +2695,7 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, initial_state: *mut c_void) -> HRESULT {
     let ext = *(this as *const usize);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
-        std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
+        std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "Reset")));
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
@@ -5445,7 +5454,7 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
 /// ClearRenderTargetView: as on the PC (`XCL_TRACE_FRAME`: the colours logged)
 unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *const [f32; 4], n: u32, rects: *const c_void) {
     type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearRenderTargetView")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "ClearRenderTargetView")));
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -5460,7 +5469,7 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
     if super::present::trace_frame() {
@@ -5491,14 +5500,14 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "SetPipelineState")));
     f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
     super::list_x::on_set_pipeline_state(this, pso as usize);
 }
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "ClearState")));
     f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
     super::list_x::on_clear_state(this, pso as usize);
     super::bind::clear_state(this, pso as usize);
@@ -5507,14 +5516,14 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icount: u32, sv: u32, si: u32) {
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawInstanced")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "DrawInstanced")));
     f(this, vcount, icount, sv, si);
 }
 
 unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u32, inst: u32, si: u32, bv: i32, sinst: u32) {
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawIndexedInstanced")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "DrawIndexedInstanced")));
     f(this, icount, inst, si, bv, sinst);
 }
 
@@ -5530,7 +5539,7 @@ unsafe extern "system" fn cl_execute_indirect(
 ) {
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "ExecuteIndirect")));
     f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off);
 }
 
@@ -5787,7 +5796,7 @@ pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
 /// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back
 /// asynchronously (`sparse::readback_after_execute`): the copies back the value covers land first.
 unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
-    let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, slot_of(this, "GetCompletedValue")));
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Fence", "GetCompletedValue")));
     let v = f(this);
     super::sparse::settle_readbacks_try();
     v
@@ -5823,7 +5832,7 @@ unsafe extern "system" fn fence_wait_fired(ctx: *mut c_void, _timed_out: bool) {
 /// (a blocking wait) settles them after it.
 unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
     use windows_sys::Win32::System::Threading::{CreateEventW, RegisterWaitForSingleObject, UnregisterWaitEx, INFINITE, WT_EXECUTEONLYONCE};
-    let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetEventOnCompletion")));
+    let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Fence", "SetEventOnCompletion")));
     if event.is_null() || !super::sparse::readbacks_async() {
         let hr = f(this, value, event);
         if event.is_null() {
@@ -5856,7 +5865,7 @@ unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value
 
 /// Fence::Signal (CPU)
 unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT {
-    let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
+    let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Fence", "Signal")));
     let hr = f(this, value);
     super::fence_x::note_cpu_signal(this as usize);
     hr
@@ -5864,7 +5873,7 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
 
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
+    let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12CommandQueue", "ExecuteCommandLists")));
     if n == 0 || lists.is_null() {
         f(this, n, lists);
         stop_if_device_removed();

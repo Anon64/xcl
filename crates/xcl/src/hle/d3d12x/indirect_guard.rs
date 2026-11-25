@@ -315,7 +315,8 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     };
     l.ResourceBarrier(&[written]);
     l.SetComputeRootSignature(&g.rs);
-    l.SetPipelineState(&g.pso);
+    // (past the hook of a title's call: what the title bound stays the list's pipeline)
+    super::list_x::set_compute_pipeline(list, g.pso.as_raw());
     // (the title's address, for the log; a buffer that is not in unified memory: the GPU's)
     let at = title.map_or(va, |t| t as u64);
     let constants = [max_groups(), slot, id as u32, (id >> 32) as u32, at as u32, (at >> 32) as u32, kind as u32];

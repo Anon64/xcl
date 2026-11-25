@@ -28,6 +28,11 @@ impl Hasher for Spread {
     }
 }
 
+/// Which of `n` parts an address is in.
+pub(super) fn part(address: usize, n: usize) -> usize {
+    (spread(address) >> 40) as usize % n
+}
+
 fn spread(address: usize) -> u64 {
     let x = (address as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     x ^ (x >> 29)
@@ -47,7 +52,7 @@ impl<V> Sharded<V> {
     }
 
     fn shard(&self, key: usize) -> MutexGuard<'_, Option<Map<V>>> {
-        self.0[(spread(key) >> 40) as usize % SHARDS].0.lock().unwrap()
+        self.0[part(key, SHARDS)].0.lock().unwrap()
     }
 
     pub fn insert(&self, key: usize, value: V) -> Option<V> {

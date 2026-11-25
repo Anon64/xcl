@@ -8,7 +8,6 @@
 //! binds the ABI root signature, writes the user SGPRs (`io`) and the argument table to
 //! unified memory and dispatches. That memory stays until the list's allocator is reset.
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1052,7 +1051,12 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     }
     let real = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
-    list.SetPipelineState(pc);
+    if gfx {
+        list.SetPipelineState(pc);
+    } else {
+        // (resolved here, and a compute pipeline has none of the state the hook of a title's call keeps)
+        super::list_x::set_compute_pipeline(this, real);
+    }
     Ok(())
 }
 
