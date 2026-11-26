@@ -9001,6 +9001,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // textures in title memory the CPU wrote since: uploaded again first
     let submit_t0 = std::time::Instant::now();
     super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
+    let t_lists = std::time::Instant::now();
+    super::submit_cost::call(t_lists - submit_t0);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
@@ -9013,12 +9015,16 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::gpu_profile::note_queue(this);
+    let t_exec = std::time::Instant::now();
+    super::submit_cost::lists(t_exec - t_lists);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         // a list still on the GPU from its previous submit: that one first (the PC does not take
         // a list again before then)
+        let t = std::time::Instant::now();
         if super::alloc_pool::note_resubmits(this, chunk) > 0 {
             super::alloc_pool::wait_for_previous_submits(chunk);
         }
+        super::submit_cost::previous(t.elapsed());
         let t = std::time::Instant::now();
         {
             let _in_driver = super::watch::in_driver(super::watch::Call::Execute);
@@ -9035,10 +9041,13 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         super::list_x::note_submitted(this);
         super::submit_cost::after(t1.elapsed());
     });
+    let t_end = std::time::Instant::now();
+    super::submit_cost::exec(t_end - t_exec);
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
+    super::submit_cost::end(t_end.elapsed());
     super::submit_cost::done(submit_t0);
 }
 

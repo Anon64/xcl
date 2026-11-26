@@ -2502,8 +2502,11 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
             sync_trace(|| format!("q{} submit lists {start}..{i}", queue_id(queue as usize)));
             submit(&lists[start..i]);
         }
+        let t = Instant::now();
         wait_all_on(queue, waits, list_writes);
+        let t_waited = Instant::now();
         mapped_after_wait(queue);
+        super::submit_cost::split(t_waited - t, t_waited.elapsed());
         start = i;
     }
     if start < lists.len() {

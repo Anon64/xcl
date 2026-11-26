@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use windows::core::Interface;
@@ -866,6 +866,7 @@ static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
     let g = lock_state();
+    let _held = holding(Holder::Other);
     let Some(s) = g.as_ref() else { return (0, 0) };
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
     let quarantined: usize = s.quarantined.iter().map(|b| b.tiles.len()).sum();
@@ -2256,7 +2257,12 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() && imms.is_empty() {
         return;
     }
+    let t0 = super::look_stats::deep().then(std::time::Instant::now);
     let mut g = lock_state();
+    let _held = holding(Holder::After);
+    if let Some(t0) = t0 {
+        HELD.add(HELD_AFTER_WAIT, t0.elapsed().as_micros() as u64);
+    }
     let Some(s) = g.as_mut() else { return };
     s.note_queue(queue);
     s.after_execute(queue, ranges, imms);
@@ -2288,7 +2294,9 @@ pub unsafe fn settle_readbacks() {
     if RB_PENDING.load(Ordering::Acquire) == 0 {
         return;
     }
-    if let Some(s) = STATE.lock().unwrap().as_mut() {
+    let mut g = STATE.lock().unwrap();
+    let _held = holding(Holder::Settle);
+    if let Some(s) = g.as_mut() {
         s.drain_readbacks(Drain::TitleDone);
     }
 }
@@ -2310,6 +2318,7 @@ pub unsafe fn settle_readbacks_within(ms: u64) -> bool {
     let t0 = std::time::Instant::now();
     loop {
         if let Ok(mut g) = STATE.try_lock() {
+            let _held = holding(Holder::Settle);
             if let Some(s) = g.as_mut() {
                 s.drain_readbacks_spin(Drain::TitleDone, 300);
             }
@@ -2330,6 +2339,7 @@ fn start_readback_thread() {
         let _ = std::thread::Builder::new().name("xcl-sparse-readback".into()).spawn(|| loop {
             std::thread::sleep(std::time::Duration::from_micros(500));
             if let Ok(mut g) = STATE.try_lock() {
+                let _held = holding(Holder::ReadbackThread);
                 if let Some(s) = g.as_mut().filter(|s| !s.rb_jobs.is_empty() || !s.imm_jobs.is_empty()) {
                     unsafe { s.drain_readbacks(Drain::Finished) };
                 }
@@ -2418,6 +2428,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         return;
     }
     let mut g = lock_state();
+    let _held = holding(Holder::CpuRead);
     let Some(s) = g.as_mut() else { return };
     if s.window_index(va).is_none() {
         return;
@@ -2491,6 +2502,7 @@ pub unsafe fn committed(a: usize, n: usize) {
     }
     super::title_textures::mark_hot(a, n);
     let mut g = lock_in_turn(&STATE, &SUBMITS_WAITING);
+    let _held = holding(Holder::Commits);
     forget_released(&mut g);
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
@@ -2508,6 +2520,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
         return;
     }
     let mut g = lock_in_turn(&STATE, &SUBMITS_WAITING);
+    let _held = holding(Holder::Commits);
     forget_released(&mut g);
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
@@ -2575,6 +2588,7 @@ pub fn send_pending() {
         }
         match STATE.try_lock() {
             Ok(mut g) => {
+                let _held = holding(Holder::TileMaps);
                 if let Some(s) = g.as_mut() {
                     unsafe { s.flush_pending() };
                 }
@@ -2972,6 +2986,7 @@ pub unsafe fn moved(tiles: &[usize], from: usize, to: usize, whole: bool) {
         return;
     }
     let mut g = lock_in_turn(&STATE, &SUBMITS_WAITING);
+    let _held = holding(Holder::Sources);
     forget_released(&mut g);
     let Some(s) = g.as_mut() else { return };
     for &w in tiles {
@@ -3083,6 +3098,7 @@ pub unsafe fn source_decommitted(a: usize, n: usize) {
         return;
     }
     let mut g = lock_in_turn(&STATE, &SUBMITS_WAITING);
+    let _held = holding(Holder::Sources);
     forget_released(&mut g);
     let Some(s) = g.as_mut() else { return };
     s.source_decommitted_in(a, n);
@@ -3120,6 +3136,7 @@ pub fn forget_mirrors(a: usize, n: usize) {
         return;
     }
     let mut g = lock_in_turn(&STATE, &SUBMITS_WAITING);
+    let _held = holding(Holder::Sources);
     forget_released(&mut g);
     let Some(s) = g.as_mut() else { return };
     unsafe { s.forget_mirrors_in(a, end) };
@@ -3708,7 +3725,12 @@ impl State {
 /// tiles of GPU views show (never the views' own addresses): where a CPU write has to reach the
 /// GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
+    let t0 = super::look_stats::deep().then(std::time::Instant::now);
     let g = lock_state();
+    let _held = holding(Holder::Ranges);
+    if let Some(t0) = t0 {
+        HELD.add(HELD_RANGES_WAIT, t0.elapsed().as_micros() as u64);
+    }
     let Some(s) = g.as_ref() else { return Vec::new() };
     s.watched_ranges()
 }
@@ -3840,7 +3862,10 @@ unsafe fn run_copies(jobs: &mut Vec<(usize, usize, usize)>, staging: *mut u8) {
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
+    // (who had the lock when this began to wait for it: `XCL_LOOK_STATS=2`)
+    let behind = (HOLDER.load(Ordering::Relaxed) as usize).min(HOLDERS - 1);
     let mut g = lock_first(&STATE, &SUBMITS_WAITING);
+    let _held = holding(Holder::Submit);
     let t_got = super::look_stats::deep().then(std::time::Instant::now);
     forget_released(&mut g);
     let Some(s) = g.as_mut() else { return };
@@ -3856,6 +3881,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     if let Some(t_got) = t_got {
         LOCK_SPLIT.add(LS_WAIT, (t_got - t0).as_micros() as u64);
         LOCK_SPLIT.add(LS_ALL, waited);
+        HELD.add(HOLDERS + behind, (t_got - t0).as_micros() as u64);
     }
     s.before_execute_on(queue, dirty, page);
 }
@@ -3923,6 +3949,7 @@ fn view_stats() -> [u64; VS] {
     let mut x = [0u64; VS];
     x[0] = VIEW_ASKED.load(Ordering::Relaxed);
     let g = lock_state();
+    let _held = holding(Holder::Other);
     let Some(s) = g.as_ref() else { return x };
     let d = &s.diag;
     let rest = [s.counts.fills, s.counts.given_back, d.kept, d.back[0], d.back[1], d.back[2], d.back[3], d.back_bytes, d.submits, d.deferred];
@@ -4050,7 +4077,8 @@ impl State {
             LOCK_SPLIT.add(LS_UNMAP, us(t_map, t_locked));
             LOCK_SPLIT.add(LS_UNMAP_TILES, work(2));
             if LOCK_SPLIT.add(LS_SUBMITS, 1) >= 1024 {
-                crate::xlog_info!("D3D12.X: {}", lock_split_line(&LOCK_SPLIT.take()));
+                let x = LOCK_SPLIT.take();
+                crate::xlog_info!("D3D12.X: {}; {}", lock_split_line(&x), holders_line(&HELD.take(), x[LS_SUBMITS]));
             }
         }
         let zero_runs = zero_runs(std::mem::take(&mut s.to_zero));
@@ -4195,6 +4223,7 @@ impl State {
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
     let mut g = lock_state();
+    let _held = holding(Holder::Buffers);
     let s = g.as_mut()?;
     let start = va & !(TILE - 1);
     let delta = va - start;
@@ -4249,6 +4278,81 @@ fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
     g
 }
 
+/// Who holds `STATE` (`HOLDER`): the time a submit waits for it is put down to the holder it found
+/// there when it began to wait, and each holder's own time under it is summed (`XCL_LOOK_STATS=2`,
+/// with the sparse lock split line).
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum Holder {
+    Nobody = 0,
+    Submit,
+    After,
+    Ranges,
+    Settle,
+    ReadbackThread,
+    TileMaps,
+    Commits,
+    Sources,
+    Buffers,
+    CpuRead,
+    Other,
+}
+const HOLDERS: usize = 12;
+const HOLDER_NAMES: [&str; HOLDERS] = [
+    "nobody",
+    "submits",
+    "after stages",
+    "ranges",
+    "copies back settled",
+    "readback thread",
+    "put-off mappings",
+    "commits",
+    "GPU-view sources",
+    "placed buffers",
+    "CPU reads",
+    "other",
+];
+static HOLDER: AtomicU8 = AtomicU8::new(0);
+/// [µs each holder held the lock], [µs submits waited behind each], then the submit's other
+/// waits for it: in its after stage, and for its ranges
+static HELD: super::look_stats::Sums<{ 2 * HOLDERS + 2 }> = super::look_stats::Sums::new();
+const HELD_AFTER_WAIT: usize = 2 * HOLDERS;
+const HELD_RANGES_WAIT: usize = 2 * HOLDERS + 1;
+
+/// `STATE` is held by its holder until this is dropped (declared after the guard: it goes first).
+struct Holding(Holder, Option<std::time::Instant>);
+
+fn holding(who: Holder) -> Holding {
+    HOLDER.store(who as u8, Ordering::Relaxed);
+    Holding(who, super::look_stats::deep().then(std::time::Instant::now))
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        HOLDER.store(Holder::Nobody as u8, Ordering::Relaxed);
+        if let Some(t) = self.1 {
+            HELD.add(self.0 as usize, t.elapsed().as_micros() as u64);
+        }
+    }
+}
+
+/// The holders part of the sparse lock split line (`HELD`'s sums over `submits`), in ms a submit:
+/// who held the lock how long, and whom the submits' waits for it were behind.
+fn holders_line(x: &[u64; 2 * HOLDERS + 2], submits: u64) -> String {
+    let n = submits.max(1) as f64;
+    let part = |from: usize| -> String {
+        let items: Vec<String> = (0..HOLDERS).filter(|&k| x[from + k] > 0).map(|k| format!("{} {:.3}", HOLDER_NAMES[k], x[from + k] as f64 / n / 1e3)).collect();
+        if items.is_empty() { "none".into() } else { items.join(", ") }
+    };
+    format!(
+        "held by: {} ms a submit; waits behind: {} ms a submit; the submit's other waits for it: after stage {:.3}, ranges {:.3} ms a submit",
+        part(0),
+        part(HOLDERS),
+        x[HELD_AFTER_WAIT] as f64 / n / 1e3,
+        x[HELD_RANGES_WAIT] as f64 / n / 1e3
+    )
+}
+
 fn forget_released(g: &mut Option<State>) {
     let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap());
     let Some(s) = g.as_mut() else { return };
@@ -4265,7 +4369,10 @@ fn forget_released(g: &mut Option<State>) {
 pub fn forget_buffer(res: usize) {
     FORGOTTEN.lock().unwrap().push(res);
     match STATE.try_lock() {
-        Ok(mut g) => forget_released(&mut g),
+        Ok(mut g) => {
+            let _held = holding(Holder::Other);
+            forget_released(&mut g)
+        }
         Err(std::sync::TryLockError::WouldBlock) => {}
         Err(e) => panic!("sparse state: {e}"),
     }
@@ -4375,6 +4482,21 @@ mod tests {
         x[LS_ALL] = 0;
         assert!(lock_split_line(&x).contains("rest 0.000 ms"));
         assert!(lock_split_line(&[0; 11]).starts_with("sparse lock split (0 submits): wait 0.000 ms"));
+    }
+
+    /// The holders part of the line: only the holders with time, as averages a submit.
+    #[test]
+    fn the_holders_line_names_who_held_the_lock_and_whom_the_waits_were_behind() {
+        let mut x = [0u64; 2 * HOLDERS + 2];
+        x[Holder::Submit as usize] = 4_000;
+        x[Holder::TileMaps as usize] = 800;
+        x[HOLDERS + Holder::Settle as usize] = 2_000;
+        x[HELD_AFTER_WAIT] = 400;
+        assert_eq!(
+            holders_line(&x, 4),
+            "held by: submits 1.000, put-off mappings 0.200 ms a submit; waits behind: copies back settled 0.500 ms a submit; the submit's other waits for it: after stage 0.100, ranges 0.000 ms a submit"
+        );
+        assert!(holders_line(&[0; 2 * HOLDERS + 2], 0).starts_with("held by: none ms a submit; waits behind: none"));
     }
 
     /// A device of the test's own (a software one without a GPU).
