@@ -609,6 +609,32 @@ impl Uma {
         }
     }
 
+    /// `sparse_alloc` for memory shaders never address with 32 bits: windows 1+ first (as
+    /// `sparse_reserve`), window 0 only when they have no room – it stands for the console's low
+    /// 4 GiB, where a title's own descriptor heaps must lie (`console_heap::title_memory`).
+    /// Above a window the same as `sparse_alloc`.
+    pub fn sparse_alloc_above(&self, size: usize, align: usize) -> Option<(usize, usize)> {
+        if size <= WINDOW && self.has_sparse() {
+            let size = size.max(1).checked_next_multiple_of(GRAIN)?;
+            let align = align.max(GRAIN).checked_next_power_of_two()?;
+            let above_0 = (self.base + WINDOW).max(self.title_sparse_start());
+            if let Some(at) = take_sparse_in(&mut self.sparse_free.lock().unwrap(), above_0, self.sparse_end(), size, align, true) {
+                return Some((at, size));
+            }
+        }
+        self.sparse_alloc(size, align)
+    }
+
+    /// Diagnostic: the free bytes of sparse window `k` the title may take (not `desc_range`), in
+    /// all and the largest run.
+    pub fn sparse_free_in(&self, k: usize) -> (usize, usize) {
+        let (lo, hi) = (self.base + k * WINDOW, self.base + (k + 1) * WINDOW);
+        let lo = if k == 0 { lo.max(self.title_sparse_start()) } else { lo };
+        let g = self.sparse_free.lock().unwrap();
+        let runs = g.0.iter().map(|(&o, &l)| (o.max(lo), (o + l).min(hi))).filter(|&(a, e)| a < e).map(|(a, e)| e - a);
+        runs.fold((0, 0), |(all, big), n| (all + n, big.max(n)))
+    }
+
     /// The bytes of the sparse reservation starting at `p` (it is gone after this).
     pub fn sparse_release(&self, p: usize) -> Option<usize> {
         give_back(&mut self.sparse_free.lock().unwrap(), p)
@@ -1419,6 +1445,63 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// The Series X run's plan (`XCL_UMA_WINDOWS=16`, 4095 MB, a 512 MB coherent window) and where
+    /// its first graphics memory goes: 3 sparse windows, the coherent one, 6 view windows, 6
+    /// empty, and its GPU heaps of 1172 / 2199 / 563 / 596 MB and its 38 MB view heap at the
+    /// addresses that run logged (0xf2e00000 into window 0). Nothing of the title memory size
+    /// goes into the plan: the Series S profile gets the same one.
+    #[test]
+    fn the_series_x_plan_is_pinned() {
+        let u = Uma::for_runtime_windows(4095 << 20, RUNTIME_COMMITTED_CAP, MAX_HEAP_WINDOWS).expect("16-window aperture");
+        let b = u.base();
+        assert_eq!(b % (MAX_HEAP_WINDOWS * WINDOW), 0);
+        use WindowKind::*;
+        let mut kinds = vec![Sparse, Sparse, Sparse, Committed(512 << 20)];
+        kinds.extend([View; VIEW_WINDOWS]);
+        kinds.extend([None; 6]);
+        assert_eq!(u.kinds, kinds);
+        assert_eq!((u.shader_windows(), u.windows(), u.size()), (16, 1, 512 << 20));
+        assert_eq!(u.desc_range(), Some((b + GRAIN, b + GRAIN + DESC_HEADROOM)));
+        assert_eq!((u.title_sparse_start(), u.sparse_end()), (b + 0x2001_0000, b + 3 * WINDOW));
+        for (p, k) in [(0xf2e0_0000, Some(0)), (WINDOW + 0x140_0000, Some(1)), (3 * WINDOW, Some(3)), (3 * WINDOW + (512 << 20), Option::None), (4 * WINDOW, Some(4)), (10 * WINDOW, Option::None)] {
+            assert_eq!(u.window_of(b + p), k, "{p:#x}");
+        }
+        // the GPU heaps (2 MB pages, rounded as `kernelx::VirtualAlloc` does), then the view heap
+        let at: Vec<usize> = [1172usize, 2199, 563, 596].iter().map(|&mb| u.sparse_alloc((mb << 20).next_multiple_of(2 << 20), 2 << 20).unwrap().0 - b).collect();
+        assert_eq!(at, [0x2020_0000, 0x6960_0000, WINDOW, WINDOW + (564 << 20)]);
+        assert_eq!(u.sparse_alloc(0x260_0000, GRAIN).map(|(a, _)| a - b), Some(0xf2e0_0000));
+        // the home of the Series X run's page pool (99776 pages: more than a window) goes where it went
+        let pool = 99776 * GRAIN;
+        let above = u.sparse_alloc_above(pool, GRAIN);
+        assert_eq!(above.map(|(a, n)| (a - b, n)), Some((WINDOW + (1160 << 20), pool)));
+        assert_eq!(u.sparse_release(above.unwrap().0), Some(pool));
+        assert_eq!(u.sparse_alloc(pool, GRAIN), above);
+    }
+
+    /// Memory no shader addresses with 32 bits keeps out of window 0 while windows 1+ have room,
+    /// and gets window 0 when they have none; above a window it goes as `sparse_alloc`'s.
+    #[test]
+    fn sparse_alloc_above_keeps_window_0_for_the_title() {
+        let u = Uma::for_runtime_windows(16 << 20, RUNTIME_COMMITTED_CAP, MAX_HEAP_WINDOWS).expect("16-window aperture");
+        let b = u.base();
+        let (h, n) = u.sparse_alloc_above(664 << 20, GRAIN).unwrap();
+        assert_eq!((h, n), (b + WINDOW, 664 << 20));
+        // window 0 still has the room a 38 MB view heap needs after 2.9 GB of GPU heaps
+        let heaps = u.sparse_alloc(2892 << 20, 2 << 20).unwrap();
+        assert_eq!(u.window_of(heaps.0), Some(0));
+        assert_eq!(u.sparse_alloc(0x260_0000, GRAIN).map(|(a, _)| u.window_of(a)), Some(Some(0)));
+        let used = (2892 << 20) + 0x260_0000;
+        assert_eq!(u.sparse_free_in(0), (WINDOW - 0x2001_0000 - used, WINDOW - 0x2020_0000 - used));
+        assert_eq!(u.sparse_free_in(1), (WINDOW - (664 << 20), WINDOW - (664 << 20)));
+        // windows 1..2 full: window 0
+        let rest = u.sparse_reserve(2 * WINDOW - (664 << 20)).unwrap();
+        assert_eq!(u.window_of(rest), Some(1));
+        let (w0, _) = u.sparse_alloc_above(GRAIN, GRAIN).unwrap();
+        assert_eq!(u.window_of(w0), Some(0));
+        assert!(w0 >= u.title_sparse_start(), "never the descriptor headroom");
+        assert!(u.sparse_alloc_above(WINDOW + GRAIN, GRAIN).is_none(), "no room above a window");
     }
 
     /// With 16 windows nothing of Windows' lands in the aperture: shaders read every window of
