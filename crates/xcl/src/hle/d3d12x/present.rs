@@ -942,13 +942,17 @@ unsafe impl Send for Presenter {}
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
 
 unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+    transition_sub(res, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after)
+}
+
+unsafe fn transition_sub(res: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
                 pResource: std::mem::transmute_copy(res),
-                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                Subresource: sub,
                 StateBefore: before,
                 StateAfter: after,
             }),
@@ -1146,6 +1150,20 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
                 dumps.push(FrameDump { _source: twin, buffer, footprint, format: d.Format, tag });
             }
         }
+        // and the small 3D textures (`lut3d`), from the state the title's work left them in
+        for (tag, tex, d, state) in super::lut3d::to_dump() {
+            let moved = super::lut3d::needs_transition(state);
+            if moved {
+                p.list.ResourceBarrier(&[transition_sub(&tex, 0, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            }
+            let copied = readback_copy(&p.list, &tex, &d);
+            if moved {
+                p.list.ResourceBarrier(&[transition_sub(&tex, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
+            }
+            if let Some((buffer, footprint)) = copied {
+                dumps.push(FrameDump { _source: tex, buffer, footprint, format: d.Format, tag });
+            }
+        }
     }
     let mut composited = false;
     if resolved.len() > 1 {
@@ -1276,6 +1294,10 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
                 for dump in p.dumps.drain(..) {
                     if dump.tag.starts_with("twin") {
                         super::depth_uav::log_values(&dump.buffer, &dump.footprint, &dump.tag);
+                        continue;
+                    }
+                    if dump.tag.starts_with("lut") {
+                        super::lut3d::log_values(&dump.buffer, &dump.footprint, &dump.tag);
                         continue;
                     }
                     if dump.tag.starts_with("target") {
@@ -1434,7 +1456,7 @@ fn texel_rgb(format: DXGI_FORMAT, t: &[u8]) -> Option<[u8; 3]> {
 }
 
 /// An IEEE half float.
-fn half_float(h: u16) -> f32 {
+pub(super) fn half_float(h: u16) -> f32 {
     let (sign, e, m) = (if h >> 15 != 0 { -1.0f32 } else { 1.0 }, (h >> 10 & 31) as i32, (h & 0x3FF) as f32 / 1024.0);
     sign * match e {
         0 => m * 2f32.powi(-14),
@@ -1501,7 +1523,7 @@ unsafe fn busiest_rt() -> Option<ID3D12Resource> {
 }
 
 /// an 11- / 10-bit unsigned float (5-bit exponent) -> f32
-fn small_float(v: u32, mantissa_bits: u32) -> f32 {
+pub(super) fn small_float(v: u32, mantissa_bits: u32) -> f32 {
     let (e, m) = (v >> mantissa_bits, v & ((1 << mantissa_bits) - 1));
     let m = m as f32 / (1u32 << mantissa_bits) as f32;
     match e {

@@ -4736,7 +4736,7 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         plan
     });
     // the states uploads into textures kept in step start from once this list has run
-    if super::title_textures::any() {
+    if super::title_textures::any() || super::lut3d::on() {
         let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
             out.iter().filter(|b| b[0] == 0).map(|b| ((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32))).collect();
         super::title_textures::note_transitions(this as usize, &t);
@@ -4872,6 +4872,19 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
         super::title_textures::note_gpu_write(this as usize, r);
+        super::lut3d::wrote(r, true, || {
+            let from = src.as_ref().map_or("nothing".to_string(), |sl| {
+                let sr: usize = transmute_copy(&sl.pResource);
+                if sl.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT {
+                    let f = sl.Anonymous.PlacedFootprint;
+                    format!("buffer {sr:#x} (title address {:?}) at {:#x}, footprint format {} {}x{}x{} row pitch {}", real::title_address(sr).map(|a| format!("{a:#x}")), f.Offset, f.Footprint.Format.0, f.Footprint.Width, f.Footprint.Height, f.Footprint.Depth, f.Footprint.RowPitch)
+                } else {
+                    format!("subresource {} of {sr:#x}", sl.Anonymous.SubresourceIndex)
+                }
+            });
+            let b = bx.as_ref().map(|b| (b.left, b.top, b.front, b.right, b.bottom, b.back));
+            format!("CopyTextureRegion into subresource {} at ({x}, {y}, {z}) from {from}, box {b:?}", d.Anonymous.SubresourceIndex)
+        });
         if super::present::trace_frame() {
             if let Some(va) = super::title_textures::address(r) {
                 static N: AtomicU64 = AtomicU64::new(0);
@@ -5094,6 +5107,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(this as usize, dst);
+    super::lut3d::wrote(dst, true, || format!("CopyResource from {src:#x}"));
     if super::present::trace_frame() {
         trace_watched_copy("CopyResource", dst, src);
     }

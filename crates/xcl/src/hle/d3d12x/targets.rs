@@ -25,6 +25,7 @@
 //! own after the dump: `target<k>_<stage>_<key>.hlsl` and `.rdna2.txt` (the disassembly)
 //! go next to the pictures. Pipelines are known only once made through
 //! CreateGraphicsPipelineState (or a stream of console VS / PS) with the switch on.
+//! The switch also follows 3D textures and reads the small ones back at a dump (`lut3d`).
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -187,6 +188,9 @@ pub unsafe fn note_draw(list: *mut c_void, outcome: usize) {
     let mut targets: Vec<usize> = super::list_x::bound_render_targets(list).into_iter().filter_map(super::present::rtv_resource).collect();
     targets.sort_unstable();
     targets.dedup();
+    for &t in &targets {
+        super::lut3d::wrote(t, false, || format!("drawn into as a render target (pipeline {:#x})", super::bind::bound_pso(list)));
+    }
     let depth = super::list_x::bound_dsv(list).and_then(super::present::rtv_resource);
     let pso = super::bind::bound_pso(list);
     let first = {

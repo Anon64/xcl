@@ -896,6 +896,7 @@ pub fn any() -> bool {
 /// The title recorded `transitions` on PC list `list`: those of textures kept in step are noted
 /// for when the list is submitted.
 pub fn note_transitions(list: usize, transitions: &[Transition]) {
+    super::lut3d::note_transitions(list, transitions);
     if !any() || transitions.is_empty() {
         return;
     }
@@ -911,6 +912,7 @@ pub fn note_transitions(list: usize, transitions: &[Transition]) {
 /// PC list `list` starts a new recording (made, reset, released): its noted transitions and
 /// writes go.
 pub fn list_reset(list: usize) {
+    super::lut3d::list_reset(list);
     {
         let mut g = LIST_NOTES.lock().unwrap();
         if !g.is_empty() {
@@ -927,6 +929,7 @@ pub fn list_reset(list: usize) {
 /// states their transitions leave them in, and those they write are the GPU's from this submit
 /// on (`Entry::written_call`).
 pub fn submitted(lists: &[*mut c_void]) {
+    super::lut3d::submitted(lists);
     let notes: Vec<Transition> = {
         let g = LIST_NOTES.lock().unwrap();
         if g.is_empty() { Vec::new() } else { lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().copied().collect() }
@@ -962,7 +965,7 @@ fn subresource_count(tex: &xg::Texture) -> usize {
 
 /// `states` (one for all `n` subresources, or one each) after a transition of subresource `sub`
 /// (or all of them) to `after`; a subresource the texture does not have is ignored.
-fn apply_transition(states: &mut Vec<D3D12_RESOURCE_STATES>, n: usize, sub: u32, after: D3D12_RESOURCE_STATES) {
+pub(super) fn apply_transition(states: &mut Vec<D3D12_RESOURCE_STATES>, n: usize, sub: u32, after: D3D12_RESOURCE_STATES) {
     if sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || (n <= 1 && sub == 0) {
         *states = vec![after];
         return;

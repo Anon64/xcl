@@ -863,7 +863,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     // borrowed (ManuallyDrop fields, nothing released)
                     let mut b: Vec<u64> = vec![0; 4 * m];
                     std::ptr::copy_nonoverlapping(sent.as_ptr() as *const u8, b.as_mut_ptr() as *mut u8, 32 * m);
-                    if super::title_textures::any() {
+                    if super::title_textures::any() || super::lut3d::on() {
                         // each barrier: type | flags, resource, subresource | before, after
                         let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
                             b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();

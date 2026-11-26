@@ -1898,6 +1898,10 @@ unsafe extern "system" fn res_write_to_subresource(this: *mut c_void, sub: u32, 
             hr as u32
         );
     }
+    super::lut3d::wrote(this as usize, false, || {
+        let b = dst_box.as_ref().map(|b| (b.left, b.top, b.front, b.right, b.bottom, b.back));
+        format!("WriteToSubresource({sub}, box {b:?}, row pitch {row_pitch}, depth pitch {depth_pitch}) by the CPU → {:#x}", hr as u32)
+    });
     hr
 }
 
@@ -1968,6 +1972,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::vram::forget(this as usize);
         super::depth_uav::forget(this as usize);
         super::title_textures::forget(this as usize);
+        super::lut3d::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         // a buffer may be over a heap of pages that are freed next; a texture, and a buffer of XCL's
         // in video memory (or over a GPU view's tiles), is not
@@ -2631,6 +2636,9 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         super::console_heap::publish(&slot, false, res as usize);
     }
     super::console_heap::note_resource(&slot, res as usize);
+    if res.is_null() || desc.as_ref().is_some_and(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+        super::lut3d::slot_reused(slot.index, cpu, res as usize, || format!("a shader resource view of {res:p} (a buffer or none)"));
+    }
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 24 {
@@ -2661,6 +2669,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
     }
     let rdesc = r.GetDesc();
+    super::lut3d::viewed(res as usize, &rdesc, desc.as_ref(), slot.index, cpu);
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
         Some(t) => super::console_heap::write(&slot, &t),
         None => {
@@ -3018,6 +3027,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     };
     let Some(slot) = super::console_heap::slot(cpu) else { return pc_uav(cpu) };
     pc_uav(slot.pc_uav);
+    super::lut3d::slot_reused(slot.index, cpu, res as usize, || format!("an unordered access view of {res:p} (its companion view)"));
     super::console_heap::publish(&slot, true, if no_uav { 0 } else { res as usize });
     super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
@@ -3059,6 +3069,10 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         }
         None => (rd.Format, resource_dim_to_view(&rd), rd.DepthOrArraySize as u32, 0),
     };
+    super::lut3d::wrote(res as usize, false, || {
+        let first = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE3D).map_or(0, |v| v.Anonymous.Texture3D.FirstWSlice);
+        format!("an unordered access view made in console slot {cpu:#x} (T# index {}, the UAV at + 1): format {}, mip {mip}, depth slices {first} (+{})", slot.index, format.0, array as i32)
+    });
     let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
         note_buffer_view();
         return super::console_heap::write(&slot, &[0; 8]);
@@ -3187,6 +3201,7 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     let hr = dev_create_committed_resource(this, props, flags, desc, st as usize, clear, riid, ppv);
     if hr >= 0 && pc_full.is_some() && !ppv.is_null() && !(*ppv).is_null() {
         super::depth_uav::note_created(*ppv, &(console_desc as *const [u8; 0x38]).read_unaligned(), None, st);
+        super::lut3d::created("CreateCommittedResource (a PC resource: not in the title's memory)", *ppv, Some(&(console_desc as *const [u8; 0x38]).read_unaligned()), None, false, st);
     }
     if hr < 0 {
         let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
@@ -3583,6 +3598,16 @@ pub(super) const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 |
 /// buffers-only heap) is made the PC's way (`device_x::pc_resource_desc`, the console's state
 /// bits dropped). Logged with the console's values.
 pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = placed_in_heap_x(this, heap, offset, desc, state, clear, riid, ppv);
+    if hr >= 0 && super::lut3d::on() && !ppv.is_null() && desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
+        let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+        super::lut3d::created(&format!("CreatePlacedResource (heap {heap:#x} at {offset:#x}: the PC's memory, not kept in step)"), *ppv, Some(&x), None, false, state as u32 & PC_RESOURCE_STATES);
+    }
+    hr
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn placed_in_heap_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     // the clear value in the PC's format of the resource (D3D12 wants the two to match)
     let mut clear_buf = [0u8; 24];
     let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
@@ -3756,12 +3781,21 @@ unsafe fn is_reserved(res: *mut c_void) -> bool {
 
 /// CreateReservedResource
 pub(super) unsafe extern "system" fn dev_create_reserved_resource(this: *mut c_void, a1: usize, a2: usize, a3: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    note_reserved(pc_create_reserved_resource(this, a1, a2, a3, riid, ppv), ppv)
+    reserved_3d(note_reserved(pc_create_reserved_resource(this, a1, a2, a3, riid, ppv), ppv), ppv, a2)
 }
 
 /// CreateReservedResource1
 pub(super) unsafe extern "system" fn dev_create_reserved_resource1(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    note_reserved(pc_create_reserved_resource1(this, a1, a2, a3, a4, riid, ppv), ppv)
+    reserved_3d(note_reserved(pc_create_reserved_resource1(this, a1, a2, a3, a4, riid, ppv), ppv), ppv, a2)
+}
+
+/// `XCL_DUMP_TARGETS`: a reserved 3D texture (XCL's own for a placed one too: that placement's
+/// line follows)
+unsafe fn reserved_3d(hr: HRESULT, ppv: *mut *mut c_void, state: usize) -> HRESULT {
+    if hr >= 0 && super::lut3d::on() && !ppv.is_null() {
+        super::lut3d::created("CreateReservedResource (tiles mapped by whoever made it)", *ppv, None, None, false, state as u32);
+    }
+    hr
 }
 creator!(dev_create_heap_pc, "CreateHeap", Kind::Heap, [a1]);
 
@@ -8244,6 +8278,10 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
     let desc = copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
     f(this, res, desc, handle);
     super::present::note_rtv(handle, res);
+    super::lut3d::wrote(res as usize, false, || {
+        let v = copy.filter(|c| c.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE3D).map(|c| (c.Format.0, c.Anonymous.Texture3D));
+        format!("a render target view made ({handle:#x}): {}", v.map_or("the default view".into(), |(f, t)| format!("format {f}, mip {}, depth slices {} (+{})", t.MipSlice, t.FirstWSlice, t.WSize as i32)))
+    });
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -8264,6 +8302,11 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
         }
         if let Some(r) = super::present::rtv_resource(rtv) {
             super::present::note_use(r, super::present::USE_CLEAR);
+        }
+    }
+    if super::lut3d::on() {
+        if let Some(r) = super::present::rtv_resource(rtv) {
+            super::lut3d::wrote(r, false, || format!("ClearRenderTargetView {rtv:#x} to {:?}, {n} rects", color.as_ref()));
         }
     }
     f(this, rtv, color, n, rects)

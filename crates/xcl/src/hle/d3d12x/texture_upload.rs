@@ -481,6 +481,18 @@ unsafe fn plan_item(dev: &ID3D12Device, k: usize, it: &Item, at: &mut u64, out: 
         for (i, l) in c.levels.iter().enumerate() {
             push(0, i, Rect { x0: 0, y0: 0, x1: l.width, y1: l.height }, l.depth);
         }
+        super::lut3d::wrote(it.res.as_raw() as usize, false, || {
+            format!(
+                "uploaded from the title's memory at {:#x}: {} bytes ({} tiled, swizzle mode {}), all {} levels and {} depth slices{}",
+                it.src,
+                s.size(),
+                if c.layout.block_d > 1 { "thick" } else { "thin" },
+                s.mode,
+                mips,
+                s.depth,
+                if it.changed.is_some() { " (pages of it were written)" } else { "" }
+            )
+        });
         return Ok(());
     }
     let whole = [(0, c.slice_bytes * array)];
