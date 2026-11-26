@@ -24,7 +24,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 /// sides of a texture read back at a dump, at most; and how many are read back
 const SIDE_MOST: u64 = 64;
-const DUMPED_MOST: usize = 32;
+const DUMPED_MOST: usize = 256;
 /// lines of writes logged per texture (then every power of two)
 const WRITES_LOGGED: u64 = 12;
 
