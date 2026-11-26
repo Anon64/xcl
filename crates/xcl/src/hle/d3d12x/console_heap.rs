@@ -995,18 +995,7 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
         };
         let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-        let zero = D3D12_SAMPLER_DESC {
-            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-            AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-            AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-            AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-            MipLODBias: 0.0,
-            MaxAnisotropy: 1,
-            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
-            BorderColor: [0.0; 4],
-            MinLOD: 0.0,
-            MaxLOD: 0.0,
-        };
+        let zero = zero_sampler();
         for k in 0..GLOBAL_SAMPLER_MAX as u64 {
             dev.CreateSampler(&zero, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize });
         }
@@ -1067,6 +1056,34 @@ pub fn global_sampler_heap() -> Option<ID3D12DescriptorHeap> {
 /// Whether `obj` (a title's sampler heap) has its descriptors in the shared sampler heap.
 pub fn in_global_sampler(obj: usize) -> bool {
     HEAPS.lock().unwrap().iter().any(|h| h.obj == obj && h.sampler && !h.pages.is_empty())
+}
+
+/// The zero sampler: what an S# of zeros is on the console (point filtering, wrap, mip 0 only),
+/// and what a shader gets whose S# XCL takes for a heap entry it is not (entry 0).
+/// `XCL_ZERO_SAMPLER_LINEAR=1` (a diagnostic): linear filtering, clamp, every mip instead; a
+/// picture that changes with it samples through the zero sampler.
+pub(super) fn zero_sampler() -> D3D12_SAMPLER_DESC {
+    static LINEAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let linear = *LINEAR.get_or_init(|| {
+        let on = std::env::var("XCL_ZERO_SAMPLER_LINEAR").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: XCL_ZERO_SAMPLER_LINEAR=1 - the zero sampler is linear, clamp, all mips (a diagnostic)");
+        }
+        on
+    });
+    let address = if linear { D3D12_TEXTURE_ADDRESS_MODE_CLAMP } else { D3D12_TEXTURE_ADDRESS_MODE_WRAP };
+    D3D12_SAMPLER_DESC {
+        Filter: if linear { D3D12_FILTER_MIN_MAG_MIP_LINEAR } else { D3D12_FILTER_MIN_MAG_MIP_POINT },
+        AddressU: address,
+        AddressV: address,
+        AddressW: address,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+        BorderColor: [0.0; 4],
+        MinLOD: 0.0,
+        MaxLOD: if linear { 1000.0 } else { 0.0 },
+    }
 }
 
 #[cfg(test)]

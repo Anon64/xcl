@@ -1297,18 +1297,7 @@ fn pc_descriptor_heap_desc(d: [u32; 4], shared: bool) -> [u32; 4] {
 /// mip 0 only. So a table entry the title left empty samples as there (an unwritten PC
 /// descriptor is undefined), as does an index past the title's slots (`console_heap::pc_samplers`).
 unsafe fn zero_samplers(dev: &ID3D12Device, heap: &ID3D12DescriptorHeap) {
-    let zero = D3D12_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-        AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        MipLODBias: 0.0,
-        MaxAnisotropy: 1,
-        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
-        BorderColor: [0.0; 4],
-        MinLOD: 0.0,
-        MaxLOD: 0.0,
-    };
+    let zero = super::console_heap::zero_sampler();
     let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
     let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as u64;
     for k in 0..heap.GetDesc().NumDescriptors as u64 {
