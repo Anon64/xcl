@@ -124,6 +124,7 @@ pub fn want(path: Path, va: u64, len: u64) -> bool {
         return false;
     }
     CALLS[path as usize].fetch_add(1, Ordering::Relaxed);
+    let len = reach(path, va, len);
     if !asked_lately(va, len, generation()) {
         let queued = super::sparse::map_mirror(va as usize, len as usize) as u64;
         if queued != 0 {
@@ -131,6 +132,42 @@ pub fn want(path: Path, va: u64, len: u64) -> bool {
         }
     }
     true
+}
+
+/// `XCL_VIEW_REACH_MB=n` (an experiment): a view whose size the title does not give – a root
+/// view, a mesh stage's root view, an acceleration structure – is asked for `n` MiB from its
+/// address on instead of 64 KiB, as far as that still lies in a view window. Tiles whose CPU
+/// pages are not committed get no video memory (`sparse::fill_later`), so the cost is what the
+/// title really has there. Off (0) by default.
+fn reach(path: Path, va: u64, len: u64) -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let mb = *MB.get_or_init(|| {
+        let mb = std::env::var("XCL_VIEW_REACH_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(4096);
+        if mb != 0 {
+            crate::xlog_info!("D3D12.X: XCL_VIEW_REACH_MB: root views, mesh stage views and acceleration structures are asked for {mb} MiB from their address on");
+        }
+        mb
+    });
+    // `XCL_VIEW_REACH=bvh,root,mesh`: only those kinds (all three without it)
+    static KINDS: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
+    let kinds = KINDS.get_or_init(|| match std::env::var("XCL_VIEW_REACH") {
+        Ok(v) => ["bvh", "root", "mesh"].map(|k| v.split(',').any(|x| x.trim().eq_ignore_ascii_case(k))),
+        Err(_) => [true; 3],
+    });
+    let sizeless = match path {
+        Path::Bvh => kinds[0],
+        Path::RootView => kinds[1],
+        Path::MeshStage => kinds[2],
+        _ => false,
+    };
+    longer(sizeless, mb, len, |end| is_view(va.saturating_add(end - 1)))
+}
+
+/// `len`, or `mb` MiB when that is more, the path has no size (`sizeless`) and the last byte
+/// of the longer range is still in a view window (`in_view`, by the length).
+fn longer(sizeless: bool, mb: u64, len: u64, in_view: impl Fn(u64) -> bool) -> u64 {
+    let want = mb << 20;
+    if sizeless && want > len && in_view(want) { want } else { len }
 }
 
 /// The CPU address behind `va` (itself unless `va` lies in a GPU view of the title's memory,
@@ -170,6 +207,21 @@ pub fn line(now: &[(u64, u64); PATHS], before: &[(u64, u64); PATHS]) -> Option<S
         .map(|i| format!("{} {} ({} KB new)", now[i].0 - before[i].0, NAMES[i], (now[i].1 - before[i].1) >> 10))
         .collect();
     (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+#[cfg(test)]
+mod reach_tests {
+    /// Only a view without a size reaches further, only when asked to, and never past the
+    /// view window it is in.
+    #[test]
+    fn a_sizeless_view_reaches_further_inside_its_window_only() {
+        let all = |_: u64| true;
+        assert_eq!(super::longer(true, 0, 0x1_0000, all), 0x1_0000, "off");
+        assert_eq!(super::longer(true, 64, 0x1_0000, all), 64 << 20);
+        assert_eq!(super::longer(false, 64, 0x1_0000, all), 0x1_0000, "a view with a size keeps it");
+        assert_eq!(super::longer(true, 1, 8 << 20, all), 8 << 20, "never shorter");
+        assert_eq!(super::longer(true, 64, 0x1_0000, |end| end <= 32 << 20), 0x1_0000, "past the window");
+    }
 }
 
 #[cfg(test)]

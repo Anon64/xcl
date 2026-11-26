@@ -2605,7 +2605,17 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         // has all its tiles)
         let view = super::view_want::want(super::view_want::Path::Bvh, va, 0x1_0000);
         let in_uma = va != 0 && (view || crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize)));
-        if in_uma {
+        // `XCL_BVH_EMPTY=1` (a test): every acceleration structure is an empty one – the title's
+        // rays hit nothing. Tells what its ray tracing shaders do to the picture and the device.
+        static EMPTY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let empty = *EMPTY.get_or_init(|| {
+            let on = std::env::var("XCL_BVH_EMPTY").is_ok_and(|v| v.trim() == "1");
+            if on {
+                crate::xlog_info!("D3D12.X: XCL_BVH_EMPTY: acceleration structures are given to the shaders as empty ones");
+            }
+            on
+        });
+        if in_uma && !empty {
             let w = crate::gpu::desc::bvh_words(va, true);
             return super::console_heap::write(&slot, &[w[0], w[1], w[2], w[3], 0, 0, 0, 0]);
         }
