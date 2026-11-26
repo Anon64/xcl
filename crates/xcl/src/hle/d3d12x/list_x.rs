@@ -4765,6 +4765,10 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             out.iter().filter(|b| b[0] == 0).map(|b| ((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32))).collect();
         super::title_textures::note_transitions(this as usize, &t);
     }
+    // (a superseded target the title moves is used again: `placements`)
+    for b in out.iter().filter(|b| b[0] == 0) {
+        super::placements::note_use((b[2] as u64 | (b[3] as u64) << 32) as usize);
+    }
     capture.amend(|op| {
         if let super::capture::Op::Barrier { sent, plane_copies: copies, .. } = op {
             sent.clone_from(&out);
@@ -4910,6 +4914,10 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
+        super::placements::note_use(r);
+        if let Some(s) = src.as_ref() {
+            super::placements::note_use(transmute_copy(&s.pResource));
+        }
         super::title_textures::note_gpu_write(this as usize, r);
         super::lut3d::wrote(r, true, || {
             let from = src.as_ref().map_or("nothing".to_string(), |sl| {
@@ -5164,6 +5172,8 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
         Some(c::Op::Copy { kind: "resource", dst: c::buffer(dst, 0), src: c::buffer(src, 0), at: [0; 3], bx: None, bytes: None, refused: false })
     });
     super::present::note_use(dst, super::present::USE_COPY);
+    super::placements::note_use(dst);
+    super::placements::note_use(src);
     super::title_textures::note_gpu_write(this as usize, dst);
     super::lut3d::wrote(dst, true, || format!("CopyResource from {src:#x}"));
     if super::present::trace_frame() {

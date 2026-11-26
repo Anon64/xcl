@@ -133,11 +133,11 @@ pub(super) fn is_placed_texture(resource: usize) -> bool {
 pub(super) fn forget(resource: usize) {
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
-        super::placements::released(resource);
         forget_pages(resource);
         if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
             ARENAS.lock().unwrap().release(id, std::time::Instant::now());
         }
+        super::placements::released(resource);
     }
 }
 
@@ -1048,13 +1048,27 @@ unsafe fn place_on_pages(
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     let (first, own) = owned_pages(va, console_bytes, total as usize).unwrap_or((va, 0));
     let kind = if gpu_owned(desc.Flags.0 as u32) { super::placements::Kind::Target } else { super::placements::Kind::Sampled };
-    super::placements::placed(raw as usize, va, (first, first + own * PAGE), super::placements::Backing::Pages(dev_key), kind, desc);
+    // (the older targets it supersedes leave the shared pages once the work before is done)
+    for r in super::placements::placed(raw as usize, va, (first, first + own * PAGE), super::placements::Backing::Pages(dev_key), kind, desc) {
+        super::late_release::hold_unmap(r);
+    }
     Some(hr)
 }
 
 /// Unmap a placed texture superseded by a placement with a different address range, returning its
 /// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool immediately.
 pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
+    unmap_placed(res, true);
+}
+
+/// `unmap_superseded` for a target superseded by a newer placement over other pages of it
+/// (`placements`): its pages no other texture uses stay for `IDLE` with what they hold, as a
+/// released target's do – the title may use it again, and it then gets them back.
+pub(super) unsafe fn unmap_superseded_target(res: &ID3D12Resource) {
+    unmap_placed(res, false);
+}
+
+unsafe fn unmap_placed(res: &ID3D12Resource, immediate_cool: bool) {
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
@@ -1072,7 +1086,7 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
             l.groups.iter_mut().for_each(|g| g.3 = false);
         }
         pages.unmap(res, total);
-        pages.release_tiles(used, used_extra, now, true);
+        pages.release_tiles(used, used_extra, now, immediate_cool);
         return;
     }
 }
@@ -1500,7 +1514,8 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     ARENA_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, id);
-    super::placements::placed(*ppv as usize, va, (va, va + info.SizeInBytes as usize), super::placements::Backing::Arena(id), super::placements::Kind::Target, desc);
+    // (an arena has no tiles to unmap: nothing is superseded)
+    drop(super::placements::placed(*ppv as usize, va, (va, va + info.SizeInBytes as usize), super::placements::Backing::Arena(id), super::placements::Kind::Target, desc));
     Some(hr)
 }
 
