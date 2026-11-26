@@ -280,10 +280,8 @@ fn console_menu(last: &'static str) -> Option<&'static str> {
     let title = wide("XCL");
     let heading = wide("Which console should XCL be?");
     let content = wide("The game asks which console it runs on and sets its memory, resolution and detail by the answer. This can be changed at every start; XCL_DEVICE_TYPE sets it without this question.");
-    let x = wide("Xbox Series X
-The game's full settings. Needs the most video memory.");
-    let s = wide("Xbox Series S
-Lower resolution and detail, 8 GB of game memory. Needs less video memory.");
+    let x = wide("Xbox Series X\nThe game's full settings. Needs the most video memory.");
+    let s = wide("Xbox Series S\nLower resolution and detail, 8 GB of game memory. Needs less video memory.");
     let buttons = [TASKDIALOG_BUTTON { nButtonID: X, pszButtonText: x.as_ptr() }, TASKDIALOG_BUTTON { nButtonID: S, pszButtonText: s.as_ptr() }];
     let mut c: TASKDIALOGCONFIG = unsafe { std::mem::zeroed() };
     c.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
