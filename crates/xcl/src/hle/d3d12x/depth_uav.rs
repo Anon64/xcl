@@ -288,8 +288,8 @@ pub(super) enum Resolve {
 }
 
 /// CreateUnorderedAccessView of `res` (description `rd`) with the title's view `view` as it came:
-/// a UAV of the stencil plane of a kept two-plane depth buffer is made on the plane's twin (made
-/// now when there is none yet).
+/// a UAV of the stencil plane of a kept two-plane depth buffer, or of the depth plane of a kept
+/// D32, D16 or D32S8 one, is made on the plane's twin (made now when there is none yet).
 pub(super) unsafe fn resolve_uav(dev: *mut c_void, res: *mut c_void, rd: Option<&D3D12_RESOURCE_DESC>, view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> Resolve {
     let Some(rd) = rd.filter(|d| d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0) else {
         return Resolve::NotOurs;
@@ -327,13 +327,19 @@ pub(super) unsafe fn resolve_uav(dev: *mut c_void, res: *mut c_void, rd: Option<
             );
         }
     }
-    if !matches!(key.format, 19 | 44) || !stencil_view(view) {
+    let stencil = stencil_view(view);
+    // (a D24S8's depth plane: no UAV format holds it as a shader reads it)
+    if if stencil { !matches!(key.format, 19 | 44) } else { !matches!(key.format, 19 | 39 | 53) } {
         return Resolve::Null("its depth plane has no twin yet");
     }
+    // (its states stay the title's: the twin would never be copied)
+    if !stencil && (o.cell.inner.lock().unwrap().made_in.unwrap_or(o.state) | o.state) & UNORDERED_ACCESS != 0 {
+        return Resolve::Null("the buffer was made in UNORDERED_ACCESS");
+    }
     // (the Cell holds the twin)
-    let Some((twin, _)) = plane_twin(&o, 1, dev) else { return Resolve::Null("the twin could not be made") };
+    let Some((twin, _)) = plane_twin(&o, stencil as usize, dev) else { return Resolve::Null("the twin could not be made") };
     REDIRECTED.fetch_add(1, Ordering::Relaxed);
-    Resolve::Twin(twin.as_raw(), twin_view(view, key.array))
+    Resolve::Twin(twin.as_raw(), if stencil { twin_view(view, key.array) } else { depth_twin_view(view, key.array, key.format == 53) })
 }
 
 /// The twin of `plane` (0 depth, 1 stencil) of the buffer `o` is in, and its number: the one it
@@ -722,6 +728,31 @@ fn stencil_view(view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> bool {
 /// The twin's view: the title's (a Texture2D or Texture2DArray one when it gave none) on plane 0,
 /// R8_UINT or the 8-bit class the title asked for (UNORM, SNORM, SINT).
 fn twin_view(view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>, array: u16) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let mut v = plane_view(view, array);
+    v.Format = match v.Format {
+        f @ (DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_R8_SNORM | DXGI_FORMAT_R8_SINT) => f,
+        _ => DXGI_FORMAT_R8_UINT,
+    };
+    v
+}
+
+/// The depth twin's view (`r16`: of a D16's R16 twin, else of an R32 one): the title's on plane
+/// 0, as `twin_view`'s; R32_FLOAT or R16_UNORM – the depth as a shader reads it – unless the
+/// title asked for another class of the twin's size (R32_UINT, R16_UINT …).
+fn depth_twin_view(view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>, array: u16, r16: bool) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let mut v = plane_view(view, array);
+    v.Format = match (r16, v.Format) {
+        (false, f @ (DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT)) => f,
+        (false, _) => DXGI_FORMAT_R32_FLOAT,
+        (true, f @ (DXGI_FORMAT_R16_UNORM | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_SNORM | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R16_FLOAT)) => f,
+        (true, _) => DXGI_FORMAT_R16_UNORM,
+    };
+    v
+}
+
+/// The title's view (a Texture2D or Texture2DArray one of the whole buffer when it gave none)
+/// on plane 0, its format as it came.
+fn plane_view(view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>, array: u16) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut v = match view {
         Some(v) => *v,
         None if array > 1 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -730,10 +761,6 @@ fn twin_view(view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>, array: u16) -> D3D
             ..Default::default()
         },
         None => D3D12_UNORDERED_ACCESS_VIEW_DESC { ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() },
-    };
-    v.Format = match v.Format {
-        f @ (DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_R8_SNORM | DXGI_FORMAT_R8_SINT) => f,
-        _ => DXGI_FORMAT_R8_UINT,
     };
     match v.ViewDimension {
         D3D12_UAV_DIMENSION_TEXTURE2D => v.Anonymous.Texture2D.PlaneSlice = 0,
@@ -1106,6 +1133,81 @@ mod tests {
         assert_eq!((v.Format, v.ViewDimension, unsafe { v.Anonymous.Texture2DArray.ArraySize }), (DXGI_FORMAT_R8_UINT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY, 4));
         let v = twin_view(None, 1);
         assert_eq!((v.Format, v.ViewDimension, unsafe { v.Anonymous.Texture2D.PlaneSlice }), (DXGI_FORMAT_R8_UINT, D3D12_UAV_DIMENSION_TEXTURE2D, 0));
+    }
+
+    #[test]
+    fn a_depth_view_is_a_view_of_a_twin_of_the_planes_size() {
+        assert_eq!(
+            [twin_format(39, 0), twin_format(19, 0), twin_format(53, 0), twin_format(44, 1), twin_format(19, 1)],
+            [DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_TYPELESS],
+            "D32, D32S8, D16 depth; stencil"
+        );
+        // an R32 twin: the depth as a float unless the title asked for another R32 class
+        for (asked, got) in [
+            (DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_UINT),
+        ] {
+            assert_eq!(depth_twin_view(Some(&uav2d(asked, 0)), 1, false).Format, got, "{asked:?}");
+        }
+        // an R16 one: UNORM unless another R16 class was asked for
+        for (asked, got) in [
+            (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_UNORM),
+            (DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM),
+            (DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM),
+            (DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16_UNORM),
+            (DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16_UINT),
+        ] {
+            assert_eq!(depth_twin_view(Some(&uav2d(asked, 0)), 1, true).Format, got, "{asked:?}");
+        }
+        let v = depth_twin_view(Some(&uav2d_array(DXGI_FORMAT_R32_FLOAT, 1, 2, 3, 0)), 6, false);
+        let a = unsafe { v.Anonymous.Texture2DArray };
+        assert_eq!((v.ViewDimension, a.MipSlice, a.FirstArraySlice, a.ArraySize, a.PlaneSlice), (D3D12_UAV_DIMENSION_TEXTURE2DARRAY, 1, 2, 3, 0));
+        // no view: the whole buffer
+        let v = depth_twin_view(None, 4, true);
+        assert_eq!((v.Format, v.ViewDimension, unsafe { v.Anonymous.Texture2DArray.ArraySize }), (DXGI_FORMAT_R16_UNORM, D3D12_UAV_DIMENSION_TEXTURE2DARRAY, 4));
+        // (the stencil twin's view is as it was)
+        assert_eq!(twin_view(None, 1).Format, DXGI_FORMAT_R8_UINT);
+    }
+
+    /// The library's tests run with the switch as the process has it (by default as DEFAULT_ON).
+    #[test]
+    fn a_depth_uav_of_a_d32_or_d16_buffer_asks_for_a_twin_and_a_d24s8_one_stays_null() {
+        let rd = |format| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let base = 0x7B30_0000_1000usize;
+        // console D32, D16, D32S8, D24S8; the PC formats of the buffers; the views of their depth
+        for (k, (console, pc, view, on)) in [
+            (40u32, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT, "the twin could not be made"),
+            (55, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, "the twin could not be made"),
+            (20, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, "the twin could not be made"),
+            (45, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, "its depth plane has no twin yet"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let res = base + k * 0x100;
+            note_created(res as *mut c_void, &desc(3, 64, 64, console, 1, 6), None, 0x10);
+            // (no device: with the switch on a twin is asked for and cannot be made)
+            let why = match unsafe { resolve_uav(std::ptr::null_mut(), res as *mut c_void, Some(&rd(pc)), Some(&uav2d(view, 0))) } {
+                Resolve::Null(why) => Some(why),
+                Resolve::Twin(..) | Resolve::NotOurs => None,
+            };
+            assert_eq!(why, Some(if enabled() { on } else { "XCL_DEPTH_UAV_TWIN is off" }), "console format {console}");
+            forget(res);
+        }
     }
 
     #[test]
