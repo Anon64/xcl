@@ -5587,7 +5587,8 @@ fn forget_graphics_blob(key: (u64, usize)) {
 /// in memory while `GRAPHICS_BLOBS_MAX` has room (as `remember_compute_blob`: one the store has
 /// no room for must still reach the disk).
 unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) -> Option<std::sync::Arc<Vec<u8>>> {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() {
+    let preparing = PREPARING.load(Ordering::Relaxed);
+    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !preparing) || pso.is_null() {
         return None;
     }
     if let Some(b) = graphics_blob(key) {
@@ -5598,6 +5599,10 @@ unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usiz
         return None;
     }
     let bytes = std::sync::Arc::new(bytes);
+    // (a preparation worker builds each pipeline once: for the disk only)
+    if preparing {
+        return Some(bytes);
+    }
     let mut g = GRAPHICS_BLOBS.lock().unwrap();
     let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
     if *total + bytes.len() <= GRAPHICS_BLOBS_MAX {
@@ -5610,7 +5615,7 @@ unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usiz
 /// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static
 /// samplers, blend/rasterizer/depth-stencil state, input layout, render target / depth formats,
 /// sample desc, topology, flags) for in-memory and on-disk driver blob caching.
-unsafe fn graphics_blob_key(
+pub(super) unsafe fn graphics_blob_key(
     copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     vs_dxil: &[u8],
     ps_dxil: Option<&[u8]>,
@@ -6248,10 +6253,12 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let disk = driver.and_then(|id| driver_cache::graphics_path(driver_cache::graphics_file_hash(gkey, id, crate::gpu::recomp::pso::mem_windows()), bytes));
     // (for the driver compile log of this pipeline only)
     GRAPHICS_STAGES.with(|s| s.set(Some((vs_took, ps_took))));
+    // (a preparation worker keeps every blob: the title builds these pipelines at once from them)
+    let keep_min = if PREPARING.load(Ordering::Relaxed) { std::time::Duration::ZERO } else { driver_cache::keep_threshold() };
     let build = graphics_pso_through_cache(
         gkey,
         disk.as_deref(),
-        driver_cache::keep_threshold(),
+        keep_min,
         &mut copy,
         rect_gs.is_some(),
         ps_hash,
@@ -6400,7 +6407,8 @@ mod shaders_key_tests {
 }
 
 impl OwnedDesc {
-    fn shaders_key(&self) -> u64 {
+    /// The key of its shaders, and each shader's (`shader_key`, in its own order).
+    fn shaders_key(&self) -> (u64, Vec<u64>) {
         let blobs = match self {
             OwnedDesc::Compute(_, b) => b,
             OwnedDesc::Graphics(_, b, ..) => b,
@@ -6409,8 +6417,24 @@ impl OwnedDesc {
         let key = shaders_key(blobs);
         // each shader by itself too: what a title's shader preparation translates before the
         // next run (`pso_async::earlier_used_shaders`)
-        super::pso_async::shaders_of(key, blobs.iter().map(|b| shader_key(b)).collect());
-        key
+        let parts: Vec<u64> = blobs.iter().map(|b| shader_key(b)).collect();
+        super::pso_async::shaders_of(key, parts.clone());
+        (key, parts)
+    }
+
+    /// A graphics pipeline's entry for the next run's preparation (`gfx_records`), of the set
+    /// `key` whose shaders' keys are `parts`; None for any other.
+    unsafe fn record(&self, key: u64, parts: &[u64]) -> Option<Vec<u8>> {
+        let OwnedDesc::Graphics(d, ..) = self else { return None };
+        // (`own_graphics` copied the stages it has, in this order)
+        let mut parts = parts.iter();
+        let mut shaders = [0u64; 5];
+        for (s, b) in shaders.iter_mut().zip([&d.VS, &d.PS, &d.DS, &d.HS, &d.GS]) {
+            if !b.pShaderBytecode.is_null() && b.BytecodeLength != 0 {
+                *s = *parts.next()?;
+            }
+        }
+        Some(super::gfx_records::encode(key, shaders, d))
     }
 
     fn ptr(&self) -> *const c_void {
@@ -6635,7 +6659,9 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    let key = owned.shaders_key();
+    let (key, parts) = owned.shaders_key();
+    // (a graphics pipeline used in this run is built before the next starts: `gfx_records`)
+    let described = if super::pso_async::lazy() { owned.record(key, &parts) } else { None };
     // (a compute pipeline's console program, as `translated_compute_pso` names it in the log)
     let record = match &owned {
         OwnedDesc::Compute(_, blobs) => blobs.first().map_or(0, |cs| crate::gpu::shader::fnv64(cs)),
@@ -6658,6 +6684,9 @@ unsafe fn go_background(
     });
     if super::pso_async::lazy() {
         super::pso_async::submit_lazy_with(*ppv as usize, compute, job, key, warm, record);
+        if let Some(entry) = described {
+            super::pso_async::on_first_use(*ppv as usize, Box::new(move || super::gfx_records::note(entry)));
+        }
     } else {
         super::pso_async::submit_with(*ppv as usize, compute, job, record);
     }
@@ -6692,6 +6721,33 @@ unsafe fn warm_graphics(dev: Dev, d: &OwnedDesc) {
 unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
     matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(hr) if hr >= 0)
+}
+
+/// This process is a shader preparation worker (`prepare_device`): it keeps the driver's blob of
+/// every graphics pipeline it builds on disk, whatever its size and time, and none in memory.
+static PREPARING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A shader preparation worker's device (`shaders::graphics_worker`), made on the title's adapter:
+/// adopted as the title's is, so `prepare_graphics` takes the title's path. Raw, kept for the
+/// process.
+pub(crate) fn prepare_device(device: ID3D12Device) -> usize {
+    PREPARING.store(true, Ordering::Relaxed);
+    let raw = device.into_raw();
+    unsafe { adopt(raw, Kind::Device) };
+    raw as usize
+}
+
+/// A title's graphics pipeline `desc` (`gfx_records::Record::desc`) built on `device`
+/// (`prepare_device`) as the title's background build makes it (`build_graphics`): the
+/// translation, DXC and driver blob caches on disk get what the title will ask for. The pipeline
+/// is released; false: not made (noted in the log as the title's would be).
+pub(crate) unsafe fn prepare_graphics(device: usize, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> bool {
+    let this = device as *mut c_void;
+    let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let made = matches!(translated_graphics_pso(this, f, desc as *const _ as *const c_void, &pc_iid(Kind::PipelineState), &mut out), Some(hr) if hr >= 0) && !out.is_null();
+    super::pso_async::release(out as usize);
+    made
 }
 
 unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
@@ -7137,9 +7193,11 @@ unsafe fn build_two_pass_pso(
     take_cold_slot();
     let (hr, pso, took) = attempt(None)?;
     if let Some(cache) = cache {
-        let min = driver_cache::keep_threshold();
+        // (a preparation worker keeps every blob, on disk only: `PREPARING`)
+        let preparing = PREPARING.load(Ordering::Relaxed);
+        let min = if preparing { std::time::Duration::ZERO } else { driver_cache::keep_threshold() };
         let disk = cache.disk.as_deref().filter(|_| took >= min);
-        let keep_ram = bytes >= COMPUTE_BLOB_MIN_DXIL || took >= min;
+        let keep_ram = !preparing && (bytes >= COMPUTE_BLOB_MIN_DXIL || took >= min);
         if let Some(blob) = (disk.is_some() || keep_ram).then(|| read_pso_cached_blob(pso.as_raw())).flatten() {
             if let Some(path) = disk {
                 driver_cache::keep_at(path, &blob, took, min);
