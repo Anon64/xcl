@@ -3838,7 +3838,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if close_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
     }
-    if let Some(wrapper) = super::title_list::wrapper_of(this) {
+    let kickoff_wrapper = super::title_list::wrapper_of(this);
+    if let Some(wrapper) = kickoff_wrapper {
         record_deferred(wrapper);
     }
     super::capture::kickoff(this, queue);
@@ -3884,6 +3885,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
     super::title_textures::list_reset(this as usize);
+    if let Some(w) = kickoff_wrapper {
+        super::title_textures::forget_list_closed(w as usize);
+    }
     if !sparse_writes.0.is_empty() || !sparse_writes.1.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
             super::sparse::readback_after_execute(q, &sparse_writes.0, &sparse_writes.1);
@@ -4866,6 +4870,14 @@ pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
     let ext = *(this as *const usize);
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
     real::preserve_vtable(this, ext);
+    if hr >= 0
+        && !super::title_textures::is_own_work()
+        && !super::present::presenting()
+        && super::title_list::wrapper_of(this).is_none()
+        && !super::console_list::is_backing(this)
+    {
+        super::title_textures::note_list_closed(this as usize);
+    }
     if hr < 0 {
         let ty = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_GET_TYPE)(this);
         crate::xlog_warn!("D3D12.X: DMA list Close → {:#x} (PC list type {ty})", hr as u32);
