@@ -1241,6 +1241,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // where the commands are in unified memory (a console buffer's offsets are the title's)
     let commands_at = super::real::console_buffer(args).map(|(p, n)| (p + args_off as usize, n.saturating_sub(args_off as usize)));
     let count_at = super::real::console_buffer(count_buf).filter(|&(_, n)| count_off as usize + 4 <= n).map(|(p, _)| p + count_off as usize);
+    if super::targets::enabled() && signature_dispatches(sig) {
+        super::targets::note_indirect_compute(raw_pso, commands_at, count_at, count_buf != 0, max, super::indirect_guard::plain_dispatch(sig));
+    }
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     let tp = match draw_pipeline(raw_pso, pso) {
         DrawPipeline::TwoPass(tp) => Some(tp),
@@ -2090,6 +2093,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         return super::pso_async::need_by_submit(pso);
     }
     super::targets::note_dispatch();
+    super::targets::note_compute(pso, super::targets::Dispatched::Direct([x, y, z]));
     let pso = super::pso_async::resolve_wait(pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {

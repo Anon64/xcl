@@ -551,6 +551,16 @@ mod translated {
         for id in [ident, rerouted] {
             if let Some(c) = load_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob) {
                 super::dxc::note_memory_hit();
+                if stage == Stage::Compute {
+                    super::note_compute_path(
+                        blob,
+                        match (id == rerouted, Backend::current()) {
+                            (true, _) => "direct DXIL (its HLSL is enormous), from the translated cache",
+                            (false, Backend::Hlsl) => "HLSL, from the translated cache",
+                            (false, _) => "direct DXIL or its HLSL fallback (XCL_DIRECT_DXIL), from the translated cache",
+                        },
+                    );
+                }
                 return Ok(c);
             }
         }
@@ -600,6 +610,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         match direct_compute(blob, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
+                note_compute_path(blob, "direct DXIL (XCL_DIRECT_DXIL)");
                 return Ok((c, false));
             }
             Err(e) => direct_fallback("CS", &e),
@@ -633,6 +644,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
                     t.hlsl.len() >> 10,
                     c.dxil.len() >> 10
                 );
+                note_compute_path(blob, "direct DXIL (its HLSL is enormous)");
                 return Ok((c, true));
             }
             Err(e) => direct_fallback("CS", &e),
@@ -668,7 +680,23 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
+    if stage == Stage::Compute {
+        note_compute_path(blob, "HLSL");
+    }
     Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers }, false))
+}
+
+/// How each compute program (by dump hash) was translated last in this process (`compute_path`)
+static COMPUTE_PATHS: Mutex<Option<HashMap<u64, &'static str>>> = Mutex::new(None);
+
+fn note_compute_path(blob: &[u8], path: &'static str) {
+    COMPUTE_PATHS.lock().unwrap().get_or_insert_with(HashMap::new).insert(crate::gpu::shader::fnv64(blob), path);
+}
+
+/// The path that made the DXIL of the compute program of dump hash `hash` in this process (HLSL,
+/// direct DXIL, from the translated cache): None when it was not translated here.
+pub fn compute_path(hash: u64) -> Option<&'static str> {
+    COMPUTE_PATHS.lock().unwrap().as_ref()?.get(&hash).copied()
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.

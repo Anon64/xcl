@@ -6770,6 +6770,17 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
 }
 
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = compute_pso(this, desc, riid, ppv);
+    // `XCL_DUMP_TARGETS`: its CS, for the compute pipelines a dumped frame lists
+    if super::targets::enabled() && hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        if let Some(cs) = shader_bytes(&(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS) {
+            super::targets::note_pipeline(*ppv as usize, &[("cs", cs)], &D3D12_RENDER_TARGET_BLEND_DESC::default(), &[], wave32_only(this));
+        }
+    }
+    hr
+}
+
+unsafe fn compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let _cost = crate::hle::api_cost::time(crate::hle::api_cost::Call::Pipeline);
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));

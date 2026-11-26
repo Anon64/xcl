@@ -26,6 +26,12 @@
 //! go next to the pictures. Pipelines are known only once made through
 //! CreateGraphicsPipelineState (or a stream of console VS / PS) with the switch on.
 //! The switch also follows 3D textures and reads the small ones back at a dump (`lut3d`).
+//! The dump also lists every compute pipeline the frame dispatched, in order of first use: its
+//! CS, its direct and indirect dispatches, the groups of the first direct one and of the largest,
+//! and the first indirect one's arguments when they were in unified memory when it was recorded.
+//! The first `COMPUTE_FILES_MOST` get `compute<k>_cs_<key>.hlsl` and `.rdna2.txt` the same way
+//! (made through CreateComputePipelineState with the switch on; the HLSL even when the pipeline
+//! runs direct DXIL, whose file names the path the running DXIL took).
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -113,6 +119,29 @@ pub struct Frame {
     by: HashMap<(usize, usize), u64>,
     /// what the first draw with each pipeline read (`bind::table_resources`)
     inputs: HashMap<usize, Vec<Input>>,
+    /// the compute pipelines dispatched, in order of first use, and where each is in it
+    computes: Vec<Compute>,
+    compute_at: HashMap<usize, usize>,
+}
+
+/// A dispatch: a direct one's groups, or an indirect one's arguments as read when it was
+/// recorded (None: not in memory the CPU reads).
+pub enum Dispatched {
+    Direct([u32; 3]),
+    Indirect(Option<String>),
+}
+
+/// A compute pipeline's dispatches in a frame.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Compute {
+    pso: usize,
+    direct: u64,
+    indirect: u64,
+    /// groups of the first direct dispatch, and of the one with most groups
+    first: Option<[u32; 3]>,
+    largest: Option<[u32; 3]>,
+    /// the first indirect one's arguments (`Dispatched::Indirect`)
+    first_indirect: Option<Option<String>>,
 }
 
 /// A resource a draw read through its descriptor tables, described when it drew.
@@ -138,6 +167,29 @@ impl Frame {
         let first = !self.inputs.contains_key(&pso);
         self.inputs.entry(pso).or_default();
         first
+    }
+
+    /// A dispatch with compute pipeline `pso`.
+    fn dispatched(&mut self, pso: usize, d: Dispatched) {
+        let k = *self.compute_at.entry(pso).or_insert_with(|| {
+            self.computes.push(Compute { pso, ..Default::default() });
+            self.computes.len() - 1
+        });
+        let c = &mut self.computes[k];
+        match d {
+            Dispatched::Direct(g) => {
+                let groups = |g: [u32; 3]| g.iter().map(|&n| n as u64).product::<u64>();
+                c.direct += 1;
+                c.first.get_or_insert(g);
+                if c.largest.map_or(true, |l| groups(g) > groups(l)) {
+                    c.largest = Some(g);
+                }
+            }
+            Dispatched::Indirect(a) => {
+                c.indirect += 1;
+                c.first_indirect.get_or_insert(a);
+            }
+        }
     }
 
     /// The pipelines that drew into `target`, most draws first (ties: by address), the first
@@ -219,6 +271,40 @@ pub fn note_dispatch() {
     }
 }
 
+/// A dispatch with compute pipeline `pso` (the object the title bound): listed in the dump.
+pub fn note_compute(pso: usize, d: Dispatched) {
+    if enabled() {
+        FRAME.lock().unwrap().get_or_insert_with(Frame::default).dispatched(pso, d);
+    }
+}
+
+/// An ExecuteIndirect of up to `max` dispatches with `pso`: its first command at `commands`
+/// (address, bytes there) and its count at `count` when they are in unified memory, read now
+/// (what the title wrote there by the time it recorded); `plain`: a signature of the dispatch
+/// argument alone; `counted`: it has a count buffer.
+pub unsafe fn note_indirect_compute(pso: usize, commands: Option<(usize, usize)>, count: Option<usize>, counted: bool, max: u32, plain: bool) {
+    if !enabled() {
+        return;
+    }
+    let count = match count.filter(|&p| crate::gpu::shader::readable(p, 4)) {
+        Some(p) => format!(", count {}", (p as *const u32).read_unaligned()),
+        None if counted => ", count on the GPU".into(),
+        None => String::new(),
+    };
+    let words = |p: usize, n: usize| (0..n).map(|k| ((p + 4 * k) as *const u32).read_unaligned()).collect::<Vec<u32>>();
+    let args = match commands {
+        Some((p, n)) if plain && n >= 12 && crate::gpu::shader::readable(p, 12) => {
+            let w = words(p, 3);
+            Some(format!("arguments {}x{}x{} (max {max}{count})", w[0], w[1], w[2]))
+        }
+        Some((p, n)) if !plain && n >= 4 && crate::gpu::shader::readable(p, n.min(32)) => {
+            Some(format!("a command with root arguments, its first dwords {:x?} (max {max}{count})", words(p, n.min(32) / 4)))
+        }
+        _ => None,
+    };
+    note_compute(pso, Dispatched::Indirect(args));
+}
+
 /// Whether a frame of `work` is dumped, `done` frames dumped before it, `since` the first present.
 fn due(c: &Config, work: u64, done: u64, since: Duration) -> bool {
     work >= c.work && done < c.frames && since >= c.after
@@ -296,8 +382,69 @@ pub unsafe fn to_dump(n: u64, f: &Frame) -> Vec<(String, ID3D12Resource, D3D12_R
     if !left.is_empty() {
         crate::xlog_warn!("D3D12.X: target dump of frame {n}: {} of {} targets left out, past {} MiB of readback: {}", left.len(), out.len() + left.len(), DUMP_BYTES_MOST >> 20, left.join(" "));
     }
-    log_pipelines(n, f, &written);
+    let mut files = log_pipelines(n, f, &written);
+    files.extend(log_computes(n, f));
+    if !files.is_empty() {
+        if let Some(dir) = crate::state::boot().map(|b| b.logs_dir()) {
+            let _ = std::thread::Builder::new().name("xcl-dump-shaders".into()).spawn(move || write_shaders(&dir, files));
+        }
+    }
     out
+}
+
+/// compute pipelines of a frame whose shaders a dump writes at most, and HLSL bytes it writes
+/// of one shader at most (a retail title's biggest programs are tens of MB of it)
+const COMPUTE_FILES_MOST: usize = 400;
+const HLSL_BYTES_MOST: usize = 8 << 20;
+
+/// A shader file of a dump: (stem, stage, console shader, its pipeline's VS, translated for waves of 32)
+type ShaderFile = (String, &'static str, Arc<[u8]>, Option<Arc<[u8]>>, bool);
+
+/// The files of a frame's `k`th compute pipeline's shader: `compute<k>_cs_<key>` (.hlsl, .rdna2.txt).
+fn compute_stem(k: usize, key: u64) -> String {
+    format!("compute{k}_cs_{key:016x}")
+}
+
+/// `x`x`y`x`z`, or "none"
+fn groups_text(g: Option<[u32; 3]>) -> String {
+    g.map_or("none".into(), |g| format!("{}x{}x{}", g[0], g[1], g[2]))
+}
+
+/// Logs the compute pipelines frame `n` dispatched, in order of first use; the shader files of
+/// the first `COMPUTE_FILES_MOST` of them.
+fn log_computes(n: u64, f: &Frame) -> Vec<ShaderFile> {
+    let mut files = Vec::new();
+    if f.computes.is_empty() {
+        return files;
+    }
+    crate::xlog_info!("D3D12.X: target dump of frame {n}: {} compute pipelines dispatched, in order of first use", f.computes.len());
+    let pipelines = PIPELINES.lock().unwrap().clone().unwrap_or_default();
+    for (k, c) in f.computes.iter().enumerate() {
+        let translated = super::real::is_translated_compute(super::pso_async::peek(c.pso));
+        let cs = pipelines.get(&c.pso).and_then(|p| p.stages.iter().find(|s| s.0 == "cs").map(|s| (s.1, s.2, s.3.clone(), p.split)));
+        let shader = cs.as_ref().map_or("cs not known (made before the switch)".into(), |(key, h, ..)| format!("cs {key:016x} (dump hash {h:016x})"));
+        let indirect = match &c.first_indirect {
+            None => String::new(),
+            Some(Some(a)) => format!("; the first indirect one: {a}"),
+            Some(None) => "; the first indirect one: arguments on the GPU".into(),
+        };
+        crate::xlog_info!(
+            "D3D12.X: target dump: compute #{k} pipeline {:#x}: {shader}, {} dispatches ({} direct, {} indirect), groups of the first direct one {}, largest {}{indirect}; translated {translated}",
+            c.pso,
+            c.direct + c.indirect,
+            c.direct,
+            c.indirect,
+            groups_text(c.first),
+            groups_text(c.largest)
+        );
+        if let (true, Some((key, _, Some(b), split))) = (k < COMPUTE_FILES_MOST, cs) {
+            files.push((compute_stem(k, key), "cs", b, None, split));
+        }
+    }
+    if f.computes.len() > COMPUTE_FILES_MOST {
+        crate::xlog_info!("D3D12.X: target dump of frame {n}: the shaders of compute #{COMPUTE_FILES_MOST} and later are not written ({COMPUTE_FILES_MOST} pipelines at most)");
+    }
+    files
 }
 
 /// pipelines a written target lists
@@ -395,13 +542,13 @@ fn shader_stem(k: usize, stage: &str, key: u64) -> String {
     format!("target{k}_{stage}_{key:016x}")
 }
 
-/// Logs the pipelines that drew into each written target `(k, resource)` of frame `n`, and
-/// writes their shaders on a thread of their own (a later frame's dump writes over them).
-fn log_pipelines(n: u64, f: &Frame, written: &[(usize, usize)]) {
+/// Logs the pipelines that drew into each written target `(k, resource)` of frame `n`; the files
+/// of their shaders, written on a thread of their own (a later frame's dump writes over them).
+fn log_pipelines(n: u64, f: &Frame, written: &[(usize, usize)]) -> Vec<ShaderFile> {
     crate::xlog_info!("D3D12.X: target dump of frame {n}: the pipelines of the targets written");
     let pipelines = PIPELINES.lock().unwrap().clone().unwrap_or_default();
     let tag_of = |r: usize| written.iter().find(|w| w.1 == r).map(|w| format!("target{}", w.0));
-    let mut files: Vec<(String, &'static str, Arc<[u8]>, Option<Arc<[u8]>>, bool)> = Vec::new();
+    let mut files: Vec<ShaderFile> = Vec::new();
     for &(k, t) in written {
         let (list, more) = f.pipelines_of(t, PIPELINES_MOST);
         for (pso, draws) in list {
@@ -444,16 +591,14 @@ fn log_pipelines(n: u64, f: &Frame, written: &[(usize, usize)]) {
             crate::xlog_info!("D3D12.X: target dump: target{k}: and {more} more pipelines");
         }
     }
-    if files.is_empty() {
-        return;
-    }
-    let Some(dir) = crate::state::boot().map(|b| b.logs_dir()) else { return };
-    let _ = std::thread::Builder::new().name("xcl-dump-shaders".into()).spawn(move || write_shaders(&dir, files));
+    files
 }
 
-/// Writes each console shader's disassembly and its VS / PS translated again, as the pipeline
-/// translates it (`pso::console_translation`; the PS's static samplers after the VS's).
-fn write_shaders(dir: &std::path::Path, files: Vec<(String, &'static str, Arc<[u8]>, Option<Arc<[u8]>>, bool)>) {
+/// Writes each console shader's disassembly and its VS / PS / CS translated again, as the
+/// pipeline translates it through HLSL (`pso::console_translation`; the PS's static samplers
+/// after the VS's), unless that is more than `HLSL_BYTES_MOST`. A CS's file says which path
+/// made the DXIL the pipeline runs (`pso::compute_path`).
+fn write_shaders(dir: &std::path::Path, files: Vec<ShaderFile>) {
     use crate::gpu::recomp::pso::{console_translation, is_console, mem_windows, Stage};
     let translate = |b: &[u8], stage: Stage, base: u32, split: bool| console_translation(b, stage, base, mem_windows(), split).map(|(t, _)| (t.hlsl, t.static_samplers.len() as u32));
     for (stem, stage, blob, vs, split) in files {
@@ -471,9 +616,18 @@ fn write_shaders(dir: &std::path::Path, files: Vec<(String, &'static str, Arc<[u
                 let samplers = vs.as_deref().filter(|v| is_console(v)).and_then(|v| translate(v, Stage::Vertex, 0, split).ok()).map_or(0, |t| t.1);
                 translate(&blob, Stage::Pixel, samplers, split)
             }
+            "cs" => translate(&blob, Stage::Compute, 0, split),
             _ => Err(format!("a {stage} is not translated here")),
         };
         let text = match hlsl {
+            Ok((h, _)) if h.len() > HLSL_BYTES_MOST => {
+                crate::xlog_info!("D3D12.X: target dump: {stem}: {} MB of HLSL, more than {} MB: not written (its .rdna2.txt is)", h.len() >> 20, HLSL_BYTES_MOST >> 20);
+                format!("// {stem}: {} MB of HLSL, more than {} MB: not written\n", h.len() >> 20, HLSL_BYTES_MOST >> 20)
+            }
+            Ok((h, _)) if stage == "cs" => format!(
+                "// {stem}: translated again from the pipeline's console shader through HLSL, for reading (a switch-form retry or a debug switch build another)\n// the running pipeline's DXIL: {}\n{h}",
+                crate::gpu::recomp::pso::compute_path(crate::gpu::shader::fnv64(&blob)).unwrap_or("not known (not translated in this process yet)")
+            ),
             Ok((h, _)) => format!("// {stem}: translated again from the pipeline's console shader (the HLSL path; XCL_DIRECT_DXIL, a switch-form retry or a debug switch build another)\n{h}"),
             Err(e) => format!("// {stem}: not translated: {e}\n"),
         };
@@ -716,6 +870,30 @@ mod tests {
         b.LogicOp = D3D12_LOGIC_OP_COPY_INVERTED;
         assert_eq!(blend_text(&b), "blend on: colour SRC_ALPHA ADD INV_SRC_ALPHA, alpha ONE REV_SUBTRACT ZERO, logic op COPY_INVERTED, write mask 0xf");
         assert_eq!(shader_stem(17, "ps", 0xab), "target17_ps_00000000000000ab");
+    }
+
+    /// Compute pipelines are listed in order of first use, each with its direct and indirect
+    /// dispatches, the first direct one's groups, the largest, and the first indirect arguments.
+    #[test]
+    fn compute_pipelines_list_in_order_of_first_use() {
+        let mut f = Frame::default();
+        f.dispatched(0xb, Dispatched::Indirect(None));
+        f.dispatched(0xa, Dispatched::Direct([80, 45, 1]));
+        f.dispatched(0xb, Dispatched::Indirect(Some("arguments 1x2x3 (max 1)".into())));
+        f.dispatched(0xa, Dispatched::Direct([160, 90, 1]));
+        f.dispatched(0xa, Dispatched::Direct([1, 1, 1]));
+        f.dispatched(0xb, Dispatched::Direct([4, 4, 4]));
+        let order: Vec<usize> = f.computes.iter().map(|c| c.pso).collect();
+        assert_eq!(order, vec![0xb, 0xa]);
+        let b = &f.computes[0];
+        assert_eq!((b.direct, b.indirect, b.first, b.largest), (1, 2, Some([4, 4, 4]), Some([4, 4, 4])));
+        assert_eq!(b.first_indirect, Some(None), "the first indirect one's arguments were on the GPU");
+        let a = &f.computes[1];
+        assert_eq!((a.direct, a.indirect, a.first, a.largest, a.first_indirect.clone()), (3, 0, Some([80, 45, 1]), Some([160, 90, 1]), None));
+        assert_eq!(f.work, 0, "the work is counted by note_dispatch");
+        assert_eq!(groups_text(a.first), "80x45x1");
+        assert_eq!(groups_text(None), "none");
+        assert_eq!(compute_stem(399, 0xab), "compute399_cs_00000000000000ab");
     }
 
     #[test]
