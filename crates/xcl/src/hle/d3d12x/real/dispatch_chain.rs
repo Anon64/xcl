@@ -49,7 +49,7 @@ impl PipelineBuilder {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
         let (hr, in_driver, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
-            dxil, self.record, iid, &mut raw, true);
+            dxil, self.record, iid, &mut raw, ComputeBuild::Chain);
         // (as `translated_compute_pso_once` logs a huge whole program the driver refuses)
         if hr < 0 && dxil.len() >= huge_pso_bytes() {
             crate::xlog_warn!(
