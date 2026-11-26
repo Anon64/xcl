@@ -11,6 +11,7 @@
 
 mod alloc_pool;
 pub mod bind;
+mod bvh_want;
 mod capture;
 pub mod console_heap;
 pub mod console_list;

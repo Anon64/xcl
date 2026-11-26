@@ -2616,6 +2616,9 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
             on
         });
         if in_uma && !empty {
+            // and what rays read past it: the rest of the top level, its bottom levels, the
+            // parent pointers (`bvh_want`; `XCL_BVH_WALK=0`: the 64 KiB above only)
+            super::bvh_want::view_made(va);
             let w = crate::gpu::desc::bvh_words(va, true);
             return super::console_heap::write(&slot, &[w[0], w[1], w[2], w[3], 0, 0, 0, 0]);
         }
