@@ -2258,7 +2258,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
         return;
     }
     let t0 = super::look_stats::deep().then(std::time::Instant::now);
-    let mut g = lock_state();
+    let mut g = lock_for_submit();
     let _held = holding(Holder::After);
     if let Some(t0) = t0 {
         HELD.add(HELD_AFTER_WAIT, t0.elapsed().as_micros() as u64);
@@ -2315,20 +2315,12 @@ pub unsafe fn settle_readbacks_within(ms: u64) -> bool {
     }
     // (`XCL_LOOK_STATS=2`: the time a title's thread spends here when it looks at a fence)
     let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::FenceSettle));
-    let t0 = std::time::Instant::now();
-    loop {
-        if let Ok(mut g) = STATE.try_lock() {
-            let _held = holding(Holder::Settle);
-            if let Some(s) = g.as_mut() {
-                s.drain_readbacks_spin(Drain::TitleDone, 300);
-            }
-            return true;
-        }
-        if t0.elapsed().as_millis() as u64 >= ms {
-            return false;
-        }
-        std::thread::yield_now();
+    let Some(mut g) = try_lock_giving_way(&STATE, &SUBMITS_WAITING, std::time::Duration::from_millis(ms), submit_lock_first()) else { return false };
+    let _held = holding(Holder::Settle);
+    if let Some(s) = g.as_mut() {
+        s.drain_readbacks_spin(Drain::TitleDone, 300);
     }
+    true
 }
 
 /// The thread that moves finished copies back into the title's memory, so it sees what its
@@ -2338,6 +2330,10 @@ fn start_readback_thread() {
     STARTED.call_once(|| {
         let _ = std::thread::Builder::new().name("xcl-sparse-readback".into()).spawn(|| loop {
             std::thread::sleep(std::time::Duration::from_micros(500));
+            // (`XCL_SUBMIT_LOCK_FIRST=1`: nothing to land, or a submit waits for the lock: not now)
+            if submit_lock_first() && (RB_PENDING.load(Ordering::Acquire) == 0 || SUBMITS_WAITING.load(Ordering::Acquire) > 0) {
+                continue;
+            }
             if let Ok(mut g) = STATE.try_lock() {
                 let _held = holding(Holder::ReadbackThread);
                 if let Some(s) = g.as_mut().filter(|s| !s.rb_jobs.is_empty() || !s.imm_jobs.is_empty()) {
@@ -2483,6 +2479,55 @@ fn lock_first<'a, T>(m: &'a Mutex<T>, waiting: &std::sync::atomic::AtomicUsize) 
     g.unwrap()
 }
 
+/// Submits in `before_execute` waiting for the state's lock (they send the put-off mappings).
+static FLUSHERS_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `XCL_SUBMIT_LOCK_FIRST=1` (off unless set): a submit's other uses of the state's lock (its
+/// after stage's copies back, its ranges' mapped tiles) are let in first like its `before_execute`,
+/// and the threads that only try the lock in a loop (copies back settled at a fence look, the
+/// readback thread, put-off mappings sent) do not try it while a submit waits. A retail title's
+/// world: each submit waited ~2 ms for the lock while title threads looked at fences ~170 times a
+/// second, each trying the lock for up to 5 ms; a thread that tries the lock as it is let go takes
+/// it before the waiting submit has woken.
+fn submit_lock_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SUBMIT_LOCK_FIRST").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The state's lock for a submit's after stage and ranges: `lock_first` with
+/// `XCL_SUBMIT_LOCK_FIRST=1`, else `lock_state` as before.
+fn lock_for_submit() -> std::sync::MutexGuard<'static, Option<State>> {
+    if !submit_lock_first() {
+        return lock_state();
+    }
+    let mut g = lock_first(&STATE, &SUBMITS_WAITING);
+    forget_released(&mut g);
+    g
+}
+
+/// `m` tried until it is had or `budget` has gone by (None). With `give_way`, it is not tried
+/// while a submit waits for it (`waiting`); that time does not count against `budget`, up to
+/// `budget` more (a caller that may not wait for the lock still gives up in the end).
+fn try_lock_giving_way<'a, T>(m: &'a Mutex<T>, waiting: &std::sync::atomic::AtomicUsize, budget: std::time::Duration, give_way: bool) -> Option<std::sync::MutexGuard<'a, T>> {
+    let t0 = std::time::Instant::now();
+    let mut gave = std::time::Duration::ZERO;
+    loop {
+        if give_way && gave < budget && waiting.load(Ordering::Acquire) > 0 {
+            let t = std::time::Instant::now();
+            std::thread::yield_now();
+            gave += t.elapsed();
+            continue;
+        }
+        if let Ok(g) = m.try_lock() {
+            return Some(g);
+        }
+        if t0.elapsed().saturating_sub(gave) >= budget {
+            return None;
+        }
+        std::thread::yield_now();
+    }
+}
+
 /// `m` once no submit waits for it (or `GIVE_WAY_US` have gone by).
 fn lock_in_turn<'a, T>(m: &'a Mutex<T>, waiting: &std::sync::atomic::AtomicUsize) -> std::sync::MutexGuard<'a, T> {
     if waiting.load(Ordering::Acquire) > 0 {
@@ -2585,6 +2630,15 @@ pub fn send_pending() {
         // (asked each time: another thread may be sending them, and has sent them when the flag goes)
         if !PENDING.load(Ordering::Acquire) {
             return;
+        }
+        // (`XCL_SUBMIT_LOCK_FIRST=1`: a submit that waits for the lock in `before_execute` sends
+        // them itself, `flush_pending`)
+        if submit_lock_first() && FLUSHERS_WAITING.load(Ordering::Acquire) > 0 {
+            if t0.elapsed().as_millis() >= 2 {
+                return;
+            }
+            std::thread::yield_now();
+            continue;
         }
         match STATE.try_lock() {
             Ok(mut g) => {
@@ -3726,7 +3780,7 @@ impl State {
 /// GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
     let t0 = super::look_stats::deep().then(std::time::Instant::now);
-    let g = lock_state();
+    let g = lock_for_submit();
     let _held = holding(Holder::Ranges);
     if let Some(t0) = t0 {
         HELD.add(HELD_RANGES_WAIT, t0.elapsed().as_micros() as u64);
@@ -3864,7 +3918,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t0 = std::time::Instant::now();
     // (who had the lock when this began to wait for it: `XCL_LOOK_STATS=2`)
     let behind = (HOLDER.load(Ordering::Relaxed) as usize).min(HOLDERS - 1);
+    FLUSHERS_WAITING.fetch_add(1, Ordering::AcqRel);
     let mut g = lock_first(&STATE, &SUBMITS_WAITING);
+    FLUSHERS_WAITING.fetch_sub(1, Ordering::AcqRel);
     let _held = holding(Holder::Submit);
     let t_got = super::look_stats::deep().then(std::time::Instant::now);
     forget_released(&mut g);
@@ -4819,6 +4875,45 @@ mod tests {
             assert!(turns[10] < 60, "the other thread's turns before a submit had the lock: {turns:?}");
         });
         assert_eq!(waiting.load(Ordering::Acquire), 0);
+    }
+
+    /// A thread that only tries the lock (a fence look settling copies back) does not take it while
+    /// a submit waits for it, when it gives way; without that it takes it at once. Its time giving
+    /// way does not count against its budget, but it does not give way for ever.
+    #[test]
+    fn a_thread_that_tries_the_lock_gives_way_to_a_waiting_submit() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+        let (m, waiting) = (Mutex::new(()), AtomicUsize::new(0));
+        // nobody waits: had at once either way
+        assert!(try_lock_giving_way(&m, &waiting, Duration::from_millis(5), true).is_some());
+        assert!(try_lock_giving_way(&m, &waiting, Duration::from_millis(5), false).is_some());
+        // a submit waits for 8 ms: the lock, free all along, is not taken in the first 5 ms
+        waiting.store(1, Ordering::Release);
+        let t0 = std::time::Instant::now();
+        let got = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(8));
+                waiting.store(0, Ordering::Release);
+            });
+            try_lock_giving_way(&m, &waiting, Duration::from_millis(5), true).is_some()
+        });
+        let took = t0.elapsed();
+        assert!(got, "the lock was free once the submit was done");
+        assert!(took >= Duration::from_millis(5), "taken after {took:?}, while the submit waited");
+        // a submit that never stops waiting: it is given way to for the budget, then tried
+        waiting.store(1, Ordering::Release);
+        let t0 = std::time::Instant::now();
+        assert!(try_lock_giving_way(&m, &waiting, Duration::from_millis(3), true).is_some());
+        assert!(t0.elapsed() >= Duration::from_millis(3));
+        assert!(try_lock_giving_way(&m, &waiting, Duration::from_millis(3), false).is_some());
+        // held by another thread: given up after the budget (and the time given way)
+        let held = m.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        let got = std::thread::scope(|s| s.spawn(|| try_lock_giving_way(&m, &waiting, Duration::from_millis(3), true).is_some()).join().unwrap());
+        assert!(!got);
+        assert!(t0.elapsed() >= Duration::from_millis(6), "gave up after {:?}", t0.elapsed());
+        drop(held);
     }
 
     /// A mapping put off does not wait for the title's next submit: a CPU signal sends it, and
