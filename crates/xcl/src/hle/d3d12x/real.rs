@@ -1009,6 +1009,13 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             v[1 + i] = super::guard::make_tracer(v[1 + i], name);
         }
     }
+    // XCL_TWO_PASS_BATCH=2: a title call on a list with deferred two-pass draws records them
+    // first, unless it is one that cannot change what they draw (`bind::before_list_call`)
+    if kind == Kind::CommandList && super::bind::two_pass_defer() {
+        for (i, e) in v.iter_mut().enumerate().skip(1) {
+            *e = super::guard::make_before(*e, (i - 1) as u64, super::bind::before_list_call);
+        }
+    }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
     let ext = leaked.as_ptr() as usize + 8;
     EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(ext);
@@ -3391,6 +3398,7 @@ macro_rules! as_usize {
 /// command list's vtable pointer on Close; adopt the runtime's new state vtable so
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
+    super::bind::flush_two_pass(this);
     super::list_x::before_close(this);
     super::gpu_times::before_close(this);
     let ext = *(this as *const usize);

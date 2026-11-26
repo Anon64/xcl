@@ -113,6 +113,9 @@ pub(super) enum Kind {
     Mesh(&'static str),
     /// an ExecuteIndirect with a PC pipeline
     Pc,
+    /// the argument rewrites and compute passes of a run of deferred two-pass draws
+    /// (`XCL_TWO_PASS_BATCH=2`), all programs together; their mesh passes are `Mesh`
+    MeshBatch,
 }
 
 /// A program: the kind of call and its console shaders' dump hashes – CS, or VS / MS / GS and
@@ -633,11 +636,13 @@ fn program_text(p: &Program, wave: &dyn Fn(u64) -> Option<&'static str>) -> Stri
         Kind::Graphics => format!("graphics pipeline {:#x} (its shaders not known)", p.pso),
         Kind::Mesh(k) => format!("mesh two-pass {k} pipeline {:#x} (its shaders not known)", p.pso),
         Kind::Pc => format!("PC pipeline {:#x}", p.pso),
+        Kind::MeshBatch => "mesh two-pass compute passes of deferred draws (all programs)".into(),
     }
 }
 
 fn size_text(kind: Kind, size: [u32; 3], indirect: bool) -> String {
     match (kind, indirect) {
+        (Kind::MeshBatch, _) => format!("{} draws", size[0]),
         (_, true) => format!("ExecuteIndirect, max count {}", size[0]),
         (Kind::Graphics, false) => format!("{} vertices or indices x {} instances", size[0], size[1]),
         _ => format!("{}x{}x{} groups", size[0], size[1], size[2]),
@@ -798,6 +803,8 @@ mod tests {
         assert_eq!(size_text(Kind::Compute, [8, 4, 1], false), "8x4x1 groups");
         assert_eq!(size_text(Kind::Graphics, [3, 2, 0], false), "3 vertices or indices x 2 instances");
         assert_eq!(size_text(Kind::Mesh("GS"), [64, 0, 0], true), "ExecuteIndirect, max count 64");
+        assert_eq!(size_text(Kind::MeshBatch, [12, 0, 0], false), "12 draws");
+        assert_eq!(program_text(&p(Kind::MeshBatch, 0, 0), &wave), "mesh two-pass compute passes of deferred draws (all programs)");
         let c = Config { frames: 2, after: Duration::ZERO };
         let frames = vec![FrameRead {
             present: 7,

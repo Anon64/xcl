@@ -52,6 +52,13 @@ struct State {
     /// the record regions a mesh pass may still be reading, with no UAV barrier on the records
     /// since (`two_pass_plan`; only with `two_pass_batch`)
     record_open: Option<u8>,
+    /// two-pass draws deferred to `flush_two_pass` (`two_pass_defer`), in the title's order
+    deferred: Vec<DeferredDraw>,
+    /// the records of deferred draws: a region each from the start (`batch_region`), and whether
+    /// the mesh passes of the last run may still read them (no barrier after them)
+    batch_buf: Option<TwoPassBuf>,
+    batch_used: u64,
+    batch_open: bool,
     /// the next dispatch's thread limits (`IO_THREAD_LIMIT`; a `DispatchX` with thread
     /// dimensions), taken by its `bind_abi`
     limits: [u32; 3],
@@ -441,10 +448,22 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
         }
+        res_bufs.extend(s.end_batch());
         (old, std::mem::take(&mut s.uma), res_bufs)
     });
+    unmark_deferring(list);
     console_list::hold_until_reset(old, blocks);
     hold_res_until_reset(old, res_bufs);
+}
+
+impl State {
+    /// The deferred draws of a recording that ends without them (a Reset without a Close, a
+    /// list let go): dropped, and the buffer of their records for the caller to hold.
+    fn end_batch(&mut self) -> Option<TwoPassBuf> {
+        self.deferred.clear();
+        (self.batch_used, self.batch_open) = (0, false);
+        self.batch_buf.take()
+    }
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
@@ -487,8 +506,10 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
         }
+        res_bufs.extend(s.end_batch());
         (old, std::mem::take(&mut s.uma), res_bufs)
     });
+    unmark_deferring(to);
     console_list::hold_until_reset(old, blocks);
     hold_res_until_reset(old, res_bufs);
 }
@@ -576,11 +597,14 @@ pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
+    unmark_deferring(list);
     if let Some(mut s) = STATES.remove(list as usize) {
+        let batch = s.end_batch();
         console_list::hold_until_reset(s.allocator, s.uma);
         if let Some(b) = s.res_buf.take() {
             s.res_retired.push(b);
         }
+        s.res_retired.extend(batch);
         hold_res_until_reset(s.allocator, s.res_retired);
     }
 }
@@ -914,9 +938,25 @@ fn two_pass_steps(max: u32) -> impl Iterator<Item = (u32, bool)> {
 /// after that one orders the mesh pass before the half is written again. An ExecuteIndirect's
 /// rewritten arguments stay in INDIRECT_ARGUMENT until the next one rewrites into the block, with
 /// the UAV barrier before the rewrite in the same ResourceBarrier call as that transition.
+/// `XCL_TWO_PASS_BATCH=2` also defers runs of two-pass draws (`flush_two_pass`); the draws it
+/// does not defer go as with 1.
 fn two_pass_batch() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_TWO_PASS_BATCH").is_ok_and(|v| v.trim() == "1"))
+    two_pass_mode() >= 1
+}
+
+/// `XCL_TWO_PASS_BATCH=2`: runs of two-pass draws are deferred (`flush_two_pass`).
+pub(super) fn two_pass_defer() -> bool {
+    two_pass_mode() == 2
+}
+
+/// `XCL_TWO_PASS_BATCH`: 0 (unset or anything else), 1 or 2 (read once).
+fn two_pass_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("XCL_TWO_PASS_BATCH").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
 /// Record regions of a two-pass pass (`TwoPassStep::Pass`): the first half, the second half, or
@@ -1026,6 +1066,465 @@ fn halves_bytes(need: u64, batch: bool) -> Option<u64> {
     (batch && both <= RECORD_MAX).then_some(both)
 }
 
+// ---------------------------------------------------------------------------------------
+// deferred two-pass draws (`XCL_TWO_PASS_BATCH=2`)
+//
+// A two-pass draw on a direct list is not recorded at once: what both of its passes read is
+// written to unified memory as the unbatched draw would write it (its io blocks with the title's
+// root arguments of that moment, the argument rewrite's constants), and the draw waits in the
+// list's `State::deferred` with a region of its own in the list's batch record buffer. The run
+// goes out (`flush_two_pass`) before any title call on the list that is not a root-argument set
+// or another such draw (`before_list_call`, in front of every slot of the list's vtable), at the
+// list's Close, at `XCL_TWO_PASS_BATCH_MOST` draws and when the next draw's records do not fit:
+// the argument rewrites, all compute passes, one barrier, the mesh passes in the title's order.
+// Between the draws of a run nothing reaches the PC list, so each mesh pass draws with the PC
+// state (render targets, viewports, …) its draw had.
+// ---------------------------------------------------------------------------------------
+
+/// Most draws in a run (`XCL_TWO_PASS_BATCH_MOST`, 64 by default; read once).
+fn batch_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("XCL_TWO_PASS_BATCH_MOST").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(64).max(1))
+}
+
+/// Bytes of a list's batch record buffer (`XCL_TWO_PASS_BATCH_MB`, 128 MiB by default; read
+/// once). An ExecuteIndirect's region is what its draw would have had alone, up to 32 MiB.
+fn batch_records_bytes() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| std::env::var("XCL_TWO_PASS_BATCH_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(128).clamp(1, 1024) << 20)
+}
+
+/// Lists with deferred draws, and how many (the hook in front of every list call looks at the
+/// count first).
+static DEFERRING: super::sharded::Sharded<u8> = super::sharded::Sharded::new();
+static DEFERRING_LISTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn mark_deferring(list: *mut c_void) {
+    if DEFERRING.insert(list as usize, 1).is_none() {
+        DEFERRING_LISTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn unmark_deferring(list: *mut c_void) {
+    if DEFERRING.remove(list as usize).is_some() {
+        DEFERRING_LISTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// What a deferred draw runs besides its two stages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredWork {
+    /// DispatchMesh: the compute pass's groups, the mesh pass's
+    Mesh { groups: u32, mesh_groups: u32 },
+    /// ExecuteIndirect of one command: its argument rewrite into `block` (in `before` until the
+    /// run), the companion Dispatch signature and the DispatchMesh one, where each pass's command is
+    Indirect { rewrite: Rewrite, block: usize, before: D3D12_RESOURCE_STATES, companion: usize, sig: usize, compute_at: u64, mesh_at: u64 },
+}
+
+/// What a deferred draw records: everything it reads was fixed when the title made it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DrawSnap {
+    compute: StageBind,
+    mesh: StageBind,
+    work: DeferredWork,
+}
+
+/// A deferred two-pass draw (`State::deferred`).
+struct DeferredDraw {
+    snap: DrawSnap,
+    /// (what the snapshot names stays alive until the run is recorded)
+    _tp: Arc<super::real::TwoPassPso>,
+    _mesh_pso: Option<ID3D12PipelineState>,
+    _block: Option<ID3D12Resource>,
+    /// the pipeline the title bound, for the counts; the kind and size for `XCL_GPU_TIMES`
+    raw_pso: usize,
+    kind: &'static str,
+    size: [u32; 3],
+}
+
+/// Why a two-pass draw is recorded at once rather than deferred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoDefer {
+    /// `XCL_TWO_PASS_BATCH` is not 2
+    Off,
+    /// not a direct list (a bundle cannot hold the barriers; a compute list draws nothing)
+    NotDirect,
+    /// `XCL_CAPTURE_FRAME` records each call where it is made
+    Capture,
+    /// an ExecuteIndirect of more than one command (each runs its passes in turn)
+    Commands,
+    /// its records are more than a batch record buffer
+    TooBig,
+}
+
+/// Whether a two-pass draw of `commands` commands whose records take `region` bytes is deferred.
+fn defer_check(on: bool, ty: Option<D3D12_COMMAND_LIST_TYPE>, capture: bool, commands: u32, region: u64, batch_bytes: u64) -> Result<(), NoDefer> {
+    if !on {
+        return Err(NoDefer::Off);
+    }
+    if ty != Some(D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        return Err(NoDefer::NotDirect);
+    }
+    if capture {
+        return Err(NoDefer::Capture);
+    }
+    if commands != 1 {
+        return Err(NoDefer::Commands);
+    }
+    if region > batch_bytes {
+        return Err(NoDefer::TooBig);
+    }
+    Ok(())
+}
+
+/// Where in a batch record buffer of `bytes` with `used` taken a draw's `region` goes: None, the
+/// run so far is recorded first and it goes at the start.
+fn batch_place(used: u64, region: u64, bytes: u64) -> Option<u64> {
+    (used.saturating_add(region) <= bytes).then_some(used)
+}
+
+/// Bytes of a draw's region: its records, 256-aligned.
+fn batch_region_bytes(need: u64) -> u64 {
+    need.max(1).next_multiple_of(256)
+}
+
+/// Console list slots a run of deferred draws goes on across (`before_list_call`): QueryInterface,
+/// AddRef, Release and the private data / name / device / type ones (they record nothing), the
+/// compute and graphics root signature and root argument sets (kept by XCL, `put_in`: nothing
+/// reaches the PC list), ExecuteIndirect and DispatchMesh (at their slots of the title's layout,
+/// `real::NEWER_LIST_SLOTS`; they defer or record the run first themselves). Everything else –
+/// pipelines, barriers, copies, clears, draws, dispatches, render targets, viewports, heaps,
+/// queries, predication, bundles, Close, Reset, the console's own methods – records the run first.
+fn keeps_two_pass_batch(slot: usize, newer_layout: bool) -> bool {
+    let (ei, dm) = if newer_layout { (61, 129) } else { (59, 127) };
+    matches!(slot, 0..=8 | 33..=46) || slot == ei || slot == dm
+}
+
+/// Whether a list call through `slot` records the list's deferred draws first.
+fn flush_wanted(slot: usize, newer_layout: bool, from_title: bool, deferring: bool) -> bool {
+    deferring && from_title && !keeps_two_pass_batch(slot, newer_layout)
+}
+
+/// In front of every command list slot with `XCL_TWO_PASS_BATCH=2` (`real::class_for`): a title
+/// call on a list with deferred draws records them first, unless the slot keeps the run
+/// (`keeps_two_pass_batch`). Calls from XCL and the runtime go on as they are.
+pub(super) unsafe extern "system" fn before_list_call(caller: usize, slot: u64, frame: *const u64) -> usize {
+    if DEFERRING_LISTS.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    let this = *frame.add(0x80 / 8) as *mut c_void;
+    let deferring = DEFERRING.contains(this as usize);
+    let newer = super::real::QUEUE_SHIFTED.load(Ordering::Acquire);
+    if flush_wanted(slot as usize, newer, deferring && crate::modules::image_base_for_addr(caller).is_some(), deferring) {
+        flush_two_pass(this);
+    }
+    0
+}
+
+/// A UAV barrier on all resources or on `uav`, and transitions, in one ResourceBarrier call
+/// (`Cmd::Barriers`).
+unsafe fn emit_barrier_set(list: &ID3D12GraphicsCommandList, all: bool, uav: Option<&ID3D12Resource>, transitions: &[(&ID3D12Resource, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)]) {
+    let mut b: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(transitions.len() + 2);
+    for r in [all.then_some(None), uav.map(Some)].into_iter().flatten() {
+        b.push(D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(r.cloned()) }) },
+        });
+    }
+    for &(r, before, after) in transitions {
+        b.push(D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(Some(r.clone())),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        });
+    }
+    if b.is_empty() {
+        return;
+    }
+    list.ResourceBarrier(&b);
+    for x in &mut b {
+        if x.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV {
+            std::mem::ManuallyDrop::drop(&mut (*x.Anonymous.UAV).pResource);
+        } else {
+            std::mem::ManuallyDrop::drop(&mut (*x.Anonymous.Transition).pResource);
+        }
+    }
+}
+
+/// A command of a run of deferred draws (`batch_commands`); objects by address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Cmd {
+    /// one ResourceBarrier call: a UAV barrier on all resources (`all`), one on `uav`, transitions
+    Barriers { all: bool, uav: Option<usize>, transitions: Vec<(usize, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)> },
+    ComputeRs(usize),
+    GraphicsRs(usize),
+    Pso(usize),
+    ComputeView(u32, u64),
+    GraphicsView(u32, u64),
+    Dispatch(u32),
+    DispatchMesh(u32),
+    /// ExecuteIndirect of one command: signature, argument buffer, offset
+    Indirect(usize, usize, u64),
+    /// an `XCL_GPU_TIMES` span: the rewrites and compute passes (None), the mesh pass of draw `d`
+    TimesBegin(Option<usize>),
+    TimesEnd,
+}
+
+/// The commands of a run of `draws` with their records in `records`, after a run whose mesh
+/// passes may still read them (`open`): the argument rewrites (after a UAV barrier on all
+/// resources – the title's writes of the arguments, `fresh_indirect_arguments` – and the
+/// argument blocks to UNORDERED_ACCESS in the same call), the blocks to INDIRECT_ARGUMENT, every
+/// compute pass, one UAV barrier on the records, every mesh pass in the title's order. A root
+/// signature or pipeline is set where it changes; every pass sets all its root views.
+fn batch_commands(draws: &[DrawSnap], records: usize, open: bool) -> Vec<Cmd> {
+    use D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT as ARGS;
+    use D3D12_RESOURCE_STATE_UNORDERED_ACCESS as UAV;
+    let mut v = Vec::with_capacity(draws.len() * 20 + 8);
+    let mut blocks: Vec<(usize, D3D12_RESOURCE_STATES)> = Vec::new();
+    for d in draws {
+        if let DeferredWork::Indirect { block, before, .. } = d.work {
+            if !blocks.iter().any(|b| b.0 == block) {
+                blocks.push((block, before));
+            }
+        }
+    }
+    if !blocks.is_empty() {
+        v.push(Cmd::Barriers { all: true, uav: None, transitions: blocks.iter().map(|&(b, s)| (b, s, UAV)).collect() });
+    } else if open {
+        v.push(Cmd::Barriers { all: false, uav: Some(records), transitions: Vec::new() });
+    }
+    v.push(Cmd::TimesBegin(None));
+    let (mut crs, mut grs, mut pso) = (0usize, 0usize, 0usize);
+    let set = |v: &mut Vec<Cmd>, now: &mut usize, to: usize, cmd: fn(usize) -> Cmd| {
+        if *now != to {
+            v.push(cmd(to));
+            *now = to;
+        }
+    };
+    for d in draws {
+        if let DeferredWork::Indirect { rewrite, .. } = d.work {
+            set(&mut v, &mut crs, rewrite.rs, Cmd::ComputeRs);
+            set(&mut v, &mut pso, rewrite.pso, Cmd::Pso);
+            v.extend(rewrite.views.iter().map(|&(slot, va)| Cmd::ComputeView(slot, va)));
+            v.push(Cmd::Dispatch(rewrite.groups));
+        }
+    }
+    if !blocks.is_empty() {
+        v.push(Cmd::Barriers { all: false, uav: None, transitions: blocks.iter().map(|&(b, _)| (b, UAV, ARGS)).collect() });
+    }
+    for d in draws {
+        set(&mut v, &mut crs, d.compute.rs, Cmd::ComputeRs);
+        set(&mut v, &mut pso, d.compute.pso, Cmd::Pso);
+        v.extend(d.compute.views.iter().enumerate().map(|(k, &va)| Cmd::ComputeView(k as u32, va)));
+        v.push(match d.work {
+            DeferredWork::Mesh { groups, .. } => Cmd::Dispatch(groups),
+            DeferredWork::Indirect { block, companion, compute_at, .. } => Cmd::Indirect(companion, block, compute_at),
+        });
+    }
+    v.push(Cmd::TimesEnd);
+    v.push(Cmd::Barriers { all: false, uav: Some(records), transitions: Vec::new() });
+    for (i, d) in draws.iter().enumerate() {
+        v.push(Cmd::TimesBegin(Some(i)));
+        set(&mut v, &mut grs, d.mesh.rs, Cmd::GraphicsRs);
+        set(&mut v, &mut pso, d.mesh.pso, Cmd::Pso);
+        v.extend(d.mesh.views.iter().enumerate().map(|(k, &va)| Cmd::GraphicsView(k as u32, va)));
+        v.push(match d.work {
+            DeferredWork::Mesh { mesh_groups, .. } => Cmd::DispatchMesh(mesh_groups),
+            DeferredWork::Indirect { block, sig, mesh_at, .. } => Cmd::Indirect(sig, block, mesh_at),
+        });
+        v.push(Cmd::TimesEnd);
+    }
+    v
+}
+
+/// `cmds` (`batch_commands` of `draws`) on the list `this`.
+unsafe fn emit_commands(this: *mut c_void, list: &ID3D12GraphicsCommandList, cmds: &[Cmd], draws: &[DeferredDraw]) {
+    type Ei = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
+    type Dm = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
+    let pc_ei: Ei = std::mem::transmute(super::real::orig_fn(this, 59));
+    let pc_dm: Dm = std::mem::transmute(super::real::orig_fn(this, 79));
+    // (every object here is held by `draws` or the list's state until this returns)
+    let res = |raw: usize| {
+        let p = raw as *mut c_void;
+        ID3D12Resource::from_raw_borrowed(&p).cloned()
+    };
+    let rs = |raw: usize| {
+        let p = raw as *mut c_void;
+        ID3D12RootSignature::from_raw_borrowed(&p).cloned()
+    };
+    for c in cmds {
+        match c {
+            Cmd::Barriers { all, uav, transitions } => {
+                let uav = uav.and_then(res);
+                let held: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)> = transitions.iter().filter_map(|&(r, a, b)| Some((res(r)?, a, b))).collect();
+                let t: Vec<_> = held.iter().map(|(r, a, b)| (r, *a, *b)).collect();
+                emit_barrier_set(list, *all, uav.as_ref(), &t);
+            }
+            Cmd::ComputeRs(r) => list.SetComputeRootSignature(rs(*r).as_ref()),
+            Cmd::GraphicsRs(r) => list.SetGraphicsRootSignature(rs(*r).as_ref()),
+            Cmd::Pso(p) => {
+                let p = *p as *mut c_void;
+                list.SetPipelineState(ID3D12PipelineState::from_raw_borrowed(&p));
+            }
+            Cmd::ComputeView(slot, va) => list.SetComputeRootUnorderedAccessView(*slot, *va),
+            Cmd::GraphicsView(slot, va) => list.SetGraphicsRootUnorderedAccessView(*slot, *va),
+            Cmd::Dispatch(n) => list.Dispatch(*n, 1, 1),
+            Cmd::DispatchMesh(n) => pc_dm(this, *n, 1, 1),
+            Cmd::Indirect(sig, buf, at) => pc_ei(this, *sig, 1, *buf, *at, 0, 0),
+            Cmd::TimesBegin(None) => super::gpu_times::before(this, 0, super::gpu_times::Kind::MeshBatch, [draws.len() as u32, 0, 0], false),
+            Cmd::TimesBegin(Some(d)) => {
+                let d = &draws[*d];
+                let indirect = matches!(d.snap.work, DeferredWork::Indirect { .. });
+                super::gpu_times::before(this, d.snap.mesh.pso, super::gpu_times::Kind::Mesh(d.kind), d.size, indirect);
+            }
+            Cmd::TimesEnd => super::gpu_times::after(this),
+        }
+    }
+}
+
+/// The deferred draws of the list `this`, recorded now (`batch_commands`); nothing when it has
+/// none.
+pub(super) unsafe fn flush_two_pass(this: *mut c_void) {
+    if DEFERRING_LISTS.load(Ordering::Relaxed) == 0 || !DEFERRING.contains(this as usize) {
+        return;
+    }
+    unmark_deferring(this);
+    let (draws, records, open) = with(this, |s| (std::mem::take(&mut s.deferred), s.batch_buf.as_ref().map(|b| b.res.clone()), s.batch_open));
+    if draws.is_empty() {
+        return;
+    }
+    let (Some(list), Some(records)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), records) else { return };
+    let snaps: Vec<DrawSnap> = draws.iter().map(|d| d.snap).collect();
+    let cmds = batch_commands(&snaps, records.as_raw() as usize, open);
+    emit_commands(this, list, &cmds, &draws);
+    with(this, |s| (s.batch_used, s.batch_open) = (0, true));
+    for d in &draws {
+        mesh_work(this, super::targets::RAN);
+        let (what, size) = match d.snap.work {
+            DeferredWork::Mesh { .. } => (super::watch::MESH, [d.size[0].saturating_mul(d.size[1]).saturating_mul(d.size[2]), 0, 0]),
+            DeferredWork::Indirect { .. } => (super::watch::INDIRECT_MESH, [1, 0, 0]),
+        };
+        super::watch::note(d.raw_pso, what, size);
+        count(DRAWS);
+    }
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    static DRAWN: AtomicU64 = AtomicU64::new(0);
+    let n = RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+    let drawn = DRAWN.fetch_add(draws.len() as u64, Ordering::Relaxed) + draws.len() as u64;
+    if n <= 8 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: deferred two-pass draws: run #{n} of {} ({drawn} in all, {:.1} a run)", draws.len(), drawn as f64 / n as f64);
+    }
+}
+
+/// A region of `region` bytes in the batch record buffer of `this` for the next deferred draw
+/// (the run so far is recorded first when it does not fit): its GPU address.
+unsafe fn batch_region(this: *mut c_void, region: u64) -> Result<u64, String> {
+    let bytes = batch_records_bytes();
+    if with(this, |s| s.batch_buf.is_none()) {
+        let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
+        let buf = match take_free(dev.as_raw() as usize, bytes, bytes) {
+            Some(b) => b,
+            // (a new one only while the two-pass buffers alive leave half the budget: past it the
+            // draws go at once, and the records they need alone are still made)
+            None if TWO_PASS[TP_ALIVE].load(Ordering::Relaxed).saturating_add(bytes) > two_pass_cap() / 2 => return Err("the two-pass buffers alive are at half their budget".into()),
+            None => TwoPassBuf::make(&dev, bytes, "two-pass batch records")?,
+        };
+        with(this, |s| (s.batch_buf, s.batch_used, s.batch_open) = (Some(buf), 0, false));
+    }
+    let (used, cap) = with(this, |s| (s.batch_used, s.batch_buf.as_ref().map_or(0, |b| b.bytes)));
+    let at = match batch_place(used, region, cap) {
+        Some(at) => at,
+        None => {
+            flush_two_pass(this);
+            0
+        }
+    };
+    if at + region > cap {
+        return Err("its records are more than the batch record buffer".into());
+    }
+    let va = with(this, |s| {
+        s.batch_used = at + region;
+        s.batch_buf.as_ref().map(|b| b.res.GetGPUVirtualAddress())
+    });
+    va.map(|va| va + at).ok_or_else(|| "no batch record buffer".into())
+}
+
+/// `draw` deferred on `this`; the run is recorded when it has `batch_most` draws.
+unsafe fn push_deferred(this: *mut c_void, draw: DeferredDraw) {
+    let n = with(this, |s| {
+        s.deferred.push(draw);
+        s.deferred.len()
+    });
+    mark_deferring(this);
+    if n >= batch_most() {
+        flush_two_pass(this);
+    }
+}
+
+/// A two-pass DispatchMesh of `dims` groups with `tp` (`pso`: its mesh pass's pipeline) deferred
+/// on `this` (`XCL_TWO_PASS_BATCH=2`). False: not deferred – the caller records the run so far
+/// and this draw at once, as without.
+unsafe fn defer_dispatch_mesh(this: *mut c_void, tp: &Arc<super::real::TwoPassPso>, pso: usize, raw_pso: usize, dims: [u32; 3]) -> bool {
+    let groups = dims[0].saturating_mul(dims[1]).saturating_mul(dims[2]);
+    let record_bytes = tp.record.record_dwords() as u64 * 4;
+    let region = batch_region_bytes((groups as u64).saturating_mul(record_bytes));
+    let ty = super::list_x::tracked_list_type(this);
+    if groups == 0 || defer_check(true, ty, super::capture::on(), 1, region, batch_records_bytes()).is_err() {
+        return false;
+    }
+    // (as many groups as the draw alone would have: its region holds them all)
+    let n = groups.min(record_groups(region, record_bytes, tp.mesh_groups_per_record));
+    if n == 0 {
+        return false;
+    }
+    let Ok(records) = batch_region(this, region) else { return false };
+    super::list_x::ensure_view_heap(this);
+    let (Ok(compute), Ok(mesh)) = (prepare_two_pass_stage(this, pso, tp, records, true), prepare_two_pass_stage(this, pso, tp, records, false)) else { return false };
+    let work = DeferredWork::Mesh { groups: n, mesh_groups: n * tp.mesh_groups_per_record };
+    push_deferred(this, DeferredDraw { snap: DrawSnap { compute, mesh, work }, _tp: tp.clone(), _mesh_pso: held_pso(pso), _block: None, raw_pso, kind: tp.kind, size: dims });
+    true
+}
+
+/// A two-pass ExecuteIndirect of one command deferred (`defer_dispatch_mesh`): `sig` with the
+/// DispatchMesh signature `msig`, its command at UMA address `src`, its count at `count`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn defer_execute_indirect(this: *mut c_void, tp: &Arc<super::real::TwoPassPso>, pso: usize, raw_pso: usize, sig: usize, msig: DispatchMeshSig, max: u32, src: usize, count: Option<usize>) -> bool {
+    let record_bytes = tp.record.record_dwords() as u64 * 4;
+    let region = batch_region_bytes(indirect_record_need(record_bytes, tp.mesh_groups_per_record));
+    let ty = super::list_x::tracked_list_type(this);
+    if defer_check(true, ty, super::capture::on(), max, region, batch_records_bytes()).is_err() {
+        return false;
+    }
+    // (the groups a command keeps: as the draw alone, `two_pass_record_buffers_fit_what_their_draws_need`)
+    let cap = record_groups(region, record_bytes, tp.mesh_groups_per_record);
+    if cap == 0 {
+        return false;
+    }
+    let Ok(records) = batch_region(this, region) else { return false };
+    super::list_x::ensure_view_heap(this);
+    let (Ok(compute), Ok(mesh)) = (prepare_two_pass_stage(this, pso, tp, records, true), prepare_two_pass_stage(this, pso, tp, records, false)) else { return false };
+    let Ok((rewrite, block, at)) = prepare_scaled_args(this, src, count, 1, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap) else { return false };
+    // (the block is in INDIRECT_ARGUMENT after the run, `scratch_in_args`)
+    let before = scratch_state(with(this, |s| std::mem::replace(&mut s.scratch_in_args, true)));
+    let work = DeferredWork::Indirect { rewrite, block: block.as_raw() as usize, before, companion: msig.companion_dispatch, sig, compute_at: at, mesh_at: at + msig.byte_stride as u64 };
+    push_deferred(this, DeferredDraw { snap: DrawSnap { compute, mesh, work }, _tp: tp.clone(), _mesh_pso: held_pso(pso), _block: Some(block), raw_pso, kind: tp.kind, size: [max, 0, 0] });
+    true
+}
+
+/// A reference to the pipeline `pso` for as long as a deferred draw names it.
+unsafe fn held_pso(pso: usize) -> Option<ID3D12PipelineState> {
+    let p = pso as *mut c_void;
+    ID3D12PipelineState::from_raw_borrowed(&p).cloned()
+}
+
 /// Smallest and largest record buffer. The smallest is an argument scratch block's size
 /// (`SCRATCH_BLOCK`), so a freed one of either serves both.
 const RECORD_MIN: u64 = 1 << 20;
@@ -1105,6 +1604,42 @@ unsafe fn bind_two_pass_stage(
 ) -> Result<(), String> {
     // the pair is translated with heap windows when they are on (`pso::mem_windows`): as `bind_abi`
     super::list_x::ensure_view_heap(this);
+    let stage = prepare_two_pass_stage(this, real_mesh_pso, tp, res_va, compute_pass)?;
+    emit_two_pass_stage(list, &stage, compute_pass);
+    Ok(())
+}
+
+/// What a two-pass stage binds: its root signature, pipeline and root views – the io block made
+/// from the title's root arguments as they are when it is prepared, the records, the memory
+/// windows (`prepare_two_pass_stage`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StageBind {
+    rs: usize,
+    pso: usize,
+    views: [u64; 6],
+}
+
+/// `stage` on `list`: root signature, root views, pipeline.
+unsafe fn emit_two_pass_stage(list: &ID3D12GraphicsCommandList, stage: &StageBind, compute_pass: bool) {
+    let (rs_raw, pso_raw) = (stage.rs as *mut c_void, stage.pso as *mut c_void);
+    let (Some(rs), Some(pc)) = (ID3D12RootSignature::from_raw_borrowed(&rs_raw), ID3D12PipelineState::from_raw_borrowed(&pso_raw)) else { return };
+    if compute_pass {
+        list.SetComputeRootSignature(rs);
+        for (k, &v) in stage.views.iter().enumerate() {
+            list.SetComputeRootUnorderedAccessView(k as u32, v);
+        }
+    } else {
+        list.SetGraphicsRootSignature(rs);
+        for (k, &v) in stage.views.iter().enumerate() {
+            list.SetGraphicsRootUnorderedAccessView(k as u32, v);
+        }
+    }
+    list.SetPipelineState(pc);
+}
+
+/// The binding of a two-pass stage with the title's root arguments as they are now, written to
+/// unified memory (its io block and argument table): nothing is recorded on the list.
+unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &super::real::TwoPassPso, res_va: u64, compute_pass: bool) -> Result<StageBind, String> {
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let first = first_window(super::real::uma_window_va(0), u.shadowed())?;
     let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
@@ -1122,27 +1657,16 @@ unsafe fn bind_two_pass_stage(
     let io = two_pass_io(layout.as_deref(), &args, table_at as u64, compute_pass, u.base(), heaps);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
-    let rs_raw = if compute_pass { tp.compute_rs } else { tp.mesh_rs } as *mut c_void;
-    let rs = ID3D12RootSignature::from_raw_borrowed(&rs_raw).ok_or("two-pass root signature")?;
-    let views = [va(io_at), res_va].into_iter().chain((0..4).map(|k| super::real::uma_window_va(k).unwrap_or(first)));
-    if compute_pass {
-        list.SetComputeRootSignature(rs);
-        for (k, v) in views.enumerate() {
-            list.SetComputeRootUnorderedAccessView(k as u32, v);
-        }
-        let pso_raw = tp.compute as *mut c_void;
-        let pc = ID3D12PipelineState::from_raw_borrowed(&pso_raw).ok_or("two-pass compute pipeline")?;
-        list.SetPipelineState(pc);
-    } else {
-        list.SetGraphicsRootSignature(rs);
-        for (k, v) in views.enumerate() {
-            list.SetGraphicsRootUnorderedAccessView(k as u32, v);
-        }
-        let pso_raw = real_mesh_pso as *mut c_void;
-        let pc = ID3D12PipelineState::from_raw_borrowed(&pso_raw).ok_or("two-pass mesh pipeline")?;
-        list.SetPipelineState(pc);
+    let rs = if compute_pass { tp.compute_rs } else { tp.mesh_rs };
+    if rs == 0 {
+        return Err("two-pass root signature".into());
     }
-    Ok(())
+    let pso = if compute_pass { tp.compute } else { real_mesh_pso };
+    if pso == 0 {
+        return Err(if compute_pass { "two-pass compute pipeline" } else { "two-pass mesh pipeline" }.into());
+    }
+    let w = |k: usize| super::real::uma_window_va(k).unwrap_or(first);
+    Ok(StageBind { rs, pso, views: [va(io_at), res_va, w(0), w(1), w(2), w(3)] })
 }
 
 /// The pass that rewrites a two-pass ExecuteIndirect's arguments, on XCL's ABI: u0 = `count`,
@@ -1257,6 +1781,43 @@ fn scale_views(consts: u64, src: u64, dst: u64, count: Option<u64>) -> [(u32, u6
 /// count (`count`: its UMA address, when the title gave a count buffer).
 #[allow(clippy::too_many_arguments)]
 unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32, batch: bool) -> Result<(ID3D12Resource, u64), String> {
+    let (rewrite, dst, dst_off) = prepare_scaled_args(this, src, count, max, stride, mesh_offset, split, cap)?;
+    // the title's writes of the arguments before this (`fresh_indirect_arguments`)
+    if batch {
+        let before = scratch_state(with(this, |s| s.scratch_in_args));
+        emit_uav_and_transition(list, None, &dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    } else {
+        emit_uav_barrier(list, None);
+        emit_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    let (rs_raw, pso_raw) = (rewrite.rs as *mut c_void, rewrite.pso as *mut c_void);
+    list.SetComputeRootSignature(ID3D12RootSignature::from_raw_borrowed(&rs_raw));
+    list.SetPipelineState(ID3D12PipelineState::from_raw_borrowed(&pso_raw));
+    for (slot, va) in rewrite.views {
+        list.SetComputeRootUnorderedAccessView(slot, va);
+    }
+    list.Dispatch(rewrite.groups, 1, 1);
+    emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    if batch {
+        with(this, |s| s.scratch_in_args = true);
+    }
+    Ok((dst, dst_off))
+}
+
+/// The pass that rewrites an ExecuteIndirect's arguments as bound (`SCALE_ARGS_HLSL`): its root
+/// signature and pipeline (made once a device, kept), root views and groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rewrite {
+    rs: usize,
+    pso: usize,
+    views: [(u32, u64); 4],
+    groups: u32,
+}
+
+/// `make_scaled_args_buffer` up to what it records: the rewrite's constants in unified memory,
+/// its place in a scratch block, the block and the offset.
+#[allow(clippy::too_many_arguments)]
+unsafe fn prepare_scaled_args(this: *mut c_void, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(Rewrite, ID3D12Resource, u64), String> {
     let dev = super::real::list_device(this).ok_or("no device")?;
     let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
@@ -1278,25 +1839,9 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     let p = with(this, |s| s.arena.take(u, consts.len(), 256, &mut s.uma)).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
-    // the title's writes of the arguments before this (`fresh_indirect_arguments`)
-    if batch {
-        let before = scratch_state(with(this, |s| s.scratch_in_args));
-        emit_uav_and_transition(list, None, &dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    } else {
-        emit_uav_barrier(list, None);
-        emit_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    }
-    list.SetComputeRootSignature(&rs);
-    list.SetPipelineState(&pso);
-    for (slot, va) in scale_views(consts_va, src_va, dst.GetGPUVirtualAddress() + dst_off, count_va) {
-        list.SetComputeRootUnorderedAccessView(slot, va);
-    }
-    list.Dispatch(max.div_ceil(64), 1, 1);
-    emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    if batch {
-        with(this, |s| s.scratch_in_args = true);
-    }
-    Ok((dst, dst_off))
+    let views = scale_views(consts_va, src_va, dst.GetGPUVirtualAddress() + dst_off, count_va);
+    // (the pair is the device's for good: `scale_indirect_pipeline` keeps it)
+    Ok((Rewrite { rs: rs.as_raw() as usize, pso: pso.as_raw() as usize, views, groups: max.div_ceil(64) }, dst, dst_off))
 }
 
 /// The state the scratch block of a recording is in before a rewrite: INDIRECT_ARGUMENT when the
@@ -1373,6 +1918,13 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         }
         DrawPipeline::Other => None,
     };
+    // (XCL_TWO_PASS_BATCH=2: deferred, or the deferred ones recorded before this one)
+    if let Some(tp) = &tp {
+        if two_pass_defer() && defer_dispatch_mesh(this, tp, pso, raw_pso, [x, y, z]) {
+            return;
+        }
+    }
+    flush_two_pass(this);
     if let Some(tp) = tp {
         let groups = x.saturating_mul(y).saturating_mul(z);
         if groups == 0 {
@@ -1461,6 +2013,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // (a dispatching one whose pipeline would be waited for here: at the submit, `list_x::defer`;
     // recorded there through this call, with everything below)
     let unbuilt_compute = signature_dispatches(sig) && super::pso_async::waits_for(raw_pso) && super::real::is_console_compute(raw_pso);
+    if unbuilt_compute {
+        flush_two_pass(this);
+    }
     if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
         super::capture::outcome(super::capture::Outcome::Deferred);
         return super::pso_async::need_by_submit(raw_pso);
@@ -1507,6 +2062,22 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             return;
         };
+        // (XCL_TWO_PASS_BATCH=2: one command whose arguments and count are in unified memory
+        // deferred; anything else as without, after the deferred draws before it)
+        if two_pass_defer() && max == 1 && args != 0 {
+            let src = commands_at.filter(|&(_, n)| msig.byte_stride as usize <= n).map(|(p, _)| p);
+            let count = match (count_buf, count_at) {
+                (0, _) => Some(None),
+                (_, Some(p)) => Some(Some(p)),
+                _ => None,
+            };
+            if let (Some(src), Some(count)) = (src, count) {
+                if defer_execute_indirect(this, &tp, pso, raw_pso, sig, msig, max, src, count) {
+                    return;
+                }
+            }
+        }
+        flush_two_pass(this);
         {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
             super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [max, 0, 0], true);
@@ -1571,6 +2142,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             return;
         }
     }
+    flush_two_pass(this);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     if !gfx && !compute {
         // (a pipeline still being built: skipped above, `DrawPipeline::StandIn`)
@@ -4302,6 +4874,284 @@ void main(uint t : SV_GroupIndex) {
         reset(list, 0, 0);
         assert_eq!(with(list, |s| (s.scratch_in_args, s.record_open)), (false, None), "the next recording takes fresh buffers");
         forget(list);
+    }
+
+    /// A deferred DispatchMesh or ExecuteIndirect as `prepare_two_pass_stage` would snapshot it,
+    /// draw `k` of a run with one pipeline pair: the title's root arguments of each draw give it
+    /// io blocks of its own; its records are region `k` of the batch buffer at `0x9000_0000`.
+    fn snap(k: u64, indirect: Option<usize>) -> DrawSnap {
+        let records = 0x9000_0000 + k * 0x1_0000;
+        let w = [0x5000_0000, 0x5100_0000, 0x5200_0000, 0x5300_0000];
+        let compute = StageBind { rs: 0xC0, pso: 0xC1, views: [0x4000_0000 + k * 0x200, records, w[0], w[1], w[2], w[3]] };
+        let mesh = StageBind { rs: 0xA0, pso: 0xA1, views: [0x4000_0100 + k * 0x200, records, w[0], w[1], w[2], w[3]] };
+        let work = match indirect {
+            None => DeferredWork::Mesh { groups: 3 + k as u32, mesh_groups: 2 * (3 + k as u32) },
+            Some(block) => DeferredWork::Indirect {
+                rewrite: Rewrite { rs: 0xE0, pso: 0xE1, views: [(0, 0x4100_0000 + k * 0x100), (2, 0x4200_0000 + k * 16), (3, 0x7000 + k * 32), (4, 0x4100_0000 + k * 0x100)], groups: 1 },
+                block,
+                before: D3D12_RESOURCE_STATE_COMMON,
+                companion: 0xD0,
+                sig: 0xD1,
+                compute_at: k * 32,
+                mesh_at: k * 32 + 16,
+            },
+        };
+        DrawSnap { compute, mesh, work }
+    }
+
+    /// What the unbatched path records for `d`, as `make_scaled_args_buffer`,
+    /// `emit_two_pass_stage` and the PC calls after it record it (barriers left out).
+    fn unbatched_commands(d: &DrawSnap) -> Vec<Cmd> {
+        let mut v = Vec::new();
+        if let DeferredWork::Indirect { rewrite, .. } = d.work {
+            v.extend([Cmd::ComputeRs(rewrite.rs), Cmd::Pso(rewrite.pso)]);
+            v.extend(rewrite.views.iter().map(|&(s, va)| Cmd::ComputeView(s, va)));
+            v.push(Cmd::Dispatch(rewrite.groups));
+        }
+        v.push(Cmd::ComputeRs(d.compute.rs));
+        v.extend(d.compute.views.iter().enumerate().map(|(k, &va)| Cmd::ComputeView(k as u32, va)));
+        v.push(Cmd::Pso(d.compute.pso));
+        v.push(match d.work {
+            DeferredWork::Mesh { groups, .. } => Cmd::Dispatch(groups),
+            DeferredWork::Indirect { block, companion, compute_at, .. } => Cmd::Indirect(companion, block, compute_at),
+        });
+        v.push(Cmd::GraphicsRs(d.mesh.rs));
+        v.extend(d.mesh.views.iter().enumerate().map(|(k, &va)| Cmd::GraphicsView(k as u32, va)));
+        v.push(Cmd::Pso(d.mesh.pso));
+        v.push(match d.work {
+            DeferredWork::Mesh { mesh_groups, .. } => Cmd::DispatchMesh(mesh_groups),
+            DeferredWork::Indirect { block, sig, mesh_at, .. } => Cmd::Indirect(sig, block, mesh_at),
+        });
+        v
+    }
+
+    /// A GPU call with the state it runs with: the call, the pipeline, and the root signature and
+    /// root views of its side (compute for a Dispatch or an ExecuteIndirect of a companion
+    /// Dispatch signature – `0xD0` / `0xE0`.. in `snap` – graphics otherwise).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Call {
+        call: Cmd,
+        pso: usize,
+        rs: usize,
+        views: std::collections::BTreeMap<u32, u64>,
+    }
+
+    /// The calls of `cmds` with the state each runs with (a root signature that changes drops
+    /// the root views, as D3D12 does).
+    fn calls(cmds: &[Cmd]) -> Vec<Call> {
+        use std::collections::BTreeMap;
+        let (mut crs, mut grs, mut pso) = (0, 0, 0);
+        let (mut cv, mut gv) = (BTreeMap::new(), BTreeMap::new());
+        let mut out = Vec::new();
+        for c in cmds {
+            match *c {
+                Cmd::ComputeRs(r) => {
+                    if r != crs {
+                        cv.clear();
+                    }
+                    crs = r;
+                }
+                Cmd::GraphicsRs(r) => {
+                    if r != grs {
+                        gv.clear();
+                    }
+                    grs = r;
+                }
+                Cmd::Pso(p) => pso = p,
+                Cmd::ComputeView(s, va) => {
+                    cv.insert(s, va);
+                }
+                Cmd::GraphicsView(s, va) => {
+                    gv.insert(s, va);
+                }
+                Cmd::Dispatch(_) | Cmd::Indirect(0xD0, ..) => out.push(Call { call: c.clone(), pso, rs: crs, views: cv.clone() }),
+                Cmd::DispatchMesh(_) | Cmd::Indirect(..) => out.push(Call { call: c.clone(), pso, rs: grs, views: gv.clone() }),
+                Cmd::Barriers { .. } | Cmd::TimesBegin(_) | Cmd::TimesEnd => {}
+            }
+        }
+        out
+    }
+
+    /// A run of N DispatchMesh draws, the title's root arguments set between them (an io block
+    /// each): every compute pass, then one ResourceBarrier call (a UAV barrier on the records),
+    /// then every mesh pass in the title's order; the root signatures and pipelines set once,
+    /// each pass with all its root views. After a run whose mesh passes may still read the
+    /// records, one barrier on them first.
+    #[test]
+    fn a_run_of_deferred_draws_records_its_compute_passes_then_one_barrier_then_its_mesh_passes() {
+        let n = 5;
+        let draws: Vec<DrawSnap> = (0..n).map(|k| snap(k, None)).collect();
+        let cmds = batch_commands(&draws, 0x900, false);
+        let mut want = vec![Cmd::TimesBegin(None), Cmd::ComputeRs(0xC0), Cmd::Pso(0xC1)];
+        for d in &draws {
+            want.extend(d.compute.views.iter().enumerate().map(|(k, &va)| Cmd::ComputeView(k as u32, va)));
+            let DeferredWork::Mesh { groups, .. } = d.work else { unreachable!() };
+            want.push(Cmd::Dispatch(groups));
+        }
+        want.extend([Cmd::TimesEnd, Cmd::Barriers { all: false, uav: Some(0x900), transitions: vec![] }]);
+        for (i, d) in draws.iter().enumerate() {
+            want.push(Cmd::TimesBegin(Some(i)));
+            if i == 0 {
+                want.extend([Cmd::GraphicsRs(0xA0), Cmd::Pso(0xA1)]);
+            }
+            want.extend(d.mesh.views.iter().enumerate().map(|(k, &va)| Cmd::GraphicsView(k as u32, va)));
+            let DeferredWork::Mesh { mesh_groups, .. } = d.work else { unreachable!() };
+            want.extend([Cmd::DispatchMesh(mesh_groups), Cmd::TimesEnd]);
+        }
+        assert_eq!(cmds, want);
+        let barriers = |c: &[Cmd]| c.iter().filter(|c| matches!(c, Cmd::Barriers { .. })).count();
+        assert_eq!(barriers(&cmds), 1, "one ResourceBarrier call for the run");
+        let after_open = batch_commands(&draws, 0x900, true);
+        assert_eq!(after_open[0], Cmd::Barriers { all: false, uav: Some(0x900), transitions: vec![] }, "the last run's mesh passes first");
+        assert_eq!(after_open[1..], cmds[..]);
+    }
+
+    /// ExecuteIndirect draws in a run: one ResourceBarrier call before the argument rewrites (a
+    /// UAV barrier on all resources and each argument block, once, from the state it was in, to
+    /// UNORDERED_ACCESS), the rewrites, one call taking the blocks to INDIRECT_ARGUMENT, the
+    /// compute passes, one barrier on the records, the mesh passes.
+    #[test]
+    fn a_run_of_deferred_execute_indirects_rewrites_every_argument_first() {
+        use D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT as ARGS;
+        use D3D12_RESOURCE_STATE_UNORDERED_ACCESS as UAV;
+        let mut draws: Vec<DrawSnap> = vec![snap(0, Some(0xB1)), snap(1, None), snap(2, Some(0xB1)), snap(3, Some(0xB2))];
+        if let DeferredWork::Indirect { before, .. } = &mut draws[2].work {
+            // (a later draw in the block found it left in INDIRECT_ARGUMENT by the first)
+            *before = ARGS;
+        }
+        let cmds = batch_commands(&draws, 0x900, true);
+        let barriers: Vec<&Cmd> = cmds.iter().filter(|c| matches!(c, Cmd::Barriers { .. })).collect();
+        assert_eq!(
+            barriers,
+            [
+                &Cmd::Barriers { all: true, uav: None, transitions: vec![(0xB1, D3D12_RESOURCE_STATE_COMMON, UAV), (0xB2, D3D12_RESOURCE_STATE_COMMON, UAV)] },
+                &Cmd::Barriers { all: false, uav: None, transitions: vec![(0xB1, UAV, ARGS), (0xB2, UAV, ARGS)] },
+                &Cmd::Barriers { all: false, uav: Some(0x900), transitions: vec![] },
+            ]
+        );
+        let at = |c: &Cmd| cmds.iter().position(|x| x == c).unwrap();
+        let c = calls(&cmds);
+        // three rewrites, four compute passes, four mesh passes, in that order
+        let kinds: Vec<u8> = c.iter().map(|x| if x.pso == 0xE1 { 0 } else if x.pso == 0xC1 { 1 } else { 2 }).collect();
+        assert_eq!(kinds, [0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]);
+        assert!(at(barriers[1]) > at(&Cmd::Dispatch(1)) && at(barriers[1]) < at(&Cmd::Indirect(0xD0, 0xB1, 0)));
+    }
+
+    /// Each draw of a run runs every call – the rewrite, the compute pass, the mesh pass – with the
+    /// pipeline, root signature and root views the unbatched path gives it, and its mesh passes
+    /// keep the title's order.
+    #[test]
+    fn deferred_draws_run_with_what_the_unbatched_path_gives_them() {
+        let draws: Vec<DrawSnap> = (0..6).map(|k| snap(k, (k % 2 == 1).then_some(0xB0 + k as usize / 4))).collect();
+        let batched = calls(&batch_commands(&draws, 0x900, false));
+        let alone: Vec<Vec<Call>> = draws.iter().map(|d| calls(&unbatched_commands(d))).collect();
+        let indirect: Vec<usize> = (0..draws.len()).filter(|&k| matches!(draws[k].work, DeferredWork::Indirect { .. })).collect();
+        let rewrites: Vec<Call> = indirect.iter().map(|&k| alone[k][0].clone()).collect();
+        let compute: Vec<Call> = alone.iter().map(|c| c[c.len() - 2].clone()).collect();
+        let mesh: Vec<Call> = alone.iter().map(|c| c[c.len() - 1].clone()).collect();
+        let want: Vec<Call> = rewrites.into_iter().chain(compute).chain(mesh).collect();
+        assert_eq!(batched, want);
+    }
+
+    /// A run goes on only across the title's root signature and root argument sets, the calls
+    /// that record nothing, and DispatchMesh / ExecuteIndirect (at their slots of the title's
+    /// layout): every other title call records it first. Calls from XCL or the runtime, and calls
+    /// on a list with nothing deferred, do not.
+    #[test]
+    fn a_title_call_records_the_deferred_draws_first_unless_it_cannot_change_them() {
+        for newer in [false, true] {
+            let kept: Vec<usize> = (0..600).filter(|&s| keeps_two_pass_batch(s, newer)).collect();
+            let (ei, dm) = if newer { (61, 129) } else { (59, 127) };
+            let want: Vec<usize> = (0..=8).chain(33..=46).chain([ei, dm]).collect();
+            assert_eq!(kept, want, "newer layout: {newer}");
+            // pipelines, barriers, draws, dispatches, copies, clears, IA / RS / OM state, heaps,
+            // queries, predication, bundles, markers, Close, Reset, the console's own methods
+            for slot in [25, 26, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 27, 28, 29, 30, 31, 32, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 9, 10, 11, 60, 67, 78, 81, 85, 93, 104, 105, 106, 124, 125, 139, 146, 148] {
+                assert!(flush_wanted(slot, newer, true, true), "slot {slot}, newer layout: {newer}");
+            }
+            // the other layout's DispatchMesh / ExecuteIndirect slots are other methods there
+            let (other_ei, other_dm) = if newer { (59, 127) } else { (61, 129) };
+            assert!(flush_wanted(other_ei, newer, true, true) && flush_wanted(other_dm, newer, true, true));
+            assert!(!flush_wanted(ei, newer, true, true) && !flush_wanted(36, newer, true, true));
+            assert!(!flush_wanted(25, newer, false, true), "XCL's own calls");
+            assert!(!flush_wanted(25, newer, true, false), "nothing deferred");
+        }
+    }
+
+    /// A two-pass draw is deferred only on a direct list, without a capture, as one command, with
+    /// records that fit a batch record buffer; otherwise the run is recorded and it goes at once.
+    #[test]
+    fn only_single_two_pass_draws_on_direct_lists_are_deferred() {
+        let direct = Some(D3D12_COMMAND_LIST_TYPE_DIRECT);
+        let mib = 1u64 << 20;
+        assert_eq!(defer_check(true, direct, false, 1, 32 * mib, 128 * mib), Ok(()));
+        assert_eq!(defer_check(true, direct, false, 1, 128 * mib, 128 * mib), Ok(()));
+        assert_eq!(defer_check(false, direct, false, 1, mib, 128 * mib), Err(NoDefer::Off));
+        for ty in [Some(D3D12_COMMAND_LIST_TYPE_BUNDLE), Some(D3D12_COMMAND_LIST_TYPE_COMPUTE), None] {
+            assert_eq!(defer_check(true, ty, false, 1, mib, 128 * mib), Err(NoDefer::NotDirect));
+        }
+        assert_eq!(defer_check(true, direct, true, 1, mib, 128 * mib), Err(NoDefer::Capture));
+        for commands in [0, 2, 64] {
+            assert_eq!(defer_check(true, direct, false, commands, mib, 128 * mib), Err(NoDefer::Commands));
+        }
+        assert_eq!(defer_check(true, direct, false, 1, 128 * mib + 256, 128 * mib), Err(NoDefer::TooBig));
+    }
+
+    /// Each deferred draw has a region of its own in the batch record buffer, one after the other
+    /// (256-aligned, as much as the draw alone would have); one that does not fit after them has
+    /// the run recorded first and starts again at the start. An ExecuteIndirect keeps the groups
+    /// it had alone.
+    #[test]
+    fn deferred_draws_take_regions_of_their_own_until_the_buffer_is_full() {
+        let mib = 1u64 << 20;
+        assert_eq!(batch_region_bytes(2 * 47_632), 95_488);
+        assert_eq!(batch_region_bytes(0), 256);
+        let (mut used, mut at) = (0, Vec::new());
+        for need in [95_264u64, 32 * mib, 32 * mib, 32 * mib, 32 * mib] {
+            let region = batch_region_bytes(need);
+            let place = batch_place(used, region, 128 * mib);
+            at.push(place);
+            used = place.unwrap_or(0) + region;
+        }
+        assert_eq!(at, [Some(0), Some(95_488), Some(95_488 + 32 * mib), Some(95_488 + 64 * mib), None], "the fifth after a recorded run");
+        assert_eq!(batch_place(96 * mib, 32 * mib, 128 * mib), Some(96 * mib), "up to the end");
+        assert_eq!(batch_place(u64::MAX - 8, 256, 128 * mib), None);
+        for record in [64u64, 4_096, 47_632, 300_000] {
+            for split in [1u32, 3] {
+                let need = indirect_record_need(record, split);
+                assert_eq!(record_groups(batch_region_bytes(need), record, split), record_groups(record_buffer_bytes(need), record, split), "{record} B, split {split}");
+            }
+        }
+    }
+
+    /// A recording that ends with deferred draws (a Reset with no Close, a list let go) drops them,
+    /// the list is no longer counted as deferring, and its batch record buffer goes with its others.
+    #[test]
+    fn a_recording_that_ends_drops_its_deferred_draws() {
+        let list = 0x7500_0031usize as *mut c_void;
+        let draw = || DeferredDraw {
+            snap: snap(0, None),
+            _tp: Arc::new(super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" }),
+            _mesh_pso: None,
+            _block: None,
+            raw_pso: 0,
+            kind: "MS",
+            size: [1, 1, 1],
+        };
+        let before = DEFERRING_LISTS.load(Ordering::Relaxed);
+        with(list, |s| s.deferred.extend([draw(), draw()]));
+        mark_deferring(list);
+        mark_deferring(list);
+        assert!(DEFERRING.contains(list as usize));
+        reset(list, 0, 0);
+        assert!(!DEFERRING.contains(list as usize));
+        assert!(with(list, |s| s.deferred.is_empty() && s.batch_buf.is_none() && !s.batch_open));
+        with(list, |s| s.deferred.push(draw()));
+        mark_deferring(list);
+        forget(list);
+        assert!(!DEFERRING.contains(list as usize));
+        // (other tests' lists may come and go meanwhile; this one is counted once and gone)
+        assert!(DEFERRING_LISTS.load(Ordering::Relaxed) <= before + 1);
     }
 
     #[test]

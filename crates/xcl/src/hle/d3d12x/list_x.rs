@@ -3157,6 +3157,7 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
         }
         let built = super::pso_async::has_real(super::bind::bound_pso(seg));
         super::pso_async::note_put_off(if built { super::pso_async::PutOff::Recorded } else { super::pso_async::PutOff::Skipped });
+        super::bind::flush_two_pass(seg);
         super::gpu_times::before_close(seg);
         let ext = *(seg as *const usize);
         pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
@@ -3224,6 +3225,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         )
     };
 
+    super::bind::flush_two_pass(list);
     if let Some(((h, i), qty)) = active_query {
         pc::<QueryFn>(list, PC_END_QUERY)(list, h, qty, i);
     }
@@ -3792,6 +3794,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     };
     let (sparse_writes, write64_signals, cpu_writes) = sparse_writes;
 
+    super::bind::flush_two_pass(this);
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
         pc::<QueryFn>(this, PC_END_QUERY)(this, h, qty, i);
