@@ -1047,6 +1047,17 @@ fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
     }
 }
 
+/// The PC method a title call through console command list slot `slot` (the older layout) runs,
+/// by name (`console_remap`); the console's own methods by slot.
+pub(super) fn list_slot_name(slot: usize) -> String {
+    let pc = console_remap(Kind::CommandList).into_iter().find(|e| e.0 == slot).map(|e| e.1).or((slot < 60).then_some(slot));
+    let iface = layout::chain(Kind::CommandList.base()).first().copied();
+    match (pc, iface) {
+        (Some(p), Some(i)) if p < i.methods.len() => i.methods[p].to_string(),
+        _ => format!("console list method #{slot}"),
+    }
+}
+
 /// console D3D12_DESCRIPTOR_HEAP_TYPE also used for CBV / SRV / UAV heaps
 const XBOX_EXTRA_CBV_SRV_UAV: u32 = 4;
 
@@ -3398,7 +3409,7 @@ macro_rules! as_usize {
 /// command list's vtable pointer on Close; adopt the runtime's new state vtable so
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
-    super::bind::flush_two_pass(this);
+    super::bind::flush_two_pass(this, super::bind::RunEnd::Close);
     super::list_x::before_close(this);
     super::gpu_times::before_close(this);
     let ext = *(this as *const usize);
