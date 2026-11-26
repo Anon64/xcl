@@ -2477,6 +2477,9 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if super::targets::enabled() {
         super::present::note_rtv(cpu as usize, res);
     }
+    if super::capture::enabled() {
+        super::capture::note_view(cpu as usize, res as usize, true, copy.as_ref().map(|c| (c as *const D3D12_DEPTH_STENCIL_VIEW_DESC as *const [u32; 6]).read_unaligned()));
+    }
     // `XCL_TRACE_FRAME`: the first 64 DSVs of depth buffers at least 1920 wide (flags 1: read-only
     // depth, 2: read-only stencil)
     if super::present::trace_frame() {
@@ -3599,7 +3602,7 @@ pub(super) const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 |
 /// bits dropped). Logged with the console's values.
 pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let hr = placed_in_heap_x(this, heap, offset, desc, state, clear, riid, ppv);
-    if hr >= 0 && super::lut3d::on() && !ppv.is_null() && desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
+    if hr >= 0 && super::lut3d::created_on() && !ppv.is_null() && desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
         let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
         super::lut3d::created(&format!("CreatePlacedResource (heap {heap:#x} at {offset:#x}: the PC's memory, not kept in step)"), *ppv, Some(&x), None, false, state as u32 & PC_RESOURCE_STATES);
     }
@@ -3792,7 +3795,7 @@ pub(super) unsafe extern "system" fn dev_create_reserved_resource1(this: *mut c_
 /// `XCL_DUMP_TARGETS`: a reserved 3D texture (XCL's own for a placed one too: that placement's
 /// line follows)
 unsafe fn reserved_3d(hr: HRESULT, ppv: *mut *mut c_void, state: usize) -> HRESULT {
-    if hr >= 0 && super::lut3d::on() && !ppv.is_null() {
+    if hr >= 0 && super::lut3d::created_on() && !ppv.is_null() {
         super::lut3d::created("CreateReservedResource (tiles mapped by whoever made it)", *ppv, None, None, false, state as u32);
     }
     hr
@@ -6714,13 +6717,14 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
 /// `XCL_DUMP_TARGETS`: pipeline `*ppv` was made from the graphics desc `desc` – its shaders,
 /// blend state and formats, for the pipelines a dumped target lists (`targets::note_pipeline`).
 unsafe fn note_pipeline_for_dump(this: *mut c_void, desc: *const c_void, ppv: *mut *mut c_void, hr: HRESULT) {
-    if !super::targets::enabled() || hr < 0 || ppv.is_null() || (*ppv).is_null() || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+    if !(super::targets::enabled() || super::capture::enabled()) || hr < 0 || ppv.is_null() || (*ppv).is_null() || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return;
     }
     let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
     // (in `own_graphics`' order: the set's key is the one `pso_async` and `used-pipelines.txt` know)
     let stages: Vec<(&'static str, &[u8])> = [("vs", &d.VS), ("ps", &d.PS), ("ds", &d.DS), ("hs", &d.HS), ("gs", &d.GS)].into_iter().filter_map(|(s, b)| shader_bytes(b).map(|b| (s, b))).collect();
     super::targets::note_pipeline(*ppv as usize, &stages, &d.BlendState.RenderTarget[0], &d.RTVFormats[..d.NumRenderTargets.min(8) as usize], graphics_wave32(this));
+    super::capture::note_graphics(*ppv as usize, d, &stages, graphics_wave32(this));
 }
 
 /// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
@@ -6770,6 +6774,17 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
 }
 
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = compute_pso(this, desc, riid, ppv);
+    // `XCL_CAPTURE_FRAME`: its shader, for a captured frame's pipelines
+    if super::capture::enabled() && hr >= 0 && !ppv.is_null() && crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        if let Some(cs) = shader_bytes(&(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS) {
+            super::capture::note_compute(*ppv as usize, cs);
+        }
+    }
+    hr
+}
+
+unsafe fn compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let _cost = crate::hle::api_cost::time(crate::hle::api_cost::Call::Pipeline);
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
@@ -8182,6 +8197,15 @@ unsafe fn stream_has_unreadable_shader(desc: *const c_void) -> bool {
 }
 
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = pipeline_state(this, desc, riid, ppv);
+    // `XCL_CAPTURE_FRAME`: a stream the graphics and compute paths did not note (mesh)
+    if super::capture::enabled() && hr >= 0 && !ppv.is_null() {
+        super::capture::note_stream(*ppv as usize);
+    }
+    hr
+}
+
+unsafe fn pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
@@ -8278,6 +8302,9 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
     let desc = copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
     f(this, res, desc, handle);
     super::present::note_rtv(handle, res);
+    if super::capture::enabled() {
+        super::capture::note_view(handle, res as usize, false, (!desc.is_null()).then(|| (desc as *const [u32; 6]).read_unaligned()));
+    }
     super::lut3d::wrote(res as usize, false, || {
         let v = copy.filter(|c| c.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE3D).map(|c| (c.Format.0, c.Anonymous.Texture3D));
         format!("a render target view made ({handle:#x}): {}", v.map_or("the default view".into(), |(f, t)| format!("format {f}, mip {}, depth slices {} (+{})", t.MipSlice, t.FirstWSlice, t.WSize as i32)))
@@ -8295,6 +8322,7 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
 unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *const [f32; 4], n: u32, rects: *const c_void) {
     type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "ClearRenderTargetView")));
+    let _c = super::capture::op(this, || Some(super::capture::clear("rtv", rtv as u64, None, color.as_ref().map_or([0; 4], |c| c.map(f32::to_bits)), 0, n)));
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -8317,6 +8345,7 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
+    let _ = super::capture::op(this, || Some(super::capture::targets_op(this)));
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -8816,6 +8845,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    super::capture::submit(this, std::slice::from_raw_parts(lists, n as usize));
     // from here to the end: XCL's uploads and tile mappings before the lists, then the driver's
     // own work in the submission. Where that takes long, it is not the title's time
     // (`pso_async::title_held`)

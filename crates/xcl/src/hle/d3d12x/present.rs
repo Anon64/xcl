@@ -141,6 +141,9 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         }
     }
     let extracted = extract_planes(plane_count, planes);
+    if super::capture::enabled() {
+        super::capture::present(queue as usize, &extracted.iter().map(|e| e.0).collect::<Vec<_>>(), frames);
+    }
     if extracted.is_empty() || !enabled() {
         return;
     }
