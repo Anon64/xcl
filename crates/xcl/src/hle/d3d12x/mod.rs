@@ -26,6 +26,7 @@ pub mod file_reads;
 pub mod frame;
 pub(crate) mod gfx_records;
 mod gpu_profile;
+mod gpu_times;
 pub mod guard;
 mod indirect_guard;
 mod late_release;

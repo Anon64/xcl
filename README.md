@@ -339,6 +339,9 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   the log: `frame.jsonl` (every submit, barrier, copy, clear, draw and dispatch in the order the GPU got
   them, with render targets and root arguments), `resources.jsonl`, `pipelines.jsonl`, the pipelines'
   shaders translated again and `summary.txt`. Every frame is recorded until then, which costs time.
+  `XCL_GPU_TIMES=<frames>[,<s>]` times every draw and dispatch of the next `frames` busy frames (from
+  `s` seconds after the first present) with GPU timestamps and logs the 60 programs that took the
+  most GPU time per frame (`D3D12.X: GPU times:` lines); the times are coarse, fine for ranking.
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and

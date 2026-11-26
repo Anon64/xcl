@@ -1207,6 +1207,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
         let record_bytes = tp.record.record_dwords() as u64 * 4;
         let need = (groups as u64).saturating_mul(record_bytes);
+        super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [x, y, z], false);
         let run = (|| -> Result<(), String> {
             let (res_buf, res_va, cap) = ensure_res_buffer(this, need)?;
             let n = groups.min(record_groups(cap, record_bytes, tp.mesh_groups_per_record));
@@ -1227,6 +1228,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             emit_uav_barrier(list, Some(&res_buf));
             Ok(())
         })();
+        super::gpu_times::after(this);
         match run {
             Ok(()) => {
                 mesh_work(this, super::targets::RAN);
@@ -1330,6 +1332,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         };
         {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+            super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [max, 0, 0], true);
             let run = (|| -> Result<(), String> {
                 if max == 0 || args == 0 {
                     return Ok(());
@@ -1365,6 +1368,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 emit_transition(list, &scaled, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
                 passes
             })();
+            super::gpu_times::after(this);
             match run {
                 Ok(()) => {
                     mesh_work(this, super::targets::RAN);

@@ -3392,6 +3392,7 @@ macro_rules! as_usize {
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     super::list_x::before_close(this);
+    super::gpu_times::before_close(this);
     let ext = *(this as *const usize);
     let f: RefFn = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "Close")));
     let hr = f(this) as HRESULT;
@@ -4992,7 +4993,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             }
             note_translated_compute(0, ppv);
             PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (record, 0));
-            if super::gpu_profile::on() {
+            if super::gpu_profile::on() || super::gpu_times::enabled() {
                 super::gpu_profile::note_compute(record, cs, dxil.len(), wave32_only(this));
             }
             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
@@ -5033,7 +5034,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     note_translated_compute(hr, ppv);
     PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (record, 0));
-    if super::gpu_profile::on() {
+    if super::gpu_profile::on() || super::gpu_times::enabled() {
         super::gpu_profile::note_compute(record, cs, dxil.len(), wave32_only(this));
     }
     crate::xlog_info!(
@@ -6333,7 +6334,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
     TRANSLATED_GRAPHICS.insert(*ppv as usize, ());
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
-    if super::gpu_profile::on() && !super::present::trace_frame() {
+    if (super::gpu_profile::on() || super::gpu_times::enabled()) && !super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
     }
@@ -6424,7 +6425,12 @@ unsafe impl Sync for OwnedDesc {}
 /// pipeline by in the next run.
 /// `shaders_key` of the one shader `blob`.
 pub(crate) fn shader_key(blob: &[u8]) -> u64 {
-    ((0xcbf2_9ce4_8422_2325u64 ^ crate::gpu::shader::fnv64(blob)).wrapping_mul(0x0000_0100_0000_01b3)) | 1
+    shader_key_of_hash(crate::gpu::shader::fnv64(blob))
+}
+
+/// `shader_key` of the shader whose dump hash (`fnv64`) is `hash`.
+pub(crate) fn shader_key_of_hash(hash: u64) -> u64 {
+    ((0xcbf2_9ce4_8422_2325u64 ^ hash).wrapping_mul(0x0000_0100_0000_01b3)) | 1
 }
 
 pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
@@ -7652,6 +7658,9 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
+        if super::gpu_times::enabled() {
+            PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(ms), console_ps.map_or(0, crate::gpu::shader::fnv64)));
+        }
     }
     Some(hr)
 }
@@ -7727,6 +7736,9 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "GS", riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("gs", Some(gs)), ("ps", shader_bytes(&d.PS))]);
+        if super::gpu_times::enabled() {
+            PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(gs), shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64)));
+        }
     }
     hr
 }
@@ -8993,6 +9005,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             let _in_driver = super::watch::in_driver(super::watch::Call::Execute);
             f(this, chunk.len() as u32, chunk.as_ptr());
         }
+        super::gpu_times::executed(this, chunk);
         let t1 = std::time::Instant::now();
         super::submit_cost::driver(t1 - t);
         super::list_x::copy_scratch_submitted(this, chunk);
