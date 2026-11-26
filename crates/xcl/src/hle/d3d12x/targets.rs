@@ -329,30 +329,35 @@ pub fn note_pipeline(pso: usize, stages: &[(&'static str, &[u8])], blend: &D3D12
         return;
     }
     let set = super::real::shaders_key(&stages.iter().map(|(_, b)| b.to_vec()).collect::<Vec<_>>());
-    let stages = {
-        let mut g = BLOBS.lock().unwrap();
-        let (kept, bytes) = g.get_or_insert_with(Default::default);
-        stages
-            .iter()
-            .map(|&(s, b)| {
-                let key = super::real::shader_key(b);
-                let blob = kept.get(&key).cloned().or_else(|| {
-                    if *bytes + b.len() > BLOB_BYTES_MOST {
-                        static ONCE: std::sync::Once = std::sync::Once::new();
-                        ONCE.call_once(|| crate::xlog_warn!("D3D12.X: XCL_DUMP_TARGETS keeps {} MiB of shaders: later ones get no HLSL in a dump", BLOB_BYTES_MOST >> 20));
-                        return None;
-                    }
-                    *bytes += b.len();
-                    let a: Arc<[u8]> = b.into();
-                    kept.insert(key, a.clone());
-                    Some(a)
-                });
-                (s, key, crate::gpu::shader::fnv64(b), blob)
-            })
-            .collect()
-    };
+    let stages = stages
+        .iter()
+        .map(|&(s, b)| {
+            let (key, hash, blob) = keep_shader(b);
+            (s, key, hash, blob)
+        })
+        .collect();
     let p = Pipeline { set, stages, blend: *blend, formats: formats.iter().map(|f| f.0).collect(), split };
     PIPELINES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, Arc::new(p));
+}
+
+/// Shader `b` kept for a dump (`XCL_DUMP_TARGETS`, `XCL_CAPTURE_FRAME`; 512 MiB of them at most):
+/// its `real::shader_key`, its dump hash, and its bytes (None past the cap).
+pub(super) fn keep_shader(b: &[u8]) -> (u64, u64, Option<Arc<[u8]>>) {
+    let key = super::real::shader_key(b);
+    let mut g = BLOBS.lock().unwrap();
+    let (kept, bytes) = g.get_or_insert_with(Default::default);
+    let blob = kept.get(&key).cloned().or_else(|| {
+        if *bytes + b.len() > BLOB_BYTES_MOST {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("D3D12.X: the dump switches keep {} MiB of shaders: later ones get no HLSL in a dump", BLOB_BYTES_MOST >> 20));
+            return None;
+        }
+        *bytes += b.len();
+        let a: Arc<[u8]> = b.into();
+        kept.insert(key, a.clone());
+        Some(a)
+    });
+    (key, crate::gpu::shader::fnv64(b), blob)
 }
 
 /// A D3D12_BLEND by name.
@@ -365,7 +370,7 @@ fn blend_name(b: i32) -> &'static str {
 }
 
 /// Render target 0's blend state as a line: what a pass that comes out inverted is checked by.
-fn blend_text(b: &D3D12_RENDER_TARGET_BLEND_DESC) -> String {
+pub(super) fn blend_text(b: &D3D12_RENDER_TARGET_BLEND_DESC) -> String {
     const OPS: [&str; 6] = ["?", "ADD", "SUBTRACT", "REV_SUBTRACT", "MIN", "MAX"];
     const LOGIC: [&str; 16] = [
         "CLEAR", "SET", "COPY", "COPY_INVERTED", "NOOP", "INVERT", "AND", "NAND", "OR", "NOR", "XOR", "EQUIV", "AND_REVERSE", "AND_INVERTED", "OR_REVERSE", "OR_INVERTED",
@@ -448,12 +453,21 @@ fn log_pipelines(n: u64, f: &Frame, written: &[(usize, usize)]) {
         return;
     }
     let Some(dir) = crate::state::boot().map(|b| b.logs_dir()) else { return };
-    let _ = std::thread::Builder::new().name("xcl-dump-shaders".into()).spawn(move || write_shaders(&dir, files));
+    let _ = std::thread::Builder::new().name("xcl-dump-shaders".into()).spawn(move || {
+        write_shaders(&dir, files, usize::MAX);
+        crate::xlog_info!("D3D12.X: target dump: the shaders of the pipelines listed are written to {}", dir.display());
+    });
 }
 
-/// Writes each console shader's disassembly and its VS / PS translated again, as the pipeline
-/// translates it (`pso::console_translation`; the PS's static samplers after the VS's).
-fn write_shaders(dir: &std::path::Path, files: Vec<(String, &'static str, Arc<[u8]>, Option<Arc<[u8]>>, bool)>) {
+/// A shader to write (`write_shaders`): its file stem, stage (`vs`, `ps`, `cs`, …), bytes, the
+/// pipeline's VS (a PS's static samplers come after the VS's) and whether it is translated for
+/// waves of 32.
+pub(super) type ShaderFile = (String, &'static str, Arc<[u8]>, Option<Arc<[u8]>>, bool);
+
+/// Writes each console shader's disassembly and its VS / PS / CS translated again, as the pipeline
+/// translates it (`pso::console_translation`; the PS's static samplers after the VS's). HLSL past
+/// `hlsl_most` bytes is not written: a note of its size takes its place.
+pub(super) fn write_shaders(dir: &std::path::Path, files: Vec<ShaderFile>, hlsl_most: usize) {
     use crate::gpu::recomp::pso::{console_translation, is_console, mem_windows, Stage};
     let translate = |b: &[u8], stage: Stage, base: u32, split: bool| console_translation(b, stage, base, mem_windows(), split).map(|(t, _)| (t.hlsl, t.static_samplers.len() as u32));
     for (stem, stage, blob, vs, split) in files {
@@ -471,15 +485,16 @@ fn write_shaders(dir: &std::path::Path, files: Vec<(String, &'static str, Arc<[u
                 let samplers = vs.as_deref().filter(|v| is_console(v)).and_then(|v| translate(v, Stage::Vertex, 0, split).ok()).map_or(0, |t| t.1);
                 translate(&blob, Stage::Pixel, samplers, split)
             }
+            "cs" => translate(&blob, Stage::Compute, 0, false),
             _ => Err(format!("a {stage} is not translated here")),
         };
         let text = match hlsl {
+            Ok((h, _)) if h.len() > hlsl_most => format!("// {stem}: translated, {} bytes of HLSL: past {} MiB, not written\n", h.len(), hlsl_most >> 20),
             Ok((h, _)) => format!("// {stem}: translated again from the pipeline's console shader (the HLSL path; XCL_DIRECT_DXIL, a switch-form retry or a debug switch build another)\n{h}"),
             Err(e) => format!("// {stem}: not translated: {e}\n"),
         };
         let _ = std::fs::write(base.with_extension("hlsl"), text);
     }
-    crate::xlog_info!("D3D12.X: target dump: the shaders of the pipelines listed are written to {}", dir.display());
 }
 
 /// readback bytes of one present's target dump at most: 64 targets of 2560x1440 RGBA32F are
