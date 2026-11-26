@@ -173,6 +173,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
+                let (thin, thin_bytes) = crate::hle::d3d12x::vram::skipped_textures();
                 let mb = |b: u64| b >> 20;
                 // (at the end: tools read the line's beginning; the guard script reads the budget)
                 let mut budget_text = if budget != 0 { format!("; video memory budget {} MB", mb(budget)) } else { String::new() };
@@ -184,7 +185,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     warn_low_commit(commit, commit_limit, private as u64, local);
                 }
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped){budget_text}",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped); top mips left out of {} textures ({} MB){budget_text}",
                     mb(private as u64),
                     mb(local),
                     mb(non_local),
@@ -193,7 +194,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(arenas as u64),
                     mb(arenas_made as u64),
                     mb(pools as u64),
-                    mb(pools_mapped as u64)
+                    mb(pools_mapped as u64),
+                    thin,
+                    mb(thin_bytes)
                 );
                 // past the budget Windows moves the process's video memory off the card and
                 // every frame pays for bringing it back; a run at the card's limit is also
