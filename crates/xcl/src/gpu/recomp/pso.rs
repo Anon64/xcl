@@ -162,7 +162,9 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
-    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
+    // (the compute shader `XCL_DEBUG_CS_SUB` names: neither the memory nor the disk entry of its
+    // bytes, which hold it unchanged – translated again, and the result kept in neither)
+    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) || cs_subs(blob, stage).is_some() {
         return compile_one().map(|(c, _)| c);
     }
     let key = ShaderKey {
@@ -601,9 +603,11 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 /// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
 /// disk cache entry then follows that translator's version: `translated::cached`).
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
+    // `XCL_DEBUG_CS_SUB` names this compute shader: the HLSL path, whatever its size
+    let cs_subs = cs_subs(blob, stage);
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
-    if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
+    if stage == Stage::Compute && cs_subs.is_none() && crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -632,7 +636,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         }
     }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
-    if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
+    if cs_subs.is_none() && enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -660,16 +664,13 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }
     // `XCL_DEBUG_PS_SUB=hash:from=>to||from=>to…` (one pixel shader): every `from` in its HLSL
     // becomes `to`
-    if let Some(subs) = (stage == Stage::Pixel).then(|| std::env::var("XCL_DEBUG_PS_SUB").ok()).flatten().and_then(|v| {
-        let (h, rest) = v.split_once(':')?;
-        (u64::from_str_radix(h.trim(), 16).ok()? == crate::gpu::shader::fnv64(blob)).then(|| rest.to_string())
-    }) {
-        for sub in subs.split("||") {
-            let Some((from, to)) = sub.split_once("=>") else { continue };
-            let n = t.hlsl.matches(from).count();
-            crate::xlog_info!("[SHADER] XCL_DEBUG_PS_SUB: {n} occurrence(s) of {from:?} replaced");
-            t.hlsl = t.hlsl.replace(from, to);
+    if let Some(v) = (stage == Stage::Pixel).then(|| std::env::var("XCL_DEBUG_PS_SUB").ok()).flatten() {
+        if let Some(subs) = debug_subs(&v, crate::gpu::shader::fnv64(blob)) {
+            apply_debug_subs(&mut t.hlsl, &subs, "XCL_DEBUG_PS_SUB");
         }
+    }
+    if let Some(subs) = &cs_subs {
+        apply_debug_subs(&mut t.hlsl, subs, "XCL_DEBUG_CS_SUB");
     }
     // `XCL_DEBUG_PS_EXPR=hash:expression` (one pixel shader): its target 0 gets that HLSL
     // expression, e.g. `float4(xi.a1.rgb, 1)` – an input or a register made visible
@@ -681,9 +682,36 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
     if stage == Stage::Compute {
-        note_compute_path(blob, "HLSL");
+        note_compute_path(blob, if cs_subs.is_some() { "HLSL, with XCL_DEBUG_CS_SUB" } else { "HLSL" });
     }
     Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers }, false))
+}
+
+/// `XCL_DEBUG_PS_SUB` / `XCL_DEBUG_CS_SUB` = `hash:from=>to||from=>to…` (a dump hash, hex): the
+/// (from, to) pairs when `hash` is `wanted`; None for another shader or a value of another form.
+/// A part without `=>` is left out.
+fn debug_subs(v: &str, wanted: u64) -> Option<Vec<(String, String)>> {
+    let (h, rest) = v.split_once(':')?;
+    (u64::from_str_radix(h.trim(), 16).ok()? == wanted).then(|| rest.split("||").filter_map(|s| s.split_once("=>")).map(|(f, t)| (f.to_string(), t.to_string())).collect())
+}
+
+/// Every `from` of `subs` in `hlsl` becomes its `to`, one log line each with the occurrences.
+fn apply_debug_subs(hlsl: &mut String, subs: &[(String, String)], switch: &str) {
+    for (from, to) in subs {
+        let n = hlsl.matches(from.as_str()).count();
+        crate::xlog_info!("[SHADER] {switch}: {n} occurrence(s) of {from:?} replaced");
+        *hlsl = hlsl.replace(from.as_str(), to);
+    }
+}
+
+/// `XCL_DEBUG_CS_SUB=hash:from=>to||from=>to…` (one compute shader, by its dump hash): every
+/// `from` in its HLSL becomes `to`. That shader takes the HLSL path (not direct DXIL, however
+/// large) and none of the caches of its console bytes (`console_to_dxil_in`); other compute
+/// shaders are not changed. The pairs for `blob`, if it is the one.
+fn cs_subs(blob: &[u8], stage: Stage) -> Option<Vec<(String, String)>> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    let v = V.get_or_init(|| std::env::var("XCL_DEBUG_CS_SUB").ok()).as_deref()?;
+    (stage == Stage::Compute).then(|| debug_subs(v, crate::gpu::shader::fnv64(blob))).flatten()
 }
 
 /// How each compute program (by dump hash) was translated last in this process (`compute_path`)
@@ -2105,6 +2133,27 @@ mod shader_cache_tests {
             assert!(cache_allowed(Stage::Compute, |v| v == name));
         }
         assert!(cache_allowed(Stage::Pixel, |_| false));
+    }
+
+    /// `XCL_DEBUG_PS_SUB` / `XCL_DEBUG_CS_SUB`: the pairs of the shader named, none for another.
+    #[test]
+    fn a_debug_substitution_names_one_shader_by_its_dump_hash() {
+        let pairs = |v: &[(&str, &str)]| v.iter().map(|(f, t)| (f.to_string(), t.to_string())).collect::<Vec<_>>();
+        let v = "00000000DEADBEEF:r0.x=>0.0f||max(a, b)=>a";
+        assert_eq!(debug_subs(v, 0xdead_beef), Some(pairs(&[("r0.x", "0.0f"), ("max(a, b)", "a")])));
+        assert_eq!(debug_subs(" deadbeef :x=>y", 0xdead_beef), Some(pairs(&[("x", "y")])));
+        assert_eq!(debug_subs(v, 0xdead_bee0), None, "another shader");
+        assert_eq!(debug_subs("deadbeef", 0xdead_beef), None, "no substitutions");
+        assert_eq!(debug_subs("nothex:x=>y", 0xdead_beef), None);
+        // a part without `=>` is left out; `to` may hold a `:`
+        assert_eq!(debug_subs("deadbeef:x||a=>b?c:d", 0xdead_beef), Some(pairs(&[("a", "b?c:d")])));
+        let mut hlsl = "float r0 = a; r0 = a + a;".to_string();
+        apply_debug_subs(&mut hlsl, &pairs(&[("a", "1.0f"), ("r0", "q")]), "XCL_DEBUG_CS_SUB");
+        assert_eq!(hlsl, "flo1.0ft q = 1.0f; q = 1.0f + 1.0f;");
+        // with the switch unset no compute shader is named
+        if std::env::var_os("XCL_DEBUG_CS_SUB").is_none() {
+            assert_eq!(cs_subs(b"console", Stage::Compute), None);
+        }
     }
 
     #[test]
