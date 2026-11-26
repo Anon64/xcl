@@ -133,6 +133,7 @@ pub(super) fn is_placed_texture(resource: usize) -> bool {
 pub(super) fn forget(resource: usize) {
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
+        super::placements::released(resource);
         forget_pages(resource);
         if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
             ARENAS.lock().unwrap().release(id, std::time::Instant::now());
@@ -1045,6 +1046,9 @@ unsafe fn place_on_pages(
         return None;
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+    let (first, own) = owned_pages(va, console_bytes, total as usize).unwrap_or((va, 0));
+    let kind = if gpu_owned(desc.Flags.0 as u32) { super::placements::Kind::Target } else { super::placements::Kind::Sampled };
+    super::placements::placed(raw as usize, va, (first, first + own * PAGE), super::placements::Backing::Pages(dev_key), kind, desc);
     Some(hr)
 }
 
@@ -1496,6 +1500,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     ARENA_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, id);
+    super::placements::placed(*ppv as usize, va, (va, va + info.SizeInBytes as usize), super::placements::Backing::Arena(id), super::placements::Kind::Target, desc);
     Some(hr)
 }
 

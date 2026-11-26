@@ -33,6 +33,7 @@ pub mod list_x;
 mod look_stats;
 mod lut3d;
 pub mod null;
+mod placements;
 pub mod present;
 pub mod pso_async;
 pub mod real;

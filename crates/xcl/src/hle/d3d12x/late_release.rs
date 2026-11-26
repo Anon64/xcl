@@ -240,6 +240,7 @@ pub unsafe fn drain_known(seal_now: bool) {
         // buffer at the same address, whose tiles this would unpin. (`forget_buffer` takes no
         // lock of this module's and does not wait for the sparse state's.)
         super::sparse::forget_buffer(res);
+        super::placements::gone(res);
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
     }
