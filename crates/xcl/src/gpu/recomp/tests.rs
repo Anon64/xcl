@@ -3120,6 +3120,26 @@ fn static_sampler_word_from_s_brev_is_a_constant() {
     assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
 }
 
+/// An S# the compiler builds with `s_movk_i32`, `s_bfm_b32 s25, 12, 12` (a run of set bits:
+/// 0x00fff000) and a 64-bit move of a 32-bit literal for words 2 and 3 is a static sampler.
+/// Before, s_bfm and the literal move were not constants and the taps of a history
+/// reprojection sampled through sampler-heap entry 0 (point, wrap, mip 0).
+#[test]
+fn static_sampler_words_from_s_bfm_and_a_64_bit_literal_move_are_constants() {
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let linear = [clamp, 0x00FF_F000u32, 0x1850_0000u32, 0];
+    let code = prog(&[
+        ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 24), ("SIMM16", clamp as u64)], None),
+        ("S_BFM_B32", "ENC_SOP2", &[("SDST", 25), ("SSRC0", 128 + 12), ("SSRC1", 128 + 12)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(linear[2])),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(t.static_samplers, vec![(linear, false)], "the S# built with s_bfm and a 64-bit literal move is a static sampler");
+    assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
+}
+
 /// An S# set before a branch and sampled after it (the compiler sets the S# of a blur's taps
 /// before the loop, of an effect before its `if`) is a static sampler all the same: the
 /// constants are followed into the next block. Before, a block's start forgot them and the

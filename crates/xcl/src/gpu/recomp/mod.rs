@@ -1519,6 +1519,13 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
                         let v = scalar_constant(d, c).unwrap() as i32 as i64;
                         vec![(r, v as u32), (r + 1, (v >> 32) as u32)]
                     }
+                    // a 32-bit literal, zero-extended: `s_mov_b64 s[18:19], 0x18500000`
+                    (Some(r), Some(255)) => d.literal.map(|v| vec![(r, v), (r + 1, 0)]).unwrap_or_default(),
+                    _ => Vec::new(),
+                },
+                // a run of set bits: `s_bfm_b32 s17, 12, 12` is 0x00fff000
+                "S_BFM_B32" => match (f("SDST"), f("SSRC0").and_then(|c| scalar_constant(d, c)), f("SSRC1").and_then(|c| scalar_constant(d, c))) {
+                    (Some(r), Some(a), Some(b)) => vec![(r, ((1u32 << (a & 31)) - 1) << (b & 31))],
                     _ => Vec::new(),
                 },
                 _ => Vec::new(),
