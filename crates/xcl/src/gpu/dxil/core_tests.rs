@@ -102,6 +102,63 @@ fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
 {d}");
 }
 
+/// The split form keeps the console wave's order of LDS accesses (`Lw::lds_in_order`): an LDS
+/// read after a write meets the other half first (the kernel form's group barrier, a compute
+/// group's counters), a read with no write since the last meet does not, and a half without
+/// a partner and the native form never do. In a loop whose read follows the last pass's
+/// write the meet is conditional on the flag, and still validates.
+#[test]
+fn split_lds_reads_meet_after_writes() {
+    use crate::gpu::recomp::CsInterface;
+    type Inst<'a> = (&'a str, &'a str, &'a [(&'a str, u64)], Option<u32>);
+    let write: Inst = ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None);
+    let read: Inst = ("DS_READ_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 1)], None);
+    let syncs = |d: &str| d.matches("@dx.op.barrier(i32 80, i32 9)").count();
+    let kernel = |list: &[Inst], split: bool| {
+        let o = KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        super::validate::disassemble(&translate(&prog(list), o).unwrap_or_else(|e| panic!("{e}")))
+    };
+    let Ok(rw) = kernel(&[write, read], true) else {
+        crate::gpu::recomp::runner::skip_test("no DXC");
+        return;
+    };
+    let w = syncs(&kernel(&[write], true).unwrap());
+    assert_eq!(syncs(&rw), w + 1, "the read meets after the write:\n{rw}");
+    assert_eq!(syncs(&kernel(&[read, write], true).unwrap()), w, "a read before any write");
+    assert_eq!(syncs(&kernel(&[write, read, read], true).unwrap()), w + 1, "the second read: the halves met since the write");
+    let native = |list: &[Inst]| syncs(&kernel(list, false).unwrap());
+    assert_eq!(native(&[write, read]), native(&[write]), "the native form");
+    // a loop: read, write, three times – the read waits from the second pass on
+    let looped = |body: &[Inst]| {
+        let mut l: Vec<Inst> = vec![("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 131)], None)];
+        l.extend_from_slice(body);
+        // back to the loop's first instruction: the DS instructions are 2 words each
+        let back = 0x1_0000 - (2 * body.len() as u64 + 3);
+        l.extend_from_slice(&[
+            ("S_SUB_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+            ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ]);
+        let mut code = prog(&l);
+        code.truncate(code.len() - 4);
+        code.extend(encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", back)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        syncs(&super::validate::disassemble(&translate(&code, o).unwrap_or_else(|e| panic!("{e}"))).unwrap())
+    };
+    assert_eq!(looped(&[read, write]), looped(&[write, write]) + 1, "the loop's read meets when the flag is set");
+    // compute groups: the counters' meet (two more atomics), none without a partner half
+    let atomics = |threads: u32, list: &[Inst]| {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        let d = super::validate::disassemble(&super::kernel::translate_compute(&prog(list), o, &cs).unwrap_or_else(|e| panic!("{threads} threads: {e}")).dxil).unwrap();
+        d.matches("atomicrmw").count()
+    };
+    for threads in [64, 128] {
+        assert_eq!(atomics(threads, &[write, read]), atomics(threads, &[write]) + 2, "{threads} threads");
+    }
+    assert_eq!(atomics(32, &[write, read]), atomics(32, &[write]), "32 threads: no partner half");
+}
+
 #[test]
 fn straight_line_and_loop_kernels_validate() {
     let code = prog(&[

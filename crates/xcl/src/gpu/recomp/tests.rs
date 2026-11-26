@@ -7238,6 +7238,67 @@ fn split_wave64_meet_form_by_group_size() {
     assert!(leave < spin && spin < barrier);
 }
 
+/// The split form keeps the console wave's order of LDS accesses across its halves
+/// (`xcl_x_lw`): an LDS read or atomic meets the other half first when LDS may have been written
+/// since the halves last met (every meet and `s_barrier` clears the flag, every write and atomic
+/// sets it). A program that writes no LDS gets no such meet, nor does the native form.
+#[test]
+fn split_wave64_lds_reads_meet_after_writes() {
+    type Inst = (&'static str, &'static str, &'static [(&'static str, u64)], Option<u32>);
+    let write: Inst = ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None);
+    let read: Inst = ("DS_READ_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 1)], None);
+    let add: Inst = ("DS_ADD_U32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None);
+    let barrier: Inst = ("S_BARRIER", "ENC_SOPP", &[], None);
+    let lane: Inst = ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None);
+    const WAIT: &str = "if (xcl_x_lw) xcl_x_meet();";
+    const MARK: &str = "xcl_x_lw = true;";
+    const CLEAR: &str = "xcl_x_lw = false;";
+    let split = Options { mode: Mode::Kernel, wave64: true, split_wave64: true, ..Default::default() };
+    let hlsl = |list: &[Inst], o: &Options| {
+        let t = translate(&prog(list), o).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        }
+        t.hlsl
+    };
+    // every meet clears the flag, also one without a partner half
+    let h = hlsl(&[write, read], &split);
+    let meet = &h[h.find("bool xcl_x_meet()").unwrap()..];
+    assert!(meet.find("xcl_x_lw = false;").unwrap() < meet.find("if (xcl_xn == 0u) return false;").unwrap(), "{meet}");
+    // the hazard: a write, then a read with nothing between: the read meets first
+    let main = &h[h.find("void main(").unwrap()..];
+    assert_eq!((main.matches(WAIT).count(), main.matches(MARK).count()), (1, 1), "{main}");
+    let (mark, wait, at) = (main.find(MARK).unwrap(), main.find(WAIT).unwrap(), main.rfind("= xcl_lds[").unwrap());
+    assert!(mark < wait && wait < at, "the meet between the write and the read:\n{main}");
+    // every read and atomic tests the flag (a read before any write finds it clear); an atomic
+    // both waits and marks
+    let h = hlsl(&[read, write, add, read], &split);
+    let main = &h[h.find("void main(").unwrap()..];
+    assert_eq!((main.matches(WAIT).count(), main.matches(MARK).count()), (3, 2), "{main}");
+    // s_barrier: both halves made their writes before it
+    let h = hlsl(&[write, barrier, read], &split);
+    let main = &h[h.find("void main(").unwrap()..];
+    let (sync, clear, wait) = (main.find("GroupMemoryBarrierWithGroupSync();").unwrap(), main.find(CLEAR).unwrap(), main.find(WAIT).unwrap());
+    assert!(sync < clear && clear < wait, "{main}");
+    // no LDS write: no flag at all, LDS or not; the native form has none either
+    for (what, list, o) in [
+        ("reads only", &[read, read][..], split.clone()),
+        ("no LDS", &[lane][..], split.clone()),
+        ("native wave64", &[write, read, add][..], Options { split_wave64: false, ..split.clone() }),
+    ] {
+        let h = hlsl(list, &o);
+        let main = &h[h.find("void main(").unwrap()..];
+        assert!(!main.contains("xcl_x_lw"), "{what}:\n{main}");
+    }
+    // a compute group of several console waves (the counters' meet) and one of a single half
+    for threads in [128u32, 32] {
+        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let h = hlsl(&[write, read], &Options { mode: Mode::Compute(cs), ..split.clone() });
+        assert!(h.contains(WAIT) && h.contains(MARK), "{threads} threads");
+    }
+}
+
 /// Operations whose result spans both 32-lane halves of a wave64 – what the split form
 /// exchanges: masks with bits in either half (counted, scanned, branched on), readlane /
 /// readfirstlane of a lane in the other half, ds_bpermute across the halves, a GLC scalar
@@ -7794,6 +7855,96 @@ fn gpu_split_wave64_one_wave_groups_end_early() {
             for tid in 0..64usize {
                 let want = if g % 2 == 1 || tid >= threads as usize { 0 } else { 40 + 1037 };
                 assert_eq!(out[(base + (g * 64 + tid) * 4) / 4], want, "{threads} threads, group {g} thread {tid}");
+            }
+        }
+    }
+}
+
+/// LDS written by the upper half and read by lane 0 with nothing between that makes the halves
+/// meet: the console's wave runs both for all 64 lanes in order, so lane 0 sees the writes. The
+/// upper half writes only after a chain of dependent global loads its lanes alone make, so in
+/// the split form (32-lane GPUs) the lower half reaches the read first unless the read waits
+/// for it (`xcl_x_lw`). A plain store and an atomic or; groups of one console wave (the group
+/// barrier's meet) and of several (the counters').
+#[test]
+fn gpu_split_wave64_lds_write_then_read_across_halves() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    const LOADS: usize = 16;
+    const MARKER: u32 = 0x600D;
+    // s0 = output base, s1 = the load chain's first address, s2 = MARKER - 1, s4 = group id;
+    // v0 = thread index in the group
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 5), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 6), ("SRC0", 128)], None),
+        ("V_AND_B32", "ENC_VOP2", vec![("VDST", 2), ("SRC0", 128 + 31), ("VSRC1", 0)], None), // lane & 31
+        ("V_LSHRREV_B32", "ENC_VOP2", vec![("VDST", 1), ("SRC0", 134), ("VSRC1", 0)], None), // console wave
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 1), ("SRC0", 130), ("VSRC1", 1)], None), // its LDS dword
+        // lane 0 clears the wave's two dwords (at v1 and v1 + 256)
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 129)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 3), ("SRC0", 128)], None),
+        ("DS_WRITE2_B32", "ENC_DS", vec![("ADDR", 1), ("DATA0", 3), ("DATA1", 3), ("OFFSET0", 0), ("OFFSET1", 64)], None),
+        // a mask read whole: the halves meet (after the clear, before the writes below)
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("V_CMP_GT_U32", "ENC_VOPC", vec![("SRC0", 255), ("VSRC1", 0)], Some(40)),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", vec![("SDST", 20), ("SSRC0", 106)], None),
+        // lanes 32..63: the load chain, then lds[v1] = MARKER, lds[v1 + 256] |= 1 << (lane - 32)
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 10), ("SRC0", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 11), ("SRC0", 128)], None),
+    ];
+    for _ in 0..LOADS {
+        list.push(("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", vec![("VDST", 10), ("ADDR", 10), ("SADDR", 0x7D)], None));
+    }
+    list.extend([
+        ("DS_WRITE_B32", "ENC_DS", vec![("ADDR", 1), ("DATA0", 10)], None),
+        ("V_SUBREV_NC_U32", "ENC_VOP2", vec![("VDST", 12), ("SRC0", 2), ("VSRC1", 10)], None), // v10 - s2 = 1
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 12), ("SRC0", V + 2), ("VSRC1", 12)], None),
+        ("DS_OR_B32", "ENC_DS", vec![("ADDR", 1), ("DATA0", 12), ("OFFSET0", 0), ("OFFSET1", 1)], None),
+        // lane 0 reads both, no exchange since the writes
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 129)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 128)], None),
+        ("DS_READ2_B32", "ENC_DS", vec![("VDST", 5), ("ADDR", 1), ("OFFSET0", 0), ("OFFSET1", 64)], None),
+        // out[group · threads + thread] = (v5, v6)
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("S_LSHL_B32", "ENC_SOP2", vec![("SDST", 16), ("SSRC0", 4), ("SSRC1", 3)], None), // s3 = log2(threads)
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 7), ("SRC0", 16), ("VSRC1", 0)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 7), ("SRC0", 131), ("VSRC1", 7)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 7), ("SRC0", 0), ("VSRC1", 7)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 8), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", vec![("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
+    ]);
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f, l)| (*n, *e, &f[..], *l)).collect();
+    let p = prog(&refs);
+    let chain = 0x40u32;
+    let base = 0x1000usize;
+    let groups = 64usize;
+    for threads in [64u32, 128, 256] {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if runner::split_wave64() {
+            assert_eq!(t.hlsl.matches("if (xcl_x_lw) xcl_x_meet();").count(), 2, "{threads}: the atomic and the read wait");
+        }
+        let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
+        let mut io = vec![0u32; 128];
+        io[..4].copy_from_slice(&[base as u32, chain, MARKER - 1, threads.trailing_zeros()]);
+        let mut mem = vec![0u32; (base + groups * threads as usize * 8) / 4];
+        // mem[chain + 4k] = chain + 4 (k + 1), the last one MARKER
+        for k in 0..LOADS {
+            mem[chain as usize / 4 + k] = if k + 1 == LOADS { MARKER } else { chain + 4 * (k as u32 + 1) };
+        }
+        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &mem).unwrap();
+        for g in 0..groups {
+            for tid in 0..threads as usize {
+                let at = (base + (g * threads as usize + tid) * 8) / 4;
+                let want = if tid % 64 == 0 { (MARKER, u32::MAX) } else { (0, 0) };
+                assert_eq!((out[at], out[at + 1]), want, "{threads} threads, group {g} thread {tid}: the upper half's store and or");
             }
         }
     }

@@ -1676,6 +1676,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let mut em = emit::Em::new(opt.clone());
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
+    em.writes_lds = emit::writes_lds(&insts);
     em.static_ss = constant_samplers(&insts, &leaders, matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)));
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
