@@ -1409,6 +1409,16 @@ fn console_has_packed_3d_mips(desc: &D3D12_RESOURCE_DESC) -> bool {
         .unwrap_or(false)
 }
 
+/// The least a 3D texture of `desc` takes on the console – the texels of its first level, one
+/// after the other – for a 3D texture whose size there is not known: the pages it has to itself
+/// at its address. None: not a 3D texture. The PC's tiles past those pages are its own
+/// (`owned_pages`), not the pages of what the title placed behind it.
+fn least_volume_bytes(desc: &D3D12_RESOURCE_DESC) -> Option<u64> {
+    (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        .then(|| desc.Width * desc.Height as u64 * desc.DepthOrArraySize as u64 * super::targets::texel_bytes(desc.Format) as u64)
+        .filter(|&b| b != 0)
+}
+
 /// A GPU-owned texture of the title at `va` (`desc`: the PC description, `console_bytes` its
 /// size on the console): on the title's pages there, else in the arena for that address (None:
 /// neither – the caller makes a resource of its own).
@@ -1419,6 +1429,10 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     if !tier2(dev) {
         return None;
     }
+    // (a 3D render target's size on the console is not modelled: without one, every PC tile of
+    // it went on the title's pages from `va` on – more of them than the console's texture takes,
+    // so the last ones were the first pages of the title's next texture)
+    let console_bytes = console_bytes.or_else(|| least_volume_bytes(desc));
     if std::env::var_os("XCL_VRAM_ARENAS").is_none() {
         if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, true, false, riid, ppv) {
             return Some(hr);
@@ -1925,6 +1939,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Title textures placed one behind the other, 512 KiB apart: 3D render targets of 33 texels
+    /// a side with 8-byte texels, whose size on the console XCL does not model. Each has the pages
+    /// of its own texels and no page of the next one, however many tiles the PC's texture has
+    /// (18 here: with all of them on the title's pages, the tenth to the eighteenth were the
+    /// next texture's first pages, and two such textures wrote over each other).
+    #[test]
+    fn a_3d_texture_of_unknown_console_size_keeps_off_the_next_textures_pages() {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            Width: 33,
+            Height: 33,
+            DepthOrArraySize: 33,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ..Default::default()
+        };
+        let bytes = least_volume_bytes(&desc);
+        assert_eq!(bytes, Some(33 * 33 * 33 * 8));
+        let (a, b, pc_tiles) = (0x12_31f1_0000usize, 0x12_31f9_0000usize, 18);
+        let (first_a, n_a) = owned_pages(a, bytes, pc_tiles).unwrap();
+        let (first_b, _) = owned_pages(b, bytes, pc_tiles).unwrap();
+        assert_eq!((first_a, n_a), (a, 5));
+        assert!(first_a + n_a * PAGE <= first_b, "the first texture's pages end before the second's");
+        // as it was: every tile on the title's pages
+        let (_, all) = owned_pages(a, None, pc_tiles).unwrap();
+        assert!(a + all * PAGE > b);
+        // a 2D texture's size is the caller's to know
+        assert_eq!(least_volume_bytes(&D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, ..desc }), None);
     }
 
     /// Reserved only with TILED support, and for MSAA a tiled sample count (#940: the driver
