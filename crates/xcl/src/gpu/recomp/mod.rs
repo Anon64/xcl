@@ -221,6 +221,11 @@ pub const FOLD_X: u32 = 65_535;
 /// address a title can have (user space ends at 0x7FFF_FFFF_FFFF), so a load from the data is
 /// told from a load of the title's memory at the same low dword (descriptor tables in window 0).
 pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
+/// io slots (trap-temp range, after `IO_GROUP_LIMIT`) of a `DispatchX` with thread dimensions
+/// (flag 0x20): the thread count of each axis when it is not a whole number of groups (0: the
+/// last group is whole), so the program can leave the lanes past it out of EXEC. Written by
+/// D3D12.X now; read by the compute prologue later.
+pub const IO_THREAD_LIMIT: [usize; 3] = [115, 116, 117];
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)

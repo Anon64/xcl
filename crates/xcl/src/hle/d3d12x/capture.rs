@@ -155,6 +155,9 @@ pub(super) enum WorkKind {
     /// DrawIndexedX: indices read from an address
     DrawIndexedX { va: u64, format: i32, indices: u32 },
     Dispatch([u32; 3]),
+    /// DispatchX with thread dimensions (flag 0x20): the thread counts, the flags and the groups
+    /// they launch (None: the pipeline's group shape was not known when it was recorded)
+    DispatchThreads { threads: [u32; 3], flags: u32, groups: Option<[u32; 3]> },
     DispatchMesh([u32; 3]),
     Indirect(Box<Indirect>),
 }
@@ -225,7 +228,7 @@ pub(super) struct Work {
 impl Work {
     fn dispatch(&self) -> bool {
         match &self.kind {
-            WorkKind::Dispatch(_) => true,
+            WorkKind::Dispatch(_) | WorkKind::DispatchThreads { .. } => true,
             WorkKind::Indirect(i) => i.dispatches,
             _ => false,
         }
@@ -273,7 +276,7 @@ impl Op {
                 WorkKind::Draw { .. } => "draw",
                 WorkKind::DrawIndexed { .. } => "draw_indexed",
                 WorkKind::DrawIndexedX { .. } => "draw_indexed_x",
-                WorkKind::Dispatch(_) => "dispatch",
+                WorkKind::Dispatch(_) | WorkKind::DispatchThreads { .. } => "dispatch",
                 WorkKind::DispatchMesh(_) => "dispatch_mesh",
                 WorkKind::Indirect(_) => "execute_indirect",
             },
@@ -1063,6 +1066,11 @@ fn work_json(w: &Work, m: &mut Map<String, Value>) {
             put("indices", json!(indices));
         }
         WorkKind::Dispatch(g) | WorkKind::DispatchMesh(g) => put("groups", json!(g)),
+        WorkKind::DispatchThreads { threads, flags, groups } => {
+            put("groups", json!(groups));
+            put("threads", json!(threads));
+            put("dispatch_flags", json!(hex(*flags as u64)));
+        }
         WorkKind::Indirect(i) => {
             put("signature", json!(hex(i.sig as u64)));
             put("stride", json!(i.stride));
@@ -1348,7 +1356,7 @@ fn write(dir: &std::path::Path, f: &Frame, frame: u64) -> std::io::Result<()> {
                                 note("draws or dispatches XCL skipped", at.clone());
                             }
                             match &w.kind {
-                                WorkKind::Dispatch(g) | WorkKind::DispatchMesh(g) if g.contains(&0) => note("dispatches with zero groups", at.clone()),
+                                WorkKind::Dispatch(g) | WorkKind::DispatchMesh(g) | WorkKind::DispatchThreads { threads: g, .. } if g.contains(&0) => note("dispatches with zero groups", at.clone()),
                                 WorkKind::Indirect(x) => {
                                     if x.max == 0 {
                                         note("ExecuteIndirects with a max count of 0", at.clone());
@@ -1551,6 +1559,23 @@ mod tests {
 
     fn part(r: &Rec) -> Part {
         r.closed.as_ref().map(|(ops, w)| (ops.clone(), *w, r.partial, r.dropped))
+    }
+
+    /// A `DispatchX` with thread dimensions is written as a dispatch with the groups it launched
+    /// (null: not known when recorded), its thread counts and its flags.
+    #[test]
+    fn a_dispatch_with_thread_dimensions_is_written_with_its_threads_and_groups() {
+        let Op::Work(mut w) = dispatch(0xd0, vec![]) else { unreachable!() };
+        w.kind = WorkKind::DispatchThreads { threads: [100, 1, 1], flags: 0x8020, groups: Some([2, 1, 1]) };
+        assert!(w.dispatch());
+        assert_eq!(Op::Work(w.clone()).name(), "dispatch");
+        let mut m = Map::new();
+        work_json(&w, &mut m);
+        assert_eq!((&m["groups"], &m["threads"], &m["dispatch_flags"]), (&json!([2, 1, 1]), &json!([100, 1, 1]), &json!("0x8020")));
+        w.kind = WorkKind::DispatchThreads { threads: [100, 1, 1], flags: 0x20, groups: None };
+        let mut m = Map::new();
+        work_json(&w, &mut m);
+        assert_eq!(m["groups"], Value::Null);
     }
 
     #[test]

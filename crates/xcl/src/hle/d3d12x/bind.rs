@@ -46,6 +46,9 @@ struct State {
     scratch: Option<(ID3D12Resource, u64)>,
     scratch_used: u64,
     scratch_taken: u64,
+    /// the next dispatch's thread limits (`IO_THREAD_LIMIT`; a `DispatchX` with thread
+    /// dimensions), taken by its `bind_abi`
+    limits: [u32; 3],
 }
 
 /// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
@@ -2137,16 +2140,67 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let _c = capture_work(this, || super::capture::WorkKind::Dispatch([x, y, z]), false);
+    dispatch_flags(this, x, y, z, 0);
+}
+
+/// `DispatchX` flag: x, y, z are thread counts, not group counts; the console launches whole
+/// groups and leaves the lanes past the count out of EXEC (0x8000, wave32, needs nothing here)
+const DISPATCH_THREAD_DIMENSIONS: u32 = 0x20;
+
+/// What a dispatch of `dims` with `flags` launches on pipeline `pso`: its groups and the thread
+/// limits for `IO_THREAD_LIMIT` (0: that axis ends on a whole group). None: it cannot be run
+/// as the console would (thread dimensions with a group shape not known).
+fn dispatch_groups(pso: usize, dims: [u32; 3], flags: u32) -> Option<([u32; 3], [u32; 3])> {
+    if flags & DISPATCH_THREAD_DIMENSIONS == 0 {
+        return Some((dims, [0; 3]));
+    }
+    let threads = super::real::pso_threads(pso)?.map(|t| t.max(1));
+    let groups = std::array::from_fn(|k| dims[k].div_ceil(threads[k]));
+    let limits = std::array::from_fn(|k| if dims[k] % threads[k] != 0 { dims[k] } else { 0 });
+    Some((groups, limits))
+}
+
+/// What the frame capture records of a dispatch of `dims` with `flags` on `pso` (the pipeline
+/// the title bound): its groups, or a `DispatchX` with thread dimensions' thread counts with the
+/// groups they launch, when the group shape is known now (a pipeline still being built has none
+/// yet; looked up with nothing sent to the workers, `pso_async::peek`).
+fn captured_dispatch(pso: usize, dims: [u32; 3], flags: u32) -> super::capture::WorkKind {
+    if flags & DISPATCH_THREAD_DIMENSIONS == 0 {
+        return super::capture::WorkKind::Dispatch(dims);
+    }
+    let groups = if super::pso_async::has_real(pso) { dispatch_groups(super::pso_async::peek(pso), dims, flags).map(|(g, _)| g) } else { None };
+    super::capture::WorkKind::DispatchThreads { threads: dims, flags, groups }
+}
+
+/// `DispatchX` with thread dimensions launched: how many, and at the first and every power of
+/// two the last one's thread counts, its groups and the group shape, logged (whether a title
+/// uses the flag, and with what).
+fn note_thread_dimensions(threads: [u32; 3], groups: [u32; 3], shape: [u32; 3]) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        let [t, g, a] = [threads, groups, shape].map(|v| format!("{}x{}x{}", v[0], v[1], v[2]));
+        crate::xlog_info!("D3D12.X: DispatchX with thread dimensions: {n} so far, last {t} threads as {g} groups of {a}");
+    }
+}
+
+/// `Dispatch` / `DispatchX(x, y, z, flags)`.
+pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
     let pso = with(this, |s| s.pso);
+    let _c = capture_work(this, || captured_dispatch(pso, [x, y, z], flags), false);
     // (recorded at the submit through this call, with everything below: counted there)
-    if super::pso_async::waits_for(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
+    if super::pso_async::waits_for(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
         super::capture::outcome(super::capture::Outcome::Deferred);
         return super::pso_async::need_by_submit(pso);
     }
     super::targets::note_dispatch();
-    super::targets::note_compute(pso, super::targets::Dispatched::Direct([x, y, z]));
+    let bound = pso;
     let pso = super::pso_async::resolve_wait(pso);
+    // what it launches: its groups (a `DispatchX` with thread dimensions: whole groups of the
+    // pipeline's console group shape), and the thread limits; None: thread dimensions on a
+    // pipeline whose group shape is not known, nothing launched (noted with no groups)
+    let launch = dispatch_groups(pso, [x, y, z], flags);
+    super::targets::note_compute(bound, super::targets::Dispatched::Direct(launch.map_or([0; 3], |(g, _)| g)));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
@@ -2158,7 +2212,29 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
-    match translated_dispatch(this, list, pso, x, y, z) {
+    let Some((groups, limits)) = launch else {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: DispatchX of {x}x{y}x{z} threads (flags {flags:#x}) with a pipeline whose group shape is not known ({pso:#x}) skipped");
+        }
+        count(DISPATCHES_SKIPPED);
+        return;
+    };
+    if flags != 0 {
+        // each kind of flags once: what titles pass, and what it launches
+        static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let first = { let mut g = SEEN.lock().unwrap(); !g.contains(&flags) && { g.push(flags); true } };
+        if first {
+            crate::xlog_info!("D3D12.X: DispatchX with flags {flags:#x}: {x}x{y}x{z} launched as {}x{}x{} groups (thread limits {limits:?})", groups[0], groups[1], groups[2]);
+        }
+    }
+    if flags & DISPATCH_THREAD_DIMENSIONS != 0 {
+        note_thread_dimensions([x, y, z], groups, super::real::pso_threads(pso).unwrap_or_default());
+    }
+    with(this, |s| s.limits = limits);
+    let done = translated_dispatch(this, list, pso, groups[0], groups[1], groups[2]);
+    with(this, |s| s.limits = [0; 3]);
+    match done {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
             count(DISPATCHES_SKIPPED);
@@ -2467,6 +2543,11 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         io[crate::gpu::recomp::IO_LOOP_BUDGET] = crate::gpu::recomp::dispatch_loop_budget(groups);
     }
     io[crate::gpu::recomp::IO_GROUP_LIMIT] = group_limit;
+    if !gfx {
+        for (k, l) in with(this, |s| std::mem::take(&mut s.limits)).into_iter().enumerate() {
+            io[crate::gpu::recomp::IO_THREAD_LIMIT[k]] = l;
+        }
+    }
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
@@ -2855,6 +2936,91 @@ void main(uint t : SV_GroupIndex) {
         _count_off: u64,
     ) {
         (*(this as *const FakeAdoptedList)).execute_indirect_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `DispatchX` with thread dimensions (flag 0x20, as the BVH builder's rehydration passes
+    /// use it): the console launches whole groups of the pipeline's `numthreads` and leaves
+    /// the lanes past the count out; without the flag the counts are groups. With the flag
+    /// and a group shape not known, nothing is launched (the counts as groups was the bug).
+    #[test]
+    fn dispatch_x_with_thread_dimensions_launches_whole_groups() {
+        let pso = 0x7300_0001usize;
+        real::register_threads_for_test(pso, [64, 1, 1]);
+        // 640 threads in groups of 64: 10 groups, the last one whole
+        assert_eq!(dispatch_groups(pso, [640, 1, 1], 0x20), Some(([10, 1, 1], [0, 0, 0])));
+        // 100 threads: 2 groups, and the lanes past 100 to leave out
+        assert_eq!(dispatch_groups(pso, [100, 1, 1], 0x20), Some(([2, 1, 1], [100, 0, 0])));
+        // the wave32 bit (0x8000) changes nothing here
+        assert_eq!(dispatch_groups(pso, [100, 1, 1], 0x8020), Some(([2, 1, 1], [100, 0, 0])));
+        // a 2-D group shape
+        let pso2 = 0x7300_0002usize;
+        real::register_threads_for_test(pso2, [8, 8, 1]);
+        assert_eq!(dispatch_groups(pso2, [20, 16, 3], 0x20), Some(([3, 2, 3], [20, 0, 0])));
+        // group counts (Dispatch, DispatchX without the flag) are launched as they are
+        assert_eq!(dispatch_groups(pso, [7, 2, 1], 0), Some(([7, 2, 1], [0, 0, 0])));
+        assert_eq!(dispatch_groups(pso, [7, 2, 1], 0x8000), Some(([7, 2, 1], [0, 0, 0])));
+        // no threads: no groups
+        assert_eq!(dispatch_groups(pso, [0, 1, 1], 0x20), Some(([0, 1, 1], [0, 0, 0])));
+        // thread dimensions on a pipeline whose group shape is not known: not launched
+        assert_eq!(dispatch_groups(0x7300_00FF, [100, 1, 1], 0x20), None);
+        assert_eq!(dispatch_groups(0x7300_00FF, [100, 1, 1], 0), Some(([100, 1, 1], [0, 0, 0])));
+    }
+
+    /// A `DispatchX` with thread dimensions of more than 65 535 groups once converted is folded
+    /// as a dispatch of that many groups (`translated_dispatch`: conversion first, then `fold`):
+    /// the console's group count goes to `IO_GROUP_LIMIT`, the thread count to
+    /// `IO_THREAD_LIMIT`. Taken as groups, the same counts were 64x the groups and left out.
+    #[test]
+    fn dispatch_x_with_thread_dimensions_past_the_d3d12_limit_is_folded_in_groups() {
+        let most = 1 << 22;
+        let pso = 0x7300_0011usize;
+        real::register_threads_for_test(pso, [64, 1, 1]);
+        // 10 000 001 threads: 156 251 groups of 64, the last with one thread
+        let (groups, limits) = dispatch_groups(pso, [10_000_001, 1, 1], 0x20).unwrap();
+        assert_eq!((groups, limits), ([156_251, 1, 1], [10_000_001, 0, 0]));
+        let (limit, folded) = fold_counts_within(groups[0], groups[1], groups[2], most);
+        assert_eq!((limit, folded), (156_251, [65_535, 3, 1]));
+        assert!(folded[0] * folded[1] >= groups[0] && folded[0] * folded[1] - groups[0] < folded[0]);
+        // the counts as groups: past what a dispatch may run, nothing at all
+        assert_eq!(fold_counts_within(10_000_001, 1, 1, most), (0, [0, 0, 0]));
+        // 8 x 8 groups, 600 000 x 8 threads: one row of 75 000 groups, foldable (as groups the
+        // counts were two dimensions past the limit, clamped)
+        let pso2 = 0x7300_0012usize;
+        real::register_threads_for_test(pso2, [8, 8, 1]);
+        let (groups, limits) = dispatch_groups(pso2, [600_000, 8, 1], 0x8020).unwrap();
+        assert_eq!((groups, limits), ([75_000, 1, 1], [0, 0, 0]));
+        assert_eq!(fold_counts_within(groups[0], groups[1], groups[2], most), (75_000, [65_535, 2, 1]));
+    }
+
+    /// `IO_THREAD_LIMIT` takes three io slots no other value has: in the trap-temp range
+    /// (ttmp0..15, SGPRs 108..=123, which titles' programs do not use), apart from each other
+    /// and from the GS, UMA base, loop budget and group limit slots.
+    #[test]
+    fn dispatch_thread_limit_slots_collide_with_no_other_io_slot() {
+        use crate::gpu::recomp::{IO_GROUP_LIMIT, IO_GS_PRIMS, IO_GS_VERTICES, IO_LOOP_BUDGET, IO_THREAD_LIMIT, IO_UMA_BASE_HI, KERNEL_SCC_SLOT, KERNEL_SGPRS};
+        let mut all = vec![IO_GS_PRIMS, IO_GS_VERTICES, IO_UMA_BASE_HI, IO_LOOP_BUDGET, IO_GROUP_LIMIT];
+        all.extend(IO_THREAD_LIMIT);
+        let mut unique = all.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), all.len(), "{all:?}");
+        for s in all {
+            assert!((108..=123).contains(&s) && s < KERNEL_SGPRS && s != KERNEL_SCC_SLOT, "slot {s}");
+        }
+    }
+
+    /// The frame capture records a `DispatchX` with thread dimensions with its thread counts,
+    /// flags and the groups they launch (none known for a pipeline whose group shape is not);
+    /// other dispatches with their groups.
+    #[test]
+    fn a_dispatch_x_with_thread_dimensions_is_captured_with_its_groups() {
+        use super::super::capture::WorkKind;
+        let pso = 0x7300_0021usize;
+        real::register_threads_for_test(pso, [64, 1, 1]);
+        assert_eq!(captured_dispatch(pso, [100, 1, 1], 0x20), WorkKind::DispatchThreads { threads: [100, 1, 1], flags: 0x20, groups: Some([2, 1, 1]) });
+        assert_eq!(captured_dispatch(0x7300_00FE, [100, 1, 1], 0x8020), WorkKind::DispatchThreads { threads: [100, 1, 1], flags: 0x8020, groups: None });
+        assert_eq!(captured_dispatch(pso, [7, 2, 1], 0x8000), WorkKind::Dispatch([7, 2, 1]));
+        assert_eq!(captured_dispatch(pso, [7, 2, 1], 0), WorkKind::Dispatch([7, 2, 1]));
     }
 
     #[test]
