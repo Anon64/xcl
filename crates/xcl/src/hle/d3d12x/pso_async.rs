@@ -158,7 +158,13 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, run_job(p, job));
+    // (a panic in a build ends it as a failed one: whoever waits for it is not left waiting)
+    let real = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(p, job))).unwrap_or_else(|_| {
+        JOB_START.with(|s| s.set(None));
+        JOB_HUGE.with(|h| h.set(false));
+        0
+    });
+    complete(p, real);
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
@@ -2157,6 +2163,112 @@ mod used_tests {
         calls.end(5, 9, t_stale);
     }
 
+    /// With `XCL_PSO_WAIT_MS`, a submit's wait for a late pipeline that no worker can start (all
+    /// are busy) neither ends with the stand-in nor waits for a free worker: after the budget it
+    /// builds the pipeline itself.
+    #[test]
+    fn a_submit_builds_a_late_pipeline_no_worker_has_started() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::time::{Duration, Instant};
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut blockers = Vec::with_capacity(n);
+        for k in 0..n {
+            let standin = 0x7E57_A500usize + k;
+            let (tx, g) = (started_tx.clone(), gate.clone());
+            submit(standin, false, Box::new(move || {
+                let _ = tx.send(());
+                let mut open = g.0.lock().unwrap();
+                while !*open {
+                    open = g.1.wait(open).unwrap();
+                }
+                0xA500 + k
+            }));
+            blockers.push(standin);
+        }
+        for _ in 0..n {
+            started_rx.recv_timeout(Duration::from_secs(10)).expect("workers saturated");
+        }
+        let target = 0x7E57_A5FFusize;
+        submit(target, true, Box::new(|| 0xA5FF));
+        set_wait_budget_for_test(Some(Duration::from_millis(30)));
+        assert_eq!(resolve_wait(target), target, "a bind as the title records: past the budget, late");
+        let t = Instant::now();
+        wait_for_submit(target);
+        let took = t.elapsed();
+        set_wait_budget_for_test(None);
+        let built = resolve(target);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        for standin in blockers {
+            let start = Instant::now();
+            while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = released(standin);
+        }
+        let _ = released(target);
+        assert_eq!(built, 0xA5FF, "the submit's wait ended without the pipeline");
+        assert!(took < Duration::from_secs(5), "the submit waited for a free worker ({took:?})");
+    }
+
+    /// With `XCL_PSO_WAIT_MS`, a submit waits for a pipeline a worker is building at most
+    /// `SUBMIT_WAIT_MOST`, then goes on (with the stand-in) and counts it.
+    #[test]
+    fn a_submit_waits_for_a_build_on_a_worker_no_longer_than_its_bound() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::time::{Duration, Instant};
+        let standin = 0x7E57_A600usize;
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let g = gate.clone();
+        submit(standin, true, Box::new(move || {
+            let _ = started_tx.send(());
+            let mut open = g.0.lock().unwrap();
+            while !*open {
+                open = g.1.wait(open).unwrap();
+            }
+            0xA600
+        }));
+        started_rx.recv_timeout(Duration::from_secs(10)).expect("a worker builds it");
+        set_wait_budget_for_test(Some(Duration::from_millis(20)));
+        set_submit_wait_for_test(Some(Duration::from_millis(300)));
+        let gave_up = SUBMIT_GAVE_UP.load(Ordering::Relaxed);
+        let t = Instant::now();
+        wait_for_submit(standin);
+        let took = t.elapsed();
+        let pending = is_pending(standin);
+        let counted = SUBMIT_GAVE_UP.load(Ordering::Relaxed) > gave_up;
+        set_wait_budget_for_test(None);
+        set_submit_wait_for_test(None);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let start = Instant::now();
+        while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = released(standin);
+        assert!(pending, "the build ended before the bound");
+        assert!(took >= Duration::from_millis(300) && took < Duration::from_secs(5), "the submit waited {took:?}");
+        assert!(counted, "the submit that went on without its pipeline was not counted");
+    }
+
+    /// A build that panics on a worker ends as a failed one: binds and submits waiting for it go on.
+    #[test]
+    fn a_build_that_panics_on_a_worker_ends_as_failed() {
+        use std::time::{Duration, Instant};
+        let standin = 0x7E57_A700usize;
+        submit(standin, true, Box::new(|| panic!("a build that panics (test)")));
+        let start = Instant::now();
+        while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let pending = is_pending(standin);
+        let _ = released(standin);
+        assert!(!pending, "the panicked build never ended");
+    }
+
     #[test]
     fn released_queued_pipeline_drops_job_immediately_before_workers_drain() {
         let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2385,6 +2497,99 @@ fn budget_for(compute: bool, all: Option<std::time::Duration>, gfx: Option<std::
     if compute { cs.or(all) } else { gfx.or(all) }
 }
 
+/// A call put off to the submit is recorded now: wait for its compute pipeline to be built,
+/// whether a bind already found it `late` or not. Its segment lies between the list's other work,
+/// whose labels and fence signals the title reads as "done": recorded with the stand-in, the
+/// dispatch is left out while they still fire. The submitting thread is held for that time
+/// (`title_held`), as a bind's wait holds it. A build that fails still gives the stand-in, and a
+/// program binds do not wait for (`image_only`) is not waited for.
+///
+/// Unset `XCL_PSO_WAIT_MS`: until the pipeline is built, as a bind waits. Set: the build is left
+/// to the workers for that long first, as a bind leaves it (their turns for big compiles); one no
+/// worker has started by then is built here. One a worker builds is waited for at most
+/// `SUBMIT_WAIT_MOST`, and the call then goes on with the stand-in (logged and counted):
+/// `title_held` stops only `kernelx::Sleep` and the GPU-wait watchdog, not every clock a title
+/// reads.
+///
+/// `XCL_CS_PSO_WAIT_MS` goes before `XCL_PSO_WAIT_MS` for compute pipelines (`budget_for`), and
+/// with it a waiting thread never builds the pipeline itself: the call's own `resolve_wait` waits
+/// that long and leaves the dispatch out past it, as it did.
+///
+/// The submit counts once among the build's waiters (`want`, its `ahead` count, also for a
+/// pipeline a bind already found `late`), and leaves with the wait when it goes on without it.
+pub fn wait_for_submit(pso: usize) {
+    if cs_wait_budget().is_some() {
+        return;
+    }
+    let Some(budget) = wait_budget() else {
+        let _ = resolve_wait_for(pso, None);
+        return;
+    };
+    let Some(p) = entry(pso) else { return };
+    if !p.compute || p.spared.load(Ordering::Acquire) || *p.done.lock().unwrap() {
+        return;
+    }
+    p.note_use();
+    // (the title's thread is held from here until the pipeline is built or the wait is over)
+    let mut wait = Wait::new(&p);
+    if !p.sent.swap(true, Ordering::AcqRel) {
+        enqueue(p.clone());
+    }
+    {
+        let mut d = p.demand.lock().unwrap();
+        if !std::mem::replace(&mut d.ahead, true) {
+            Pending::add_waiter(&mut d);
+        }
+    }
+    if wait.until_done(Some(budget)) {
+        return;
+    }
+    // no worker has started it: built here, as without the budget
+    let job = p.job.lock().unwrap().take();
+    if let Some(job) = job {
+        BUILT_HERE.fetch_add(1, Ordering::Relaxed);
+        if is_at_submit() {
+            BUILT_AT_SUBMIT.fetch_add(1, Ordering::Relaxed);
+        }
+        return complete(&p, run_job(&p, job));
+    }
+    let most = submit_wait_most();
+    if !wait.until_done(Some(budget + most)) {
+        drop(wait);
+        p.unwant_ahead();
+        let n = SUBMIT_GAVE_UP.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: deferred dispatch skipped after waiting {} s for its pipeline ({n} so far)", most.as_secs_f32());
+        }
+    }
+}
+
+/// put-off calls that went on with the stand-in after `SUBMIT_WAIT_MOST`
+static SUBMIT_GAVE_UP: AtomicUsize = AtomicUsize::new(0);
+
+/// How long a submit waits for a pipeline a worker builds, with `XCL_PSO_WAIT_MS` set: as long as
+/// a retail title's watchdog lets its main thread stand still (30 s, #891).
+const SUBMIT_WAIT_MOST: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn submit_wait_most() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(b) = SUBMIT_WAIT_FOR_TEST.with(|b| b.get()) {
+        return b;
+    }
+    SUBMIT_WAIT_MOST
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `SUBMIT_WAIT_MOST` for the submits of this test thread
+    static SUBMIT_WAIT_FOR_TEST: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_submit_wait_for_test(most: Option<std::time::Duration>) {
+    SUBMIT_WAIT_FOR_TEST.with(|b| b.set(most));
+}
+
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
@@ -2503,8 +2708,13 @@ impl Drop for Wait<'_> {
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
 /// it is built). A retail game builds compute programs on its own threads: the driver takes up to
 /// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
-/// has been held 30 s.
+/// has been held 30 s. It bounds binds as the title records; a call put off to the submit waits
+/// there until its pipeline is built (`wait_for_submit`).
 fn wait_budget() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    if let Some(b) = BUDGET_FOR_TEST.with(|b| b.get()) {
+        return Some(b);
+    }
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
     *B.get_or_init(|| budget_of(std::env::var("XCL_PSO_WAIT_MS").ok().as_deref()))
 }
@@ -2537,6 +2747,18 @@ fn cs_wait_budget() -> Option<std::time::Duration> {
 /// A budget in milliseconds from the environment (unset, 0 or not a number: none).
 fn budget_of(v: Option<&str>) -> Option<std::time::Duration> {
     v.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `XCL_PSO_WAIT_MS` for the binds of this test thread
+    static BUDGET_FOR_TEST: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Binds on this thread wait at most `budget` (None: as `XCL_PSO_WAIT_MS` says).
+#[cfg(test)]
+pub(super) fn set_wait_budget_for_test(budget: Option<std::time::Duration>) {
+    BUDGET_FOR_TEST.with(|b| b.set(budget));
 }
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
