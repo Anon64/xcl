@@ -5587,7 +5587,8 @@ fn forget_graphics_blob(key: (u64, usize)) {
 /// in memory while `GRAPHICS_BLOBS_MAX` has room (as `remember_compute_blob`: one the store has
 /// no room for must still reach the disk).
 unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) -> Option<std::sync::Arc<Vec<u8>>> {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() {
+    let preparing = PREPARING.load(Ordering::Relaxed);
+    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !preparing) || pso.is_null() {
         return None;
     }
     if let Some(b) = graphics_blob(key) {
@@ -5598,6 +5599,10 @@ unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usiz
         return None;
     }
     let bytes = std::sync::Arc::new(bytes);
+    // (a preparation worker builds each pipeline once: for the disk only)
+    if preparing {
+        return Some(bytes);
+    }
     let mut g = GRAPHICS_BLOBS.lock().unwrap();
     let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
     if *total + bytes.len() <= GRAPHICS_BLOBS_MAX {
@@ -6248,10 +6253,12 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let disk = driver.and_then(|id| driver_cache::graphics_path(driver_cache::graphics_file_hash(gkey, id, crate::gpu::recomp::pso::mem_windows()), bytes));
     // (for the driver compile log of this pipeline only)
     GRAPHICS_STAGES.with(|s| s.set(Some((vs_took, ps_took))));
+    // (a preparation worker keeps every blob: the title builds these pipelines at once from them)
+    let keep_min = if PREPARING.load(Ordering::Relaxed) { std::time::Duration::ZERO } else { driver_cache::keep_threshold() };
     let build = graphics_pso_through_cache(
         gkey,
         disk.as_deref(),
-        driver_cache::keep_threshold(),
+        keep_min,
         &mut copy,
         rect_gs.is_some(),
         ps_hash,
@@ -6716,6 +6723,33 @@ unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool
     matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(hr) if hr >= 0)
 }
 
+/// This process is a shader preparation worker (`prepare_device`): it keeps the driver's blob of
+/// every graphics pipeline it builds on disk, whatever its size and time, and none in memory.
+static PREPARING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A shader preparation worker's device (`shaders::graphics_worker`), made on the title's adapter:
+/// adopted as the title's is, so `prepare_graphics` takes the title's path. Raw, kept for the
+/// process.
+pub(crate) fn prepare_device(device: ID3D12Device) -> usize {
+    PREPARING.store(true, Ordering::Relaxed);
+    let raw = device.into_raw();
+    unsafe { adopt(raw, Kind::Device) };
+    raw as usize
+}
+
+/// A title's graphics pipeline `desc` (`gfx_records::Record::desc`) built on `device`
+/// (`prepare_device`) as the title's background build makes it (`build_graphics`): the
+/// translation, DXC and driver blob caches on disk get what the title will ask for. The pipeline
+/// is released; false: not made (noted in the log as the title's would be).
+pub(crate) unsafe fn prepare_graphics(device: usize, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> bool {
+    let this = device as *mut c_void;
+    let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let made = matches!(translated_graphics_pso(this, f, desc as *const _ as *const c_void, &pc_iid(Kind::PipelineState), &mut out), Some(hr) if hr >= 0) && !out.is_null();
+    super::pso_async::release(out as usize);
+    made
+}
+
 unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
     matches!(translated_compute_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(Ok(hr)) if hr >= 0)
@@ -7148,9 +7182,11 @@ unsafe fn build_two_pass_pso(
     take_cold_slot();
     let (hr, pso, took) = attempt(None)?;
     if let Some(cache) = cache {
-        let min = driver_cache::keep_threshold();
+        // (a preparation worker keeps every blob, on disk only: `PREPARING`)
+        let preparing = PREPARING.load(Ordering::Relaxed);
+        let min = if preparing { std::time::Duration::ZERO } else { driver_cache::keep_threshold() };
         let disk = cache.disk.as_deref().filter(|_| took >= min);
-        let keep_ram = bytes >= COMPUTE_BLOB_MIN_DXIL || took >= min;
+        let keep_ram = !preparing && (bytes >= COMPUTE_BLOB_MIN_DXIL || took >= min);
         if let Some(blob) = (disk.is_some() || keep_ram).then(|| read_pso_cached_blob(pso.as_raw())).flatten() {
             if let Some(path) = disk {
                 driver_cache::keep_at(path, &blob, took, min);
