@@ -22,6 +22,7 @@ pub mod dred;
 mod fence_x;
 pub mod file_reads;
 pub mod frame;
+pub(crate) mod gfx_records;
 mod gpu_profile;
 pub mod guard;
 mod indirect_guard;
