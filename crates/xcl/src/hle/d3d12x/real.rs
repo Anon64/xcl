@@ -6672,7 +6672,21 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let _cost = crate::hle::api_cost::time(crate::hle::api_cost::Call::Pipeline);
-    graphics_pso(this, desc, riid, ppv, false)
+    let hr = graphics_pso(this, desc, riid, ppv, false);
+    note_pipeline_for_dump(this, desc, ppv, hr);
+    hr
+}
+
+/// `XCL_DUMP_TARGETS`: pipeline `*ppv` was made from the graphics desc `desc` – its shaders,
+/// blend state and formats, for the pipelines a dumped target lists (`targets::note_pipeline`).
+unsafe fn note_pipeline_for_dump(this: *mut c_void, desc: *const c_void, ppv: *mut *mut c_void, hr: HRESULT) {
+    if !super::targets::enabled() || hr < 0 || ppv.is_null() || (*ppv).is_null() || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return;
+    }
+    let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    // (in `own_graphics`' order: the set's key is the one `pso_async` and `used-pipelines.txt` know)
+    let stages: Vec<(&'static str, &[u8])> = [("vs", &d.VS), ("ps", &d.PS), ("ds", &d.DS), ("hs", &d.HS), ("gs", &d.GS)].into_iter().filter_map(|(s, b)| shader_bytes(b).map(|b| (s, b))).collect();
+    super::targets::note_pipeline(*ppv as usize, &stages, &d.BlendState.RenderTarget[0], &d.RTVFormats[..d.NumRenderTargets.min(8) as usize], graphics_wave32(this));
 }
 
 /// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
@@ -8148,7 +8162,12 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
         return hr;
     }
     match stream_pipeline(desc) {
-        StreamPipeline::Graphics(d) => return graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true),
+        StreamPipeline::Graphics(d) => {
+            let g = &*d as *const _ as *const c_void;
+            let hr = graphics_pso(this, g, riid, ppv, true);
+            note_pipeline_for_dump(this, g, ppv, hr);
+            return hr;
+        }
         StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
         StreamPipeline::Unknown => {}
     }

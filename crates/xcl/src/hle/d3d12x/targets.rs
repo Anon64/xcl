@@ -15,13 +15,24 @@
 //! from DEPTH_WRITE (possibly compressed) is invalid – the present list would not close.
 //! Targets are kept by address only (not AddRef'd): `present::view_resource` hands one out only
 //! while a view still names it, and one released meanwhile is logged as released.
+//!
+//! Each target written also lists the pipelines that drew into it in that frame (the 12 with
+//! most draws): their shader set (`real::shaders_key`), each stage's shader (`real::shader_key`,
+//! and the dump hash the `[SHADER]` lines and the debug switches take), render target 0's blend
+//! state and the formats as the title made them, and what the first draw with it read through
+//! its descriptor tables that is not a target written. The console VS and PS of each are kept
+//! when the pipeline is made (512 MiB of them at most) and translated again on a thread of their
+//! own after the dump: `target<k>_<stage>_<key>.hlsl` and `.rdna2.txt` (the disassembly)
+//! go next to the pictures. Pipelines are known only once made through
+//! CreateGraphicsPipelineState (or a stream of console VS / PS) with the switch on.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -97,9 +108,47 @@ pub struct Frame {
     work: u64,
     targets: HashMap<usize, [u64; 4]>,
     depth: HashMap<usize, [u64; 4]>,
+    /// draws by (target, pipeline)
+    by: HashMap<(usize, usize), u64>,
+    /// what the first draw with each pipeline read (`bind::table_resources`)
+    inputs: HashMap<usize, Vec<Input>>,
+}
+
+/// A resource a draw read through its descriptor tables, described when it drew.
+#[derive(Clone, Debug, PartialEq)]
+struct Input {
+    res: usize,
+    /// D3D12_RESOURCE_DIMENSION; width, height, depth or array size, mips, format
+    dimension: i32,
+    width: u64,
+    height: u32,
+    depth: u16,
+    mips: u16,
+    format: i32,
 }
 
 impl Frame {
+    /// Draws with pipeline `pso` into `targets`: true for the frame's first draw with it (its
+    /// inputs are noted once).
+    fn drew_with(&mut self, targets: &[usize], pso: usize) -> bool {
+        for &t in targets {
+            *self.by.entry((t, pso)).or_default() += 1;
+        }
+        let first = !self.inputs.contains_key(&pso);
+        self.inputs.entry(pso).or_default();
+        first
+    }
+
+    /// The pipelines that drew into `target`, most draws first (ties: by address), the first
+    /// `most` of them, and how many more there were.
+    fn pipelines_of(&self, target: usize, most: usize) -> (Vec<(usize, u64)>, usize) {
+        let mut v: Vec<(usize, u64)> = self.by.iter().filter(|((t, _), _)| *t == target).map(|(&(_, p), &n)| (p, n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let more = v.len().saturating_sub(most);
+        v.truncate(most);
+        (v, more)
+    }
+
     fn draw(&mut self, targets: &[usize], depth: Option<usize>, outcome: usize) {
         self.work += 1;
         for &t in targets {
@@ -139,7 +188,24 @@ pub unsafe fn note_draw(list: *mut c_void, outcome: usize) {
     targets.sort_unstable();
     targets.dedup();
     let depth = super::list_x::bound_dsv(list).and_then(super::present::rtv_resource);
-    FRAME.lock().unwrap().get_or_insert_with(Frame::default).draw(&targets, depth, outcome);
+    let pso = super::bind::bound_pso(list);
+    let first = {
+        let mut g = FRAME.lock().unwrap();
+        let f = g.get_or_insert_with(Frame::default);
+        f.draw(&targets, depth, outcome);
+        f.drew_with(&targets, pso)
+    };
+    if first {
+        // (described now: the title draws with them, so they are alive)
+        let inputs: Vec<Input> = super::bind::table_resources(list)
+            .into_iter()
+            .filter_map(|r| {
+                let d = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void))?.GetDesc();
+                Some(Input { res: r, dimension: d.Dimension.0, width: d.Width, height: d.Height, depth: d.DepthOrArraySize, mips: d.MipLevels, format: d.Format.0 })
+            })
+            .collect();
+        FRAME.lock().unwrap().get_or_insert_with(Frame::default).inputs.insert(pso, inputs);
+    }
 }
 
 /// A dispatch: work of the frame.
@@ -186,7 +252,7 @@ pub unsafe fn to_dump(n: u64, f: &Frame) -> Vec<(String, ID3D12Resource, D3D12_R
     let dumped = config().map_or(DUMPED, |c| c.targets);
     crate::xlog_info!("D3D12.X: target dump of frame {n}: {} draws and dispatches, {} render targets drawn into", f.work, ranked.len());
     let mut out = Vec::new();
-    let (mut sizes, mut left) = (Vec::new(), Vec::new());
+    let (mut sizes, mut left, mut written) = (Vec::new(), Vec::new(), Vec::new());
     let depth = f.depth().map(|(r, c)| (usize::MAX, r, c));
     for (k, r, c) in ranked.into_iter().enumerate().map(|(k, (r, c))| (k, r, c)).chain(depth) {
         let res = super::present::view_resource(r);
@@ -219,13 +285,197 @@ pub unsafe fn to_dump(n: u64, f: &Frame) -> Vec<(String, ID3D12Resource, D3D12_R
                 left.push(format!("target{k}"));
             } else {
                 out.push((format!("target{k}"), res, d));
+                written.push((k, r));
             }
         }
     }
     if !left.is_empty() {
         crate::xlog_warn!("D3D12.X: target dump of frame {n}: {} of {} targets left out, past {} MiB of readback: {}", left.len(), out.len() + left.len(), DUMP_BYTES_MOST >> 20, left.join(" "));
     }
+    log_pipelines(n, f, &written);
     out
+}
+
+/// pipelines a written target lists
+const PIPELINES_MOST: usize = 12;
+/// console shader bytes kept for the dumps at most
+const BLOB_BYTES_MOST: usize = 512 << 20;
+
+/// A graphics pipeline as the title made it.
+struct Pipeline {
+    /// `real::shaders_key` of its shaders
+    set: u64,
+    /// (stage, `real::shader_key`, dump hash, its bytes: None past `BLOB_BYTES_MOST`)
+    stages: Vec<(&'static str, u64, u64, Option<Arc<[u8]>>)>,
+    blend: D3D12_RENDER_TARGET_BLEND_DESC,
+    formats: Vec<i32>,
+    /// VS / PS translated for waves of 32 (`real::graphics_wave32`)
+    split: bool,
+}
+
+/// pipelines by the address the title has (kept by address: a later one there takes its place)
+static PIPELINES: Mutex<Option<HashMap<usize, Arc<Pipeline>>>> = Mutex::new(None);
+/// console shaders by `real::shader_key`, and their bytes in all
+static BLOBS: Mutex<Option<(HashMap<u64, Arc<[u8]>>, usize)>> = Mutex::new(None);
+
+/// Pipeline `pso` was made of `stages` (VS, PS, DS, HS, GS as present, in that order) with render
+/// target 0's `blend` and the render target `formats`.
+pub fn note_pipeline(pso: usize, stages: &[(&'static str, &[u8])], blend: &D3D12_RENDER_TARGET_BLEND_DESC, formats: &[DXGI_FORMAT], split: bool) {
+    if !enabled() || pso == 0 {
+        return;
+    }
+    let set = super::real::shaders_key(&stages.iter().map(|(_, b)| b.to_vec()).collect::<Vec<_>>());
+    let stages = {
+        let mut g = BLOBS.lock().unwrap();
+        let (kept, bytes) = g.get_or_insert_with(Default::default);
+        stages
+            .iter()
+            .map(|&(s, b)| {
+                let key = super::real::shader_key(b);
+                let blob = kept.get(&key).cloned().or_else(|| {
+                    if *bytes + b.len() > BLOB_BYTES_MOST {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| crate::xlog_warn!("D3D12.X: XCL_DUMP_TARGETS keeps {} MiB of shaders: later ones get no HLSL in a dump", BLOB_BYTES_MOST >> 20));
+                        return None;
+                    }
+                    *bytes += b.len();
+                    let a: Arc<[u8]> = b.into();
+                    kept.insert(key, a.clone());
+                    Some(a)
+                });
+                (s, key, crate::gpu::shader::fnv64(b), blob)
+            })
+            .collect()
+    };
+    let p = Pipeline { set, stages, blend: *blend, formats: formats.iter().map(|f| f.0).collect(), split };
+    PIPELINES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, Arc::new(p));
+}
+
+/// A D3D12_BLEND by name.
+fn blend_name(b: i32) -> &'static str {
+    const NAMES: [&str; 22] = [
+        "?", "ZERO", "ONE", "SRC_COLOR", "INV_SRC_COLOR", "SRC_ALPHA", "INV_SRC_ALPHA", "DEST_ALPHA", "INV_DEST_ALPHA", "DEST_COLOR", "INV_DEST_COLOR", "SRC_ALPHA_SAT", "?", "?",
+        "BLEND_FACTOR", "INV_BLEND_FACTOR", "SRC1_COLOR", "INV_SRC1_COLOR", "SRC1_ALPHA", "INV_SRC1_ALPHA", "ALPHA_FACTOR", "INV_ALPHA_FACTOR",
+    ];
+    NAMES.get(b as usize).copied().unwrap_or("?")
+}
+
+/// Render target 0's blend state as a line: what a pass that comes out inverted is checked by.
+fn blend_text(b: &D3D12_RENDER_TARGET_BLEND_DESC) -> String {
+    const OPS: [&str; 6] = ["?", "ADD", "SUBTRACT", "REV_SUBTRACT", "MIN", "MAX"];
+    const LOGIC: [&str; 16] = [
+        "CLEAR", "SET", "COPY", "COPY_INVERTED", "NOOP", "INVERT", "AND", "NAND", "OR", "NOR", "XOR", "EQUIV", "AND_REVERSE", "AND_INVERTED", "OR_REVERSE", "OR_INVERTED",
+    ];
+    let op = |o: D3D12_BLEND_OP| OPS.get(o.0 as usize).copied().unwrap_or("?");
+    let mut s = if b.BlendEnable.as_bool() {
+        format!(
+            "blend on: colour {} {} {}, alpha {} {} {}",
+            blend_name(b.SrcBlend.0),
+            op(b.BlendOp),
+            blend_name(b.DestBlend.0),
+            blend_name(b.SrcBlendAlpha.0),
+            op(b.BlendOpAlpha),
+            blend_name(b.DestBlendAlpha.0)
+        )
+    } else {
+        "blend off".to_string()
+    };
+    if b.LogicOpEnable.as_bool() {
+        s += &format!(", logic op {}", LOGIC.get(b.LogicOp.0 as usize).copied().unwrap_or("?"));
+    }
+    s + &format!(", write mask {:#x}", b.RenderTargetWriteMask)
+}
+
+/// The files of a written target's pipeline's shader: `target<k>_<stage>_<key>` (.hlsl, .rdna2.txt).
+fn shader_stem(k: usize, stage: &str, key: u64) -> String {
+    format!("target{k}_{stage}_{key:016x}")
+}
+
+/// Logs the pipelines that drew into each written target `(k, resource)` of frame `n`, and
+/// writes their shaders on a thread of their own (a later frame's dump writes over them).
+fn log_pipelines(n: u64, f: &Frame, written: &[(usize, usize)]) {
+    crate::xlog_info!("D3D12.X: target dump of frame {n}: the pipelines of the targets written");
+    let pipelines = PIPELINES.lock().unwrap().clone().unwrap_or_default();
+    let tag_of = |r: usize| written.iter().find(|w| w.1 == r).map(|w| format!("target{}", w.0));
+    let mut files: Vec<(String, &'static str, Arc<[u8]>, Option<Arc<[u8]>>, bool)> = Vec::new();
+    for &(k, t) in written {
+        let (list, more) = f.pipelines_of(t, PIPELINES_MOST);
+        for (pso, draws) in list {
+            let translated = super::real::is_translated_graphics(super::pso_async::peek(pso));
+            let Some(p) = pipelines.get(&pso) else {
+                crate::xlog_info!("D3D12.X: target dump: target{k}: {draws} draws with pipeline {pso:#x} (translated {translated}): not known (made before the switch, or a mesh pipeline)");
+                continue;
+            };
+            let stages: Vec<String> = p.stages.iter().map(|(s, key, h, _)| format!("{s} {key:016x} (dump hash {h:016x})")).collect();
+            let inputs = f.inputs.get(&pso).map_or(&[][..], |v| &v[..]);
+            let read: Vec<String> = inputs.iter().filter_map(|i| tag_of(i.res)).collect();
+            crate::xlog_info!(
+                "D3D12.X: target dump: target{k}: {draws} draws with pipeline {pso:#x} (translated {translated}): shaders {:016x} – {}; RT formats {:?}, RT0 {}{}",
+                p.set,
+                stages.join(", "),
+                p.formats,
+                blend_text(&p.blend),
+                if read.is_empty() { String::new() } else { format!("; reads {}", read.join(" ")) }
+            );
+            for i in inputs.iter().filter(|i| tag_of(i.res).is_none()) {
+                crate::xlog_info!(
+                    "D3D12.X: target dump: target{k}:   pipeline {pso:#x} reads {:#x}: dimension {}, {}x{}x{}, {} mips, format {}",
+                    i.res,
+                    i.dimension,
+                    i.width,
+                    i.height,
+                    i.depth,
+                    i.mips,
+                    i.format
+                );
+            }
+            let vs = p.stages.iter().find(|s| s.0 == "vs").and_then(|s| s.3.clone());
+            for (s, key, _, blob) in &p.stages {
+                if let Some(b) = blob {
+                    files.push((shader_stem(k, s, *key), s, b.clone(), vs.clone(), p.split));
+                }
+            }
+        }
+        if more > 0 {
+            crate::xlog_info!("D3D12.X: target dump: target{k}: and {more} more pipelines");
+        }
+    }
+    if files.is_empty() {
+        return;
+    }
+    let Some(dir) = crate::state::boot().map(|b| b.logs_dir()) else { return };
+    let _ = std::thread::Builder::new().name("xcl-dump-shaders".into()).spawn(move || write_shaders(&dir, files));
+}
+
+/// Writes each console shader's disassembly and its VS / PS translated again, as the pipeline
+/// translates it (`pso::console_translation`; the PS's static samplers after the VS's).
+fn write_shaders(dir: &std::path::Path, files: Vec<(String, &'static str, Arc<[u8]>, Option<Arc<[u8]>>, bool)>) {
+    use crate::gpu::recomp::pso::{console_translation, is_console, mem_windows, Stage};
+    let translate = |b: &[u8], stage: Stage, base: u32, split: bool| console_translation(b, stage, base, mem_windows(), split).map(|(t, _)| (t.hlsl, t.static_samplers.len() as u32));
+    for (stem, stage, blob, vs, split) in files {
+        let base = dir.join(&stem);
+        if !is_console(&blob) {
+            let _ = std::fs::write(base.with_extension("txt"), format!("not a console shader ({} bytes): the PC compiles it as it is\n", blob.len()));
+            continue;
+        }
+        if let Some(sh) = crate::gpu::xbox::parse(&blob) {
+            let _ = std::fs::write(base.with_extension("rdna2.txt"), crate::gpu::xbox::listing(&sh));
+        }
+        let hlsl = match stage {
+            "vs" => translate(&blob, Stage::Vertex, 0, split),
+            "ps" => {
+                let samplers = vs.as_deref().filter(|v| is_console(v)).and_then(|v| translate(v, Stage::Vertex, 0, split).ok()).map_or(0, |t| t.1);
+                translate(&blob, Stage::Pixel, samplers, split)
+            }
+            _ => Err(format!("a {stage} is not translated here")),
+        };
+        let text = match hlsl {
+            Ok((h, _)) => format!("// {stem}: translated again from the pipeline's console shader (the HLSL path; XCL_DIRECT_DXIL, a switch-form retry or a debug switch build another)\n{h}"),
+            Err(e) => format!("// {stem}: not translated: {e}\n"),
+        };
+        let _ = std::fs::write(base.with_extension("hlsl"), text);
+    }
+    crate::xlog_info!("D3D12.X: target dump: the shaders of the pipelines listed are written to {}", dir.display());
 }
 
 /// readback bytes of one present's target dump at most: 64 targets of 2560x1440 RGBA32F are
@@ -432,6 +682,36 @@ mod tests {
         assert!(huge > DUMP_BYTES_MOST);
         assert_eq!(dumped_within(&[huge], DUMP_BYTES_MOST), 1);
         assert_eq!(dumped_within(&[huge, small], DUMP_BYTES_MOST), 1);
+    }
+
+    /// A written target lists its pipelines by draws (12 at most), each pipeline's inputs noted
+    /// at its first draw of the frame; the blend line names an inverting logic op.
+    #[test]
+    fn a_target_lists_its_pipelines_by_draws() {
+        let mut f = Frame::default();
+        assert!(f.drew_with(&[0x10], 0xa));
+        assert!(!f.drew_with(&[0x10, 0x20], 0xa));
+        assert!(f.drew_with(&[0x10], 0xb));
+        for p in 0x100..0x110 {
+            f.drew_with(&[0x30], p);
+        }
+        assert_eq!(f.pipelines_of(0x10, 12), (vec![(0xa, 2), (0xb, 1)], 0));
+        assert_eq!(f.pipelines_of(0x20, 12), (vec![(0xa, 1)], 0));
+        let (v, more) = f.pipelines_of(0x30, 12);
+        assert_eq!((v.len(), v[0], more), (12, (0x100, 1), 4));
+        let mut b = D3D12_RENDER_TARGET_BLEND_DESC { RenderTargetWriteMask: 0xf, ..Default::default() };
+        assert_eq!(blend_text(&b), "blend off, write mask 0xf");
+        b.BlendEnable = true.into();
+        b.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        b.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        b.BlendOp = D3D12_BLEND_OP_ADD;
+        b.SrcBlendAlpha = D3D12_BLEND_ONE;
+        b.DestBlendAlpha = D3D12_BLEND_ZERO;
+        b.BlendOpAlpha = D3D12_BLEND_OP_REV_SUBTRACT;
+        b.LogicOpEnable = true.into();
+        b.LogicOp = D3D12_LOGIC_OP_COPY_INVERTED;
+        assert_eq!(blend_text(&b), "blend on: colour SRC_ALPHA ADD INV_SRC_ALPHA, alpha ONE REV_SUBTRACT ZERO, logic op COPY_INVERTED, write mask 0xf");
+        assert_eq!(shader_stem(17, "ps", 0xab), "target17_ps_00000000000000ab");
     }
 
     #[test]

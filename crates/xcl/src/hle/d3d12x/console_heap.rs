@@ -797,12 +797,12 @@ pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
     }
 }
 
-/// view slot address → the resource its view names (`XCL_TRACE_FRAME` diagnostics)
+/// view slot address → the resource its view names (`XCL_TRACE_FRAME`, `XCL_DUMP_TARGETS`)
 static RES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
-    if s.sampler || !super::present::trace_frame() {
+    if s.sampler || !(super::present::trace_frame() || super::targets::enabled()) {
         return;
     }
     let mut g = RES.lock().unwrap();

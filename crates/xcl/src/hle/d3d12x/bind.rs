@@ -493,6 +493,26 @@ pub(super) fn bound_pso(this: *mut c_void) -> usize {
     with(this, |s| s.pso)
 }
 
+/// `XCL_DUMP_TARGETS`: the resources the first 16 slots of each descriptor table of `this`'s
+/// graphics arguments name, each once (as `trace_reads_of_watched` reads them).
+pub(super) fn table_resources(this: *mut c_void) -> Vec<usize> {
+    let Some(u) = crate::gpu::uma::get() else { return Vec::new() };
+    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let Some(layout) = layout else { return Vec::new() };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let mut out = Vec::new();
+    for p in layout.params.iter() {
+        let Param::Table { at } = *p else { continue };
+        let t = word(at as usize) as usize;
+        for k in 0..16usize {
+            if let Some(r) = super::console_heap::resource_at(u.base() + t + 32 * k).filter(|r| !out.contains(r)) {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
 /// A put-off dispatch that could not be recorded.
 pub(super) fn dispatch_dropped() {
     count(DISPATCHES_SKIPPED);
