@@ -3077,7 +3077,9 @@ pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
 /// Builds of a submit's put-off calls that go on without the commit headroom, as a title thread's own do: about what the title's threads had in the driver at once before.
 const WANTED_AT_ONCE: usize = 4;
 
-/// Records the deferred dispatches of `wrapper`'s recording, waiting for their pipelines as a bind did.
+/// Records the deferred dispatches of `wrapper`'s recording, each once its pipeline is built
+/// (`pso_async::wait_for_submit`: not bounded by `XCL_PSO_WAIT_MS`; `XCL_CS_PSO_WAIT_MS` still
+/// bounds it).
 pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
     let mut segs = Vec::new();
     super::title_list::push_segments(wrapper, &mut segs);
@@ -3128,6 +3130,8 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             super::bind::pass_arena(last, seg);
             real::dispatch_chain::list_follows(last as usize, seg as usize);
         }
+        // (no recording lock is held across the wait)
+        super::bind::wait_for_bound(seg);
         // (a recording of its own, made here and not through `cl_reset`: its pipeline is named
         // before the dispatch, for the device-removal report)
         super::dred::reset(seg);
@@ -8053,6 +8057,152 @@ mod tests {
 
             let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
             assert_eq!(rel_fn(wrap), 0);
+        }
+    }
+
+    /// With `XCL_PSO_WAIT_MS`, a dispatch put off to the submit whose pipeline is built after the
+    /// budget (and that a bind of another list found `late` after it was put off: a late one is
+    /// not put off, `pso_async::waits_for`) is recorded with the built pipeline: its output is
+    /// written, as is the `Write64` after it in the list. Before, the submit's bind gave up after
+    /// the budget and left the dispatch out while the label still fired.
+    #[test]
+    fn a_put_off_dispatch_runs_at_the_submit_when_its_build_outlasts_the_wait_budget() {
+        use super::super::{bind, pso_async, title_list};
+        use crate::gpu::recomp::runner;
+        use crate::gpu::xbox::tests::{fssm, sample};
+        use std::time::{Duration, Instant};
+
+        if crate::gpu::recomp::dxc::location().is_err() {
+            return runner::skip_test("no DXC");
+        }
+        if super::super::backend() != super::super::Backend::Real {
+            return runner::skip_test("no GPU");
+        }
+        if runner::wave64_programs_supported() != Ok(true) {
+            return runner::skip_test("no wave64");
+        }
+        if real::uma_window_vas().is_empty() {
+            return runner::skip_test("no unified memory on the GPU");
+        }
+        const MARK: u32 = 0x600D_F00D;
+        const LABEL: u64 = 0x1AB_E15E_7000_0001;
+        unsafe {
+            let raw = real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap().clone();
+            // s[0:1]: the argument table; its first 8 bytes say where the program stores MARK
+            let code: Vec<u8> = [
+                ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 0x7D)][..], None),
+                ("S_WAITCNT", "ENC_SOPP", &[("SIMM16", 0)][..], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 4)][..], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 5)][..], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 255)][..], Some(MARK)),
+                ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 1), ("SADDR", 0x7D)][..], None),
+                ("S_ENDPGM", "ENC_SOPP", &[][..], None),
+            ]
+            .iter()
+            .flat_map(|(n, e, f, l)| crate::gpu::rdna2::encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}")))
+            .collect();
+            let mut f = fssm(&code, &[(6, 1)]);
+            // COMPUTE_PGM_RSRC2 (2 user SGPRs) and numthreads
+            for (k, x) in [2u32 << 1, 64, 1, 1].into_iter().enumerate() {
+                f[0x138 + 4 * k..0x13C + 4 * k].copy_from_slice(&x.to_le_bytes());
+            }
+            let blob = sample(5, &[f]);
+            let game_rs: ID3D12RootSignature = {
+                let mut ser = None;
+                D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+                let ser = ser.unwrap();
+                dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+            };
+            let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(game_rs)),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: blob.as_ptr() as _, BytecodeLength: blob.len() },
+                ..Default::default()
+            };
+            let made: windows::core::Result<ID3D12PipelineState> = dev.CreateComputePipelineState(&desc);
+            std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
+            let made = made.expect("CreateComputePipelineState through the backend hook");
+            let built = pso_async::resolve_wait(made.as_raw() as usize);
+            assert!(real::is_translated_compute(built), "not translated: {:?}", real::stats().translation_errors);
+
+            // the title's pipeline: a stand-in whose build ends once the submit has begun
+            let standin = 0x7E57_D0F1usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            BUILD.store(false, Ordering::Release);
+            pso_async::submit(
+                standin,
+                true,
+                Box::new(move || {
+                    let t = Instant::now();
+                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    ID3D12PipelineState::from_raw_borrowed(&(built as *mut c_void)).unwrap().clone().into_raw() as usize
+                }),
+            );
+
+            let u = crate::gpu::uma::get().unwrap();
+            let out = u.alloc(256, 256).unwrap();
+            std::ptr::write_bytes(out, 0, 256);
+            let label = out.add(64) as *mut u64;
+
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let a = alloc.as_raw() as usize;
+            let pc0 = real::create_raw_pc_command_list(raw, ty, a, 0).expect("a PC command list");
+            on_create(pc0, a, 0, ty);
+            bind::reset(pc0, a, standin);
+            let wrap = title_list::wrap(pc0);
+            bind::set_args_for_test(pc0, (out as u64).to_le_bytes().to_vec());
+
+            bind::dispatch(pc0, 1, 1, 1);
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 3, "the dispatch was not put off");
+            // another list's bind as the title records: past the budget, late
+            pso_async::set_wait_budget_for_test(Some(Duration::from_millis(50)));
+            assert_eq!(pso_async::resolve_wait(standin), standin, "a bind as the title records: past the budget, late");
+            assert!(!pso_async::waits_for(standin), "late");
+            write64_bottom_x(*segs.last().unwrap(), label as u64, LABEL, 0, 0);
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap), 0);
+
+            let build = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(400));
+                BUILD.store(true, Ordering::Release);
+            });
+            let t = Instant::now();
+            record_deferred(wrap);
+            let took = t.elapsed();
+            pso_async::set_wait_budget_for_test(None);
+            build.join().unwrap();
+
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            segs.clear();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+            let q = queue.as_raw();
+            let exec: ExecFn = if real::is_adopted(q) {
+                std::mem::transmute(real::orig_fn(q, PC_QUEUE_EXECUTE_COMMAND_LISTS))
+            } else {
+                std::mem::transmute(*(*(q as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS))
+            };
+            exec(q, segs.len() as u32, segs.as_ptr());
+            queue.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("the list runs");
+            let (mark, labelled) = (std::ptr::read_volatile(out as *const u32), std::ptr::read_volatile(label));
+            let removed = dev.GetDeviceRemovedReason();
+
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            rel_fn(wrap);
+            pso_async::release(pso_async::released(standin));
+            drop(made);
+
+            assert!(removed.is_ok());
+            assert_eq!(labelled, LABEL, "the Write64 after the dispatch");
+            assert_eq!(mark, MARK, "the put-off dispatch was left out (the submit waited {took:?})");
+            assert!(took >= Duration::from_millis(300), "the submit did not wait for the build ({took:?})");
         }
     }
 
