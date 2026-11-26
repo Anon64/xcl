@@ -583,6 +583,10 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
 
 /// console #21 RSSetViewports (PC #21)
 pub(super) unsafe extern "system" fn rs_set_viewports_x(this: *mut c_void, n: u32, v: *const D3D12_VIEWPORT) {
+    let _c = super::capture::op(this, || {
+        let vs = if v.is_null() { &[][..] } else { std::slice::from_raw_parts(v, n as usize) };
+        Some(super::capture::Op::Viewports(vs.iter().map(|v| [v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth]).collect()))
+    });
     if !v.is_null() {
         let vs = std::slice::from_raw_parts(v, n as usize).to_vec();
         with_bindings(this, |b| b.viewports = vs);
@@ -592,6 +596,10 @@ pub(super) unsafe extern "system" fn rs_set_viewports_x(this: *mut c_void, n: u3
 
 /// console #22 RSSetScissorRects (PC #22)
 pub(super) unsafe extern "system" fn rs_set_scissors_x(this: *mut c_void, n: u32, r: *const windows::Win32::Foundation::RECT) {
+    let _c = super::capture::op(this, || {
+        let rs = if r.is_null() { &[][..] } else { std::slice::from_raw_parts(r, n as usize) };
+        Some(super::capture::Op::Scissors(rs.iter().map(|r| [r.left, r.top, r.right, r.bottom]).collect()))
+    });
     if !r.is_null() {
         let rs = std::slice::from_raw_parts(r, n as usize).to_vec();
         with_bindings(this, |b| b.scissors = rs);
@@ -2516,7 +2524,12 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
-    if size == 0 || !size.is_multiple_of(4) {
+    let refused = size == 0 || !size.is_multiple_of(4);
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        Some(c::Op::Copy { kind: "memory", dst: c::Loc::Address(dst), src: c::Loc::Address(src), at: [0; 3], bx: None, bytes: Some(size), refused })
+    });
+    if refused {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
     // In a GPU view: its tiles, asked for here, are filled from the CPU view before the list runs,
@@ -3795,6 +3808,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
         record_deferred(wrapper);
     }
+    super::capture::kickoff(this, queue);
 
     let q_raw = queue as *mut c_void;
     super::title_textures::refresh(q_raw);
@@ -4424,6 +4438,10 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
+    let _c = super::capture::op(this, || {
+        let given = if heaps.is_null() { &[][..] } else { std::slice::from_raw_parts(heaps, n as usize) };
+        Some(super::capture::Op::Heaps(given.iter().map(|&h| super::console_heap::base(h).map_or((h, 0, false), |(s, b)| (h, b, s))).collect()))
+    });
     super::bind::heaps_changed(this);
     super::bind::set_heaps(this, if heaps.is_null() { &[] } else { std::slice::from_raw_parts(heaps, n as usize) });
     if heaps.is_null() || n == 0 {
@@ -4530,6 +4548,7 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
 /// command list #81 DrawIndexedX(index address, index format, index count, flags): one
 /// instance of `count` indices read from that address; the bound index buffer stays
 pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, format: DXGI_FORMAT, count: u32, _flags: u32) {
+    let _c = super::bind::capture_work(this, || super::capture::WorkKind::DrawIndexedX { va, format: format.0, indices: count }, true);
     static N: AtomicU64 = AtomicU64::new(0);
     let stride = match format {
         DXGI_FORMAT_R16_UINT => 2,
@@ -4580,7 +4599,11 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     if let Some(w) = super::title_list::wrapper_of(this) {
         return super::title_list::reset(w, alloc, pso);
     }
-    reset_pc(this, alloc, pso)
+    let hr = reset_pc(this, alloc, pso);
+    if hr >= 0 {
+        super::capture::list_begin(this as usize, pso);
+    }
+    hr
 }
 
 /// Reset of the PC list `this` (allocator, initial pipeline): updates allocator/pipeline and
@@ -4656,6 +4679,7 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if barriers.is_null() || n == 0 {
         return;
     }
+    let capture = super::capture::op(this, || Some(super::capture::barrier(&(0..n as usize).map(|k| barriers.add(k).read_unaligned()).collect::<Vec<_>>())));
     let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize + 1);
     // a UAV barrier for all resources is in `out` / a transition from or to UNORDERED_ACCESS
     let (mut any_uav, mut uav_transition) = (false, false);
@@ -4741,6 +4765,12 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             out.iter().filter(|b| b[0] == 0).map(|b| ((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32))).collect();
         super::title_textures::note_transitions(this as usize, &t);
     }
+    capture.amend(|op| {
+        if let super::capture::Op::Barrier { sent, plane_copies: copies, .. } = op {
+            sent.clone_from(&out);
+            *copies = plane_copies.as_ref().map_or(0, |p| p.to_plane.len() + p.to_twin.len());
+        }
+    });
     if let Some(p) = &plane_copies {
         plane_copies_on(this, &p.to_plane, false);
     }
@@ -4833,6 +4863,10 @@ fn note_gpu_write(what: &str, va: usize, n: u64) {
 }
 
 pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        Some(c::Op::Copy { kind: "buffer_region", dst: c::buffer(dst, dst_off), src: c::buffer(src, src_off), at: [0; 3], bx: None, bytes: Some(n), refused: false })
+    });
     if super::present::trace_frame() {
         if let Some(a) = real::title_address(dst) {
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
@@ -4868,6 +4902,11 @@ unsafe fn trace_watched_copy(what: &str, dst: usize, src: usize) {
 
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        let b = bx.as_ref().map(|b| [b.left, b.top, b.front, b.right, b.bottom, b.back]);
+        Some(c::Op::Copy { kind: "texture_region", dst: c::location(dst), src: c::location(src), at: [x, y, z], bx: b, bytes: None, refused: dst.is_null() || src.is_null() })
+    });
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
@@ -4972,6 +5011,7 @@ const PC_CLEAR_DEPTH_STENCIL_VIEW: usize = 47;
 
 /// command list #51 ClearDepthStencilView(dsv, flags, depth, stencil, rects, rect list) (PC #47)
 pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    let _c = super::capture::op(this, || Some(super::capture::clear("dsv", dsv as u64, None, [depth.to_bits(), stencil as u32, 0, 0], flags, n)));
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         static W: AtomicU64 = AtomicU64::new(0);
@@ -5030,6 +5070,11 @@ pub(super) fn uav_clear_resource(res: usize, gpu: Option<super::console_heap::Sl
 /// console heap slots (heap #9 / #10), not PC descriptors. A depth buffer whose UAV views are
 /// views of its twin (`depth_uav`) is cleared through the twin the GPU slot's view names.
 unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usize, values: *const c_void, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    let capture = super::capture::op(this, || {
+        let v = values.cast::<[u32; 4]>().as_ref().copied().unwrap_or_default();
+        Some(super::capture::clear(if slot == PC_CLEAR_UAV_UINT { "uav_uint" } else { "uav_float" }, gpu, Some(res), v, 0, n))
+    });
+    let refused = || capture.amend(|op| if let super::capture::Op::Clear { refused, .. } = op { *refused = true });
     let gpu_slot = super::console_heap::slot(gpu);
     let (gpu, cpu) = match uav_clear_handles(gpu_slot, super::console_heap::slot(cpu)) {
         UavClearHandles::Console { gpu, cpu } => (gpu, cpu),
@@ -5039,10 +5084,10 @@ unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usi
             if once(&N, 1) {
                 crate::xlog_warn!("D3D12.X: ClearUnorderedAccessView with GPU handle {gpu:#x} / CPU handle {cpu:#x}: not both a console slot with a shader-visible UAV – not done");
             }
-            return;
+            return refused();
         }
     };
-    let Some(res) = uav_clear_resource(res, gpu_slot) else { return };
+    let Some(res) = uav_clear_resource(res, gpu_slot) else { return refused() };
     pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
 }
 
@@ -5084,6 +5129,10 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        Some(c::Op::Resolve { dst: c::describe(dst), dst_sub, src: c::describe(src), src_sub, format, region: None })
+    });
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(this as usize, dst);
     trace_resolve("ResolveSubresource", dst, src, format, "");
@@ -5094,6 +5143,11 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 /// mode) (PC #64)
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        let r = rect.as_ref().map(|r| [r.left, r.top, r.right, r.bottom]);
+        Some(c::Op::Resolve { dst: c::describe(dst), dst_sub, src: c::describe(src), src_sub, format, region: Some((x, y, r, mode)) })
+    });
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(this as usize, dst);
     if super::present::trace_frame() {
@@ -5105,6 +5159,10 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        Some(c::Op::Copy { kind: "resource", dst: c::buffer(dst, 0), src: c::buffer(src, 0), at: [0; 3], bx: None, bytes: None, refused: false })
+    });
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(this as usize, dst);
     super::lut3d::wrote(dst, true, || format!("CopyResource from {src:#x}"));

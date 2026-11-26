@@ -388,6 +388,12 @@ const DISPATCHES: usize = 3;
 const DISPATCHES_SKIPPED: usize = 4;
 
 fn count(k: usize) {
+    use super::capture::Outcome;
+    super::capture::outcome(match k {
+        DRAWS | DISPATCHES => Outcome::Ran,
+        DRAWS_PC => Outcome::Pc,
+        _ => Outcome::Skipped,
+    });
     let n = COUNTS[k].fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_power_of_two() && n >= 64 {
         let c: Vec<u64> = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
@@ -496,21 +502,56 @@ pub(super) fn bound_pso(this: *mut c_void) -> usize {
 /// `XCL_DUMP_TARGETS`: the resources the first 16 slots of each descriptor table of `this`'s
 /// graphics arguments name, each once (as `trace_reads_of_watched` reads them).
 pub(super) fn table_resources(this: *mut c_void) -> Vec<usize> {
+    table_resources_of(this, true, 16)
+}
+
+/// The resources the first `slots` slots of each descriptor table of `this`'s graphics (`gfx`)
+/// or compute arguments name, each once.
+fn table_resources_of(this: *mut c_void, gfx: bool, slots: usize) -> Vec<usize> {
     let Some(u) = crate::gpu::uma::get() else { return Vec::new() };
-    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
     let Some(layout) = layout else { return Vec::new() };
     let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
     let mut out = Vec::new();
     for p in layout.params.iter() {
         let Param::Table { at } = *p else { continue };
         let t = word(at as usize) as usize;
-        for k in 0..16usize {
+        for k in 0..slots {
             if let Some(r) = super::console_heap::resource_at(u.base() + t + 32 * k).filter(|r| !out.contains(r)) {
                 out.push(r);
             }
         }
     }
     out
+}
+
+/// `XCL_CAPTURE_FRAME`: a draw or dispatch of the title's on `this` (`gfx`: with the graphics
+/// root arguments), with the root arguments, heaps and pipeline it has, until the call returns.
+pub(super) unsafe fn capture_work(this: *mut c_void, kind: impl FnOnce() -> super::capture::WorkKind, gfx: bool) -> super::capture::Guard {
+    use super::capture::{RootArg, RootVal};
+    super::capture::op(this, || {
+        let (root, heaps, pso) = with(this, |s| {
+            let (layout, args) = if gfx { (&s.layout_gfx, &s.args_gfx) } else { (&s.layout, &s.args) };
+            let word = |at: usize| args.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+            let root: Vec<RootArg> = layout.as_ref().map_or(Vec::new(), |l| {
+                l.params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| RootArg {
+                        i: i as u32,
+                        v: match *p {
+                            Param::Constants { at, count } => RootVal::Constants((0..count as usize).map(|k| word(at as usize + 4 * k)).collect()),
+                            Param::Descriptor { at } => RootVal::View(word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32),
+                            Param::Table { at } => RootVal::Table(word(at as usize)),
+                        },
+                    })
+                    .collect()
+            });
+            (root, s.heaps, s.pso)
+        });
+        let views = table_resources_of(this, gfx, super::capture::TABLE_SLOTS);
+        Some(super::capture::work(this, kind(), pso, gfx, root, heaps, views))
+    })
 }
 
 /// A put-off dispatch that could not be recorded.
@@ -590,6 +631,7 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 
 /// #34 SetGraphicsRootSignature (PC #30)
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
+    let _c = super::capture::op(this, || Some(super::capture::Op::RootSig { gfx: true, rs: rs as usize }));
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
         s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
@@ -1140,6 +1182,7 @@ fn note_no_root_signature() {
 }
 
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    let _c = capture_work(this, || super::capture::WorkKind::DispatchMesh([x, y, z]), true);
     type PcDm = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
     let pc_dm: PcDm = std::mem::transmute(super::real::orig_fn(this, 79));
     let raw_pso = with(this, |s| s.pso);
@@ -1230,11 +1273,14 @@ unsafe fn mesh_work(this: *mut c_void, outcome: usize) {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
+    let dispatches = super::capture::on() && signature_dispatches(sig);
+    let _c = capture_work(this, || super::capture::indirect(sig, dispatches, max, args, args_off, count_buf, count_off), !dispatches);
     let raw_pso = with(this, |s| s.pso);
     // (a dispatching one whose pipeline would be waited for here: at the submit, `list_x::defer`;
     // recorded there through this call, with everything below)
     let unbuilt_compute = signature_dispatches(sig) && super::pso_async::waits_for(raw_pso) && super::real::is_console_compute(raw_pso);
     if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
+        super::capture::outcome(super::capture::Outcome::Deferred);
         return super::pso_async::need_by_submit(raw_pso);
     }
     let pso = super::pso_async::resolve_wait(raw_pso);
@@ -1622,6 +1668,7 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+    let _c = capture_work(this, || super::capture::WorkKind::Draw { vertices, instances, first_vertex, first_instance }, true);
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
         let t = super::gpu_profile::begin(this, with(this, |s| s.pso), super::gpu_profile::Kind::Draw, [vertices, instances, 0]);
@@ -1640,6 +1687,7 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+    let _c = capture_work(this, || super::capture::WorkKind::DrawIndexed { indices, instances, first_index, base_vertex, first_instance }, true);
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
@@ -2047,6 +2095,7 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
 
 /// #33 SetComputeRootSignature (PC #29)
 pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
+    let _c = super::capture::op(this, || Some(super::capture::Op::RootSig { gfx: false, rs: rs as usize }));
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
         s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
@@ -2081,15 +2130,18 @@ pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_vo
 
 /// #25 SetPipelineState: noted, then bound as on the PC
 pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
+    let _c = super::capture::op(this, || Some(super::capture::Op::Pipeline(pso as usize)));
     with(this, |s| s.pso = pso as usize);
     super::real::bind_pipeline(this, pso);
 }
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    let _c = capture_work(this, || super::capture::WorkKind::Dispatch([x, y, z]), false);
     let pso = with(this, |s| s.pso);
     // (recorded at the submit through this call, with everything below: counted there)
     if super::pso_async::waits_for(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
+        super::capture::outcome(super::capture::Outcome::Deferred);
         return super::pso_async::need_by_submit(pso);
     }
     super::targets::note_dispatch();

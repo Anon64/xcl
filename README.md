@@ -334,6 +334,11 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   `XCL_DUMP_TARGETS=<draws>[,<frames>]` logs, for the first frames with that many draws and dispatches,
   each render target and the depth buffer drawn into (draws ran / stand-in / PC / skipped) and dumps
   the eight drawn into most (`target<k>_<n>.bmp`); `XCL_DUMP_AFTER_S=<s>` waits `s` seconds first.
+  `XCL_CAPTURE_FRAME=<draws>[,<s>]` writes the command stream of the first frame with that many draws
+  and dispatches (`s` seconds after the first present at the earliest) to `capture_<frame>/` next to
+  the log: `frame.jsonl` (every submit, barrier, copy, clear, draw and dispatch in the order the GPU got
+  them, with render targets and root arguments), `resources.jsonl`, `pipelines.jsonl`, the pipelines'
+  shaders translated again and `summary.txt`. Every frame is recorded until then, which costs time.
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and

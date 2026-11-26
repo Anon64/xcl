@@ -802,7 +802,7 @@ static RES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
-    if s.sampler || !(super::present::trace_frame() || super::targets::enabled()) {
+    if s.sampler || !(super::present::trace_frame() || super::targets::enabled() || super::capture::enabled()) {
         return;
     }
     let mut g = RES.lock().unwrap();
