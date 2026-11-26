@@ -980,12 +980,12 @@ pub fn leave_out() {
 ///
 /// Which of the title's GPU heaps go there is `XCL_COHERENT_HEAPS`'s
 /// (`kernelx::coherent_heaps_route`), so a size is kept for each setting, in a file of its own
-/// (`coherent_file_name`): a size measured with every heap in the window does not apply to a
+/// (`coherent_file_name`, and per console): a size measured with every heap in the window does not apply to a
 /// run that sends them to the sparse windows. A retail title's 4582 MB of heaps, stored once,
 /// made windows of 4095 + 998 MB in runs that put at most 105 MB in them, each shadowed by as
 /// much video memory with `XCL_UMA_SHADOW=1`.
 fn coherent_file(route: &str) -> std::path::PathBuf {
-    crate::state::data_dir().join("cache").join(coherent_file_name(route))
+    crate::state::data_dir().join("cache").join(coherent_file_name(route, crate::state::config().is_series_s()))
 }
 
 /// The file in `<data>/cache` that keeps the coherent window's size for `route`, one number:
@@ -993,11 +993,15 @@ fn coherent_file(route: &str) -> std::path::PathBuf {
 /// per-setting sizes read and write in the same data folder (a text they cannot parse gave them
 /// a 512 MB window, too small for a retail title's heaps), and `uma_coherent_<setting>.txt`
 /// (`:` as `_`) for the other settings, which those builds never read.
-fn coherent_file_name(route: &str) -> String {
+/// The Series S profile has files of its own (`_lockhart` before `.txt`, as xcl-dev/xcl#1110):
+/// a title makes smaller heaps there (a retail game 2.9 GB for 4.5), and the Series X size kept
+/// in the same data folder committed a window it never filled.
+fn coherent_file_name(route: &str, series_s: bool) -> String {
+    let device = if series_s { "_lockhart" } else { "" };
     if route == ALL_HEAPS {
-        return "uma_coherent.txt".into();
+        return format!("uma_coherent{device}.txt");
     }
-    format!("uma_coherent_{}.txt", route.replace(':', "_"))
+    format!("uma_coherent_{}{device}.txt", route.replace(':', "_"))
 }
 
 /// The setting of `XCL_COHERENT_HEAPS` that puts every GPU heap in the coherent window (none),
@@ -1617,12 +1621,16 @@ mod tests {
     /// heap stays one number, the only text builds before this one read in the same data folder.
     #[test]
     fn the_stored_coherent_need_is_the_one_of_the_heaps_setting() {
-        assert_eq!(coherent_file_name(ALL_HEAPS), "uma_coherent.txt", "the file builds before read and write");
-        assert_eq!(coherent_file_name("sparse:16"), "uma_coherent_sparse_16.txt", "no ':' in a Windows file name");
-        assert_eq!(coherent_file_name("sparse"), "uma_coherent_sparse.txt");
-        assert_eq!(coherent_file_name("off"), "uma_coherent_off.txt");
-        let names = [ALL_HEAPS, "off", "sparse", "sparse:16", "sparse:64"].map(coherent_file_name);
-        assert!(names.iter().enumerate().all(|(i, n)| !names[..i].contains(n)), "one file per setting: {names:?}");
+        let x = |route| coherent_file_name(route, false);
+        assert_eq!(x(ALL_HEAPS), "uma_coherent.txt", "the file builds before read and write");
+        assert_eq!(x("sparse:16"), "uma_coherent_sparse_16.txt", "no ':' in a Windows file name");
+        assert_eq!(x("sparse"), "uma_coherent_sparse.txt");
+        assert_eq!(x("off"), "uma_coherent_off.txt");
+        // the Series S profile's own files, beside the Series X ones
+        assert_eq!(coherent_file_name(ALL_HEAPS, true), "uma_coherent_lockhart.txt");
+        assert_eq!(coherent_file_name("sparse:16", true), "uma_coherent_sparse_16_lockhart.txt");
+        let names: Vec<String> = [false, true].iter().flat_map(|&s| [ALL_HEAPS, "off", "sparse", "sparse:16", "sparse:64"].map(|r| coherent_file_name(r, s))).collect();
+        assert!(names.iter().enumerate().all(|(i, n)| !names[..i].contains(n)), "one file per setting and console: {names:?}");
         // what is written is what builds before wrote (`bytes.to_string()`) and parse
         // (`s.trim().parse::<usize>()`)
         let stored = (4582usize << 20).to_string();
