@@ -284,6 +284,8 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
     default.
 - Retired two-pass mesh buffers from tracked command lists can be reused once all GPU
   submissions that used them complete, even while the title still holds the command allocator.
+- Direct two-pass mesh draws can reuse one smaller record buffer across several slices when
+  the memory cap is tight. Each slice keeps the draw's original mesh group IDs.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
