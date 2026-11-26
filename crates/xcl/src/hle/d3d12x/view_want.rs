@@ -88,7 +88,7 @@ thread_local! {
 /// when the title decommits its source may be asked for again, and must be when the title
 /// commits and binds that memory again: a thread that still remembered asking for it left the
 /// tile unmapped, and the draw read zeros through the view (a mesh without vertices).
-fn generation() -> (u64, u64) {
+pub(super) fn generation() -> (u64, u64) {
     (crate::hle::kernelx::gpu_view_map_gen(), super::sparse::mirror_asks_forgotten())
 }
 
