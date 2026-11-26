@@ -46,6 +46,12 @@ struct State {
     scratch: Option<(ID3D12Resource, u64)>,
     scratch_used: u64,
     scratch_taken: u64,
+    /// `scratch` was left in INDIRECT_ARGUMENT by the last two-pass ExecuteIndirect (only with
+    /// `two_pass_batch`; otherwise it goes back to COMMON after each)
+    scratch_in_args: bool,
+    /// the record regions a mesh pass may still be reading, with no UAV barrier on the records
+    /// since (`two_pass_plan`; only with `two_pass_batch`)
+    record_open: Option<u8>,
     /// the next dispatch's thread limits (`IO_THREAD_LIMIT`; a `DispatchX` with thread
     /// dimensions), taken by its `bind_abi`
     limits: [u32; 3],
@@ -430,7 +436,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.rs_gfx = 0;
         s.heaps = [0; 2];
         // (the scratch blocks are in `res_retired` already)
-        (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
+        (s.scratch, s.scratch_used, s.scratch_taken, s.scratch_in_args, s.record_open) = (None, 0, 0, false, None);
         let mut res_bufs = std::mem::take(&mut s.res_retired);
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
@@ -476,7 +482,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.heaps = heaps;
         // the two-pass record buffers and argument scratch of `to`'s previous recording, as in
         // `reset`: the GPU may still read them, so the new one takes fresh ones
-        (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
+        (s.scratch, s.scratch_used, s.scratch_taken, s.scratch_in_args, s.record_open) = (None, 0, 0, false, None);
         let mut res_bufs = std::mem::take(&mut s.res_retired);
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
@@ -824,6 +830,33 @@ unsafe fn emit_transition(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource
     std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
 }
 
+/// A UAV barrier on `res` (None: on all resources) and a transition of `res` from `before` to
+/// `after`, in one ResourceBarrier call.
+unsafe fn emit_uav_and_transition(list: &ID3D12GraphicsCommandList, uav: Option<&ID3D12Resource>, res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
+    let mut b = [
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(uav.cloned()) }) },
+        },
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(Some(res.clone())),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        },
+    ];
+    list.ResourceBarrier(&b);
+    std::mem::ManuallyDrop::drop(&mut (*b[0].Anonymous.UAV).pResource);
+    std::mem::ManuallyDrop::drop(&mut (*b[1].Anonymous.Transition).pResource);
+}
+
 unsafe fn default_uav_buffer(dev: &ID3D12Device, bytes: u64, what: &str) -> Result<ID3D12Resource, String> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -873,6 +906,124 @@ fn record_groups(cap_bytes: u64, record_bytes: u64, split: u32) -> u32 {
 /// writes its records from record 0, so the next one goes only after the mesh pass drew them.
 fn two_pass_steps(max: u32) -> impl Iterator<Item = (u32, bool)> {
     (0..max).flat_map(|k| [(k, true), (k, false)])
+}
+
+/// `XCL_TWO_PASS_BATCH=1`: two-pass draws record fewer barriers (read once). Their records go
+/// in the two halves of the record buffer in turn (`Records::Halves`), so a draw's mesh pass
+/// needs no UAV barrier after it: the next compute pass writes the other half, and the barrier
+/// after that one orders the mesh pass before the half is written again. An ExecuteIndirect's
+/// rewritten arguments stay in INDIRECT_ARGUMENT until the next one rewrites into the block, with
+/// the UAV barrier before the rewrite in the same ResourceBarrier call as that transition.
+fn two_pass_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TWO_PASS_BATCH").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Record regions of a two-pass pass (`TwoPassStep::Pass`): the first half, the second half, or
+/// the whole buffer (both).
+const HALF_0: u8 = 0b01;
+const HALF_1: u8 = 0b10;
+const WHOLE: u8 = HALF_0 | HALF_1;
+
+/// How a two-pass draw lays out its records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Records {
+    /// every command from the start of the buffer, a UAV barrier after each pass
+    Whole,
+    /// commands in the buffer's two halves in turn, no UAV barrier after a mesh pass
+    Halves,
+}
+
+/// A step of a two-pass draw on the PC list (`two_pass_plan`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TwoPassStep {
+    /// the compute pass (writes the records of `region`) or the mesh pass (reads them) of command `k`
+    Pass { k: u32, compute: bool, region: u8 },
+    /// a UAV barrier on the records
+    Barrier,
+}
+
+/// The steps of a two-pass draw of `commands` commands (one for a DispatchMesh) with `records`,
+/// after draws that left a mesh pass reading `open` with no barrier since. `Whole` is the order
+/// the draws had before `Halves`: `two_pass_steps`, a barrier after each.
+fn two_pass_plan(commands: u32, records: Records, open: Option<u8>) -> Vec<TwoPassStep> {
+    let mut v = Vec::with_capacity(commands as usize * 4 + 1);
+    let first = match (records, open) {
+        (_, None) => HALF_0,
+        (Records::Halves, Some(HALF_0)) => HALF_1,
+        (Records::Halves, Some(HALF_1)) => HALF_0,
+        _ => {
+            v.push(TwoPassStep::Barrier);
+            HALF_0
+        }
+    };
+    for (k, compute) in two_pass_steps(commands) {
+        match records {
+            Records::Whole => {
+                v.push(TwoPassStep::Pass { k, compute, region: WHOLE });
+                v.push(TwoPassStep::Barrier);
+            }
+            Records::Halves => {
+                let region = if k % 2 == 0 { first } else { first ^ WHOLE };
+                v.push(TwoPassStep::Pass { k, compute, region });
+                if compute {
+                    v.push(TwoPassStep::Barrier);
+                }
+            }
+        }
+    }
+    v
+}
+
+/// What a mesh pass may still be reading after `step`, with `open` before it.
+fn open_after(open: Option<u8>, step: TwoPassStep) -> Option<u8> {
+    match step {
+        TwoPassStep::Barrier => None,
+        TwoPassStep::Pass { compute: false, region, .. } => Some(open.unwrap_or(0) | region),
+        TwoPassStep::Pass { compute: true, .. } => open,
+    }
+}
+
+/// `plan` on `list` with the records in `res` at `res_va`: `pass(k, compute, records)` records a
+/// pass with its region at GPU address `records` (the second half `half` bytes in). What each
+/// step leaves a mesh pass reading is kept for the next draw's plan (`State::record_open`).
+unsafe fn run_two_pass_plan(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    plan: &[TwoPassStep],
+    res: &ID3D12Resource,
+    res_va: u64,
+    half: u64,
+    mut pass: impl FnMut(u32, bool, u64) -> Result<(), String>,
+) -> Result<(), String> {
+    for &step in plan {
+        match step {
+            TwoPassStep::Barrier => emit_uav_barrier(list, Some(res)),
+            TwoPassStep::Pass { k, compute, region } => pass(k, compute, res_va + if region == HALF_1 { half } else { 0 })?,
+        }
+        with(this, |s| s.record_open = open_after(s.record_open, step));
+    }
+    Ok(())
+}
+
+/// The record buffer of a two-pass draw that needs `need` bytes of records: buffer, address, the
+/// bytes of a region and the layout. `Halves` (with `two_pass_batch`) when twice the buffer the
+/// draw would have had whole fits `RECORD_MAX` and the two-pass buffers: each half holds what the
+/// whole one would.
+unsafe fn records_for(this: *mut c_void, need: u64, batch: bool) -> Result<(ID3D12Resource, u64, u64, Records), String> {
+    if let Some(both) = halves_bytes(need, batch) {
+        if let Ok((buf, va, cap)) = ensure_res_buffer(this, both) {
+            return Ok((buf, va, cap / 2, Records::Halves));
+        }
+    }
+    let (buf, va, cap) = ensure_res_buffer(this, need)?;
+    Ok((buf, va, cap, Records::Whole))
+}
+
+/// The bytes of a record buffer in halves for `need` (`records_for`), if it can have them.
+fn halves_bytes(need: u64, batch: bool) -> Option<u64> {
+    let both = record_buffer_bytes(need) * 2;
+    (batch && both <= RECORD_MAX).then_some(both)
 }
 
 /// Smallest and largest record buffer. The smallest is an argument scratch block's size
@@ -1077,6 +1228,7 @@ unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Res
         s.scratch_taken += block.bytes;
         s.scratch_used = bytes;
         s.scratch = Some((block.res.clone(), block.bytes));
+        s.scratch_in_args = false;
         s.res_retired.push(block);
     });
     Ok((b, 0))
@@ -1097,13 +1249,14 @@ fn scale_views(consts: u64, src: u64, dst: u64, count: Option<u64>) -> [(u32, u6
 
 /// The arguments of `max` commands at UMA address `src`, rewritten for the two passes
 /// (`SCALE_ARGS_HLSL`) into a scratch block: the block (INDIRECT_ARGUMENT until the caller puts
-/// it back to COMMON) and where the compute pass's commands are; the mesh pass's follow them.
+/// it back to COMMON; with `batch` it stays there until the next rewrite into it,
+/// `State::scratch_in_args`) and where the compute pass's commands are; the mesh pass's follow them.
 ///
 /// They are read through the memory window over them, as translated shaders read memory, not
 /// through the title's buffer: its state on the PC is the title's and not known here. So is the
 /// count (`count`: its UMA address, when the title gave a count buffer).
 #[allow(clippy::too_many_arguments)]
-unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(ID3D12Resource, u64), String> {
+unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32, batch: bool) -> Result<(ID3D12Resource, u64), String> {
     let dev = super::real::list_device(this).ok_or("no device")?;
     let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
@@ -1126,8 +1279,13 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
     // the title's writes of the arguments before this (`fresh_indirect_arguments`)
-    emit_uav_barrier(list, None);
-    emit_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if batch {
+        let before = scratch_state(with(this, |s| s.scratch_in_args));
+        emit_uav_and_transition(list, None, &dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    } else {
+        emit_uav_barrier(list, None);
+        emit_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     list.SetComputeRootSignature(&rs);
     list.SetPipelineState(&pso);
     for (slot, va) in scale_views(consts_va, src_va, dst.GetGPUVirtualAddress() + dst_off, count_va) {
@@ -1135,7 +1293,23 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     }
     list.Dispatch(max.div_ceil(64), 1, 1);
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    if batch {
+        with(this, |s| s.scratch_in_args = true);
+    }
     Ok((dst, dst_off))
+}
+
+/// The state the scratch block of a recording is in before a rewrite: INDIRECT_ARGUMENT when the
+/// last two-pass ExecuteIndirect left it there (`two_pass_batch`), else COMMON. A block left in
+/// INDIRECT_ARGUMENT when the recording moves on to another, or closes, is a buffer: it decays to
+/// COMMON when its ExecuteCommandLists is done, before another recording can take it (`FREE_RES`
+/// takes back a recording's blocks at its allocator's reset).
+fn scratch_state(in_args: bool) -> D3D12_RESOURCE_STATES {
+    if in_args {
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+    } else {
+        D3D12_RESOURCE_STATE_COMMON
+    }
 }
 
 /// What a DispatchMesh or ExecuteIndirect draws with, decided once from `resolved`, what
@@ -1209,7 +1383,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         let need = (groups as u64).saturating_mul(record_bytes);
         super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [x, y, z], false);
         let run = (|| -> Result<(), String> {
-            let (res_buf, res_va, cap) = ensure_res_buffer(this, need)?;
+            let (res_buf, res_va, cap, records) = records_for(this, need, two_pass_batch())?;
             let n = groups.min(record_groups(cap, record_bytes, tp.mesh_groups_per_record));
             if n == 0 {
                 return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
@@ -1220,13 +1394,16 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                     crate::xlog_warn!("D3D12.X: two-pass DispatchMesh of {groups} groups: {} past the record buffer dropped", groups - n);
                 }
             }
-            bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
-            list.Dispatch(n, 1, 1);
-            emit_uav_barrier(list, Some(&res_buf));
-            bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
-            pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
-            emit_uav_barrier(list, Some(&res_buf));
-            Ok(())
+            let plan = two_pass_plan(1, records, with(this, |s| s.record_open));
+            run_two_pass_plan(this, list, &plan, &res_buf, res_va, cap, |_, compute, va| {
+                bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
+                if compute {
+                    list.Dispatch(n, 1, 1);
+                } else {
+                    pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
+                }
+                Ok(())
+            })
         })();
         super::gpu_times::after(this);
         match run {
@@ -1343,8 +1520,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     _ => return Err("its arguments are not in a console buffer in unified memory".into()),
                 };
                 let record_bytes = tp.record.record_dwords() as u64 * 4;
-                let (res_buf, res_va, cap) = ensure_res_buffer(this, indirect_record_need(record_bytes, tp.mesh_groups_per_record))?;
-                let cap = record_groups(cap, record_bytes, tp.mesh_groups_per_record);
+                let batch = two_pass_batch();
+                let (res_buf, res_va, region, records) = records_for(this, indirect_record_need(record_bytes, tp.mesh_groups_per_record), batch)?;
+                let cap = record_groups(region, record_bytes, tp.mesh_groups_per_record);
                 if cap == 0 {
                     return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
                 }
@@ -1355,17 +1533,18 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 };
                 // the groups past the record buffer, and the commands past the count, are dropped
                 // on the GPU (`SCALE_ARGS_HLSL`)
-                let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap)?;
-                let passes = (|| -> Result<(), String> {
-                    for (k, compute) in two_pass_steps(max) {
-                        bind_two_pass_stage(this, list, pso, &tp, res_va, compute)?;
-                        let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
-                        pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
-                        emit_uav_barrier(list, Some(&res_buf));
-                    }
+                let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap, batch)?;
+                let plan = two_pass_plan(max, records, with(this, |s| s.record_open));
+                let passes = run_two_pass_plan(this, list, &plan, &res_buf, res_va, region, |k, compute, va| {
+                    bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
+                    let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
+                    pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
                     Ok(())
-                })();
-                emit_transition(list, &scaled, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+                });
+                // (with `batch` the block stays in INDIRECT_ARGUMENT for the next rewrite)
+                if !batch {
+                    emit_transition(list, &scaled, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+                }
                 passes
             })();
             super::gpu_times::after(this);
@@ -4003,6 +4182,128 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(indirect_record_need(47_632, 1), 32 * mib);
     }
 
+    /// Without `XCL_TWO_PASS_BATCH` a two-pass draw records what it did before: each command's
+    /// compute pass and mesh pass (`two_pass_steps`), a UAV barrier on the records after each.
+    #[test]
+    fn whole_two_pass_records_keep_a_barrier_after_every_pass() {
+        for commands in 1..5u32 {
+            let before: Vec<TwoPassStep> = two_pass_steps(commands).flat_map(|(k, compute)| [TwoPassStep::Pass { k, compute, region: WHOLE }, TwoPassStep::Barrier]).collect();
+            assert_eq!(two_pass_plan(commands, Records::Whole, None), before, "{commands} commands");
+            // (after a batched draw left a mesh pass reading: a barrier first)
+            assert_eq!(two_pass_plan(commands, Records::Whole, Some(HALF_1))[1..], before[..]);
+            assert_eq!(two_pass_plan(commands, Records::Whole, Some(HALF_1))[0], TwoPassStep::Barrier);
+        }
+        // a whole draw leaves nothing open
+        let open = two_pass_plan(3, Records::Whole, None).into_iter().fold(None, open_after);
+        assert_eq!(open, None);
+    }
+
+    /// Consecutive draws with records in halves: every compute pass and the barrier after it,
+    /// then its mesh pass on the same region, and no barrier after a mesh pass – half the
+    /// barriers of whole records, for DispatchMesh (one command) and ExecuteIndirect alike.
+    #[test]
+    fn two_pass_records_in_halves_record_half_the_barriers() {
+        let barriers = |plans: &[Vec<TwoPassStep>]| plans.iter().flatten().filter(|s| **s == TwoPassStep::Barrier).count();
+        for (draws, commands) in [(8usize, 1u32), (5, 3), (1, 4)] {
+            let mut open = None;
+            let mut plans = Vec::new();
+            for _ in 0..draws {
+                let plan = two_pass_plan(commands, Records::Halves, open);
+                open = plan.iter().copied().fold(open, open_after);
+                plans.push(plan);
+            }
+            assert_eq!(barriers(&plans), draws * commands as usize, "{draws} draws of {commands}");
+            let whole: Vec<_> = (0..draws).map(|_| two_pass_plan(commands, Records::Whole, None)).collect();
+            assert_eq!(barriers(&whole), 2 * draws * commands as usize);
+            // each command: its compute pass, a barrier, its mesh pass on the same region
+            for plan in &plans {
+                for k in 0..commands {
+                    let at = plan.iter().position(|s| matches!(s, TwoPassStep::Pass { k: c, compute: true, .. } if *c == k)).unwrap();
+                    let TwoPassStep::Pass { region, .. } = plan[at] else { unreachable!() };
+                    assert_eq!(plan[at + 1], TwoPassStep::Barrier);
+                    assert_eq!(plan[at + 2], TwoPassStep::Pass { k, compute: false, region });
+                    assert!(region == HALF_0 || region == HALF_1);
+                }
+            }
+        }
+    }
+
+    /// Whatever the order of draws with records in halves or whole, of one or more commands, no
+    /// compute pass writes a region a mesh pass may still be reading (no barrier between), and
+    /// every mesh pass reads records its compute pass wrote before a barrier.
+    #[test]
+    fn two_pass_draws_never_write_records_a_mesh_pass_still_reads() {
+        // (records, commands) of each draw: every sequence of three of these
+        let kinds = [(Records::Halves, 1u32), (Records::Halves, 2), (Records::Halves, 3), (Records::Whole, 1), (Records::Whole, 2)];
+        for a in kinds {
+            for b in kinds {
+                for c in kinds {
+                    let (mut reading, mut writing, mut open) = (0u8, 0u8, None);
+                    for (records, commands) in [a, b, c, a] {
+                        let mut wrote = HashMap::new();
+                        for step in two_pass_plan(commands, records, open) {
+                            match step {
+                                TwoPassStep::Barrier => (reading, writing) = (0, 0),
+                                TwoPassStep::Pass { k, compute: true, region } => {
+                                    assert_eq!(region & reading, 0, "{a:?} {b:?} {c:?}: a compute pass writes records a mesh pass reads");
+                                    writing |= region;
+                                    wrote.insert(k, region);
+                                }
+                                TwoPassStep::Pass { k, compute: false, region } => {
+                                    assert_eq!(region & writing, 0, "{a:?} {b:?} {c:?}: a mesh pass reads records still being written");
+                                    assert_eq!(wrote.get(&k), Some(&region), "the mesh pass reads its own compute pass's records");
+                                    reading |= region;
+                                }
+                            }
+                            open = open_after(open, step);
+                            assert_eq!(open.unwrap_or(0), reading, "what is kept for the next draw");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A record buffer in halves is twice the one the draw would have had whole, so each half
+    /// has as many groups with a record; past `RECORD_MAX`, or without `XCL_TWO_PASS_BATCH`,
+    /// the draw takes the whole buffer as before.
+    #[test]
+    fn two_pass_record_halves_hold_what_the_whole_buffer_held() {
+        let mib = 1u64 << 20;
+        assert_eq!(halves_bytes(0, true), Some(2 * mib));
+        assert_eq!(halves_bytes(32 * mib, true), Some(64 * mib));
+        assert_eq!(halves_bytes(64 * mib, true), Some(128 * mib));
+        assert_eq!(halves_bytes(64 * mib + 1, true), None);
+        assert_eq!(halves_bytes(32 * mib, false), None);
+        for record in [64u64, 500, 4_096, 47_632, 300_000] {
+            for split in [1u32, 2, 7] {
+                let need = indirect_record_need(record, split);
+                let half = halves_bytes(need, true).unwrap() / 2;
+                assert_eq!(record_groups(half, record, split), record_groups(record_buffer_bytes(need), record, split), "{record} B, split {split}");
+                for groups in [1u64, 92, 2_817, 9_000] {
+                    let need = groups * record;
+                    if let Some(both) = halves_bytes(need, true) {
+                        assert!(record_groups(both / 2, record, split) >= record_groups(record_buffer_bytes(need), record, split));
+                    }
+                }
+            }
+        }
+    }
+
+    /// An ExecuteIndirect's argument block is in COMMON before its first rewrite; with
+    /// `XCL_TWO_PASS_BATCH` the next rewrite into it takes it from INDIRECT_ARGUMENT.
+    #[test]
+    fn the_argument_block_is_taken_from_the_state_it_was_left_in() {
+        assert_eq!(scratch_state(false), D3D12_RESOURCE_STATE_COMMON);
+        assert_eq!(scratch_state(true), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        let list = 0x7500_0011usize as *mut c_void;
+        assert!(!with(list, |s| s.scratch_in_args), "a new recording's block has not been used");
+        with(list, |s| (s.scratch_in_args, s.record_open) = (true, Some(HALF_0)));
+        reset(list, 0, 0);
+        assert_eq!(with(list, |s| (s.scratch_in_args, s.record_open)), (false, None), "the next recording takes fresh buffers");
+        forget(list);
+    }
+
     #[test]
     fn gpu_two_pass_argument_scratch_is_shared_and_capped() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -4016,14 +4317,18 @@ void main(uint t : SV_GroupIndex) {
         unsafe {
             // small rewrites share one block
             let (a, at_a) = scratch_args(list, &dev, 100).unwrap();
+            // (a rewrite left it in INDIRECT_ARGUMENT, `two_pass_batch`)
+            with(list, |s| s.scratch_in_args = true);
             let (b, at_b) = scratch_args(list, &dev, 300).unwrap();
             assert_eq!((a.as_raw(), at_a), (b.as_raw(), 0));
             assert_eq!(at_b, 256);
+            assert!(with(list, |s| s.scratch_in_args), "the same block: in the state it was left in");
             // a recording takes at most SCRATCH_CAP of blocks
             let mut taken = 1;
             while scratch_args(list, &dev, SCRATCH_BLOCK).is_ok() {
                 taken += 1;
                 assert!(taken <= SCRATCH_CAP / SCRATCH_BLOCK, "past the cap");
+                assert!(!with(list, |s| s.scratch_in_args), "a new block is in COMMON");
             }
             assert!(with(list, |s| s.scratch_taken) <= SCRATCH_CAP);
             // the next recording starts again
@@ -4043,12 +4348,25 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(compute, [[1, 3, 1, 1], [2, 2, 1, 1], [3, 4, 1, 1]]);
     }
 
-    /// Commands of one two-pass ExecuteIndirect run in `two_pass_steps` order on the GPU, with
-    /// stand-ins for the two passes: the "compute pass" writes each group's record (from record 0)
-    /// with its command's constant, the "mesh pass" copies the records it reads out by command.
+    /// Commands of two-pass draws run in `two_pass_plan` order on the GPU (`run_two_pass_plan`),
+    /// with records whole and in halves (`XCL_TWO_PASS_BATCH`), with stand-ins for the two passes:
+    /// the "compute pass" writes each group's record (from the start of its region) with its
+    /// command's constant, the "mesh pass" copies the records it reads out by command. One draw of
+    /// three commands, then three draws of one, each mesh pass with no barrier after it in halves.
     #[test]
     fn gpu_two_pass_indirect_commands_keep_their_own_records() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        let dev = dev.unwrap();
+        gpu_two_pass_records(&dev, Records::Whole);
+        gpu_two_pass_records(&dev, Records::Halves);
+    }
+
+    fn gpu_two_pass_records(dev: &ID3D12Device, records: Records) {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
         let src = r#"
 #define RS "RootConstants(num32BitConstants=1, b0), UAV(u0), UAV(u1)"
@@ -4063,14 +4381,8 @@ void cs(uint3 g : SV_GroupID) { rec.Store(g.x * 4u, v); }
 void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)); }
 "#;
         // (constant, groups) of each command
-        let commands = [(1u32, 3u32), (2, 2), (3, 4)];
+        let commands = [(1u32, 3u32), (2, 2), (3, 4), (4, 1), (5, 4), (6, 2)];
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                crate::gpu::recomp::runner::skip_test("no GPU");
-                return;
-            }
-            let dev = dev.unwrap();
             let cs = crate::gpu::recomp::dxc::compile(src, "cs", "cs_6_6", &[]).unwrap();
             let ms = crate::gpu::recomp::dxc::compile(src, "ms", "cs_6_6", &[]).unwrap();
             let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &cs).unwrap();
@@ -4132,21 +4444,31 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, &pass1).unwrap();
             emit_transition(&list, &indirect, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
             list.SetComputeRootSignature(&rs);
-            list.SetComputeRootUnorderedAccessView(1, rec.GetGPUVirtualAddress());
             list.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
-            for (k, compute) in two_pass_steps(commands.len() as u32) {
-                list.SetPipelineState(if compute { &pass1 } else { &pass2 });
-                list.ExecuteIndirect(&sig, 1, &indirect, k as u64 * 16, None::<&ID3D12Resource>, 0);
-                emit_uav_barrier(&list, Some(&rec));
+            // (the recording's state: a key of its own)
+            let this = 0x7500_0021usize as *mut c_void;
+            let draws: [&[u64]; 4] = [&[0, 1, 2], &[3], &[4], &[5]];
+            for draw in draws {
+                let plan = two_pass_plan(draw.len() as u32, records, with(this, |s| s.record_open));
+                // (the 256 B of records in halves of 128 B: 4 groups at most)
+                run_two_pass_plan(this, &list, &plan, &rec, rec.GetGPUVirtualAddress(), 128, |k, compute, va| {
+                    list.SetComputeRootUnorderedAccessView(1, va);
+                    list.SetPipelineState(if compute { &pass1 } else { &pass2 });
+                    list.ExecuteIndirect(&sig, 1, &indirect, draw[k as usize] * 16, None::<&ID3D12Resource>, 0);
+                    Ok(())
+                })
+                .unwrap();
             }
+            assert_eq!(with(this, |s| s.record_open).is_some(), records == Records::Halves, "a mesh pass left with no barrier after it");
+            forget(this);
             emit_transition(&list, &indirect, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
             list.Close().unwrap();
             queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
             queue.Signal(&done, 1).unwrap();
-            crate::gpu::fence::wait(&done, 1, &dev, None, 10_000).unwrap();
+            crate::gpu::fence::wait(&done, 1, dev, None, 10_000).unwrap();
             for &(v, x) in &commands {
                 let got: Vec<u32> = (0..x).map(|g| *o.add((v * 16 + g) as usize)).collect();
-                assert_eq!(got, vec![v; x as usize], "the records the mesh pass of command {v} read");
+                assert_eq!(got, vec![v; x as usize], "the records the mesh pass of command {v} read ({records:?})");
             }
             indirect.Unmap(0, None);
             out.Unmap(0, None);
