@@ -248,6 +248,9 @@ pub struct Lw {
     pub waves: u32,
     pub cw: Value,
     pub xn: Value,
+    /// a compute program whose lanes outside the launch EXEC have left (`kernel::compute_gate`):
+    /// that EXEC (lo, hi), every running lane's bit of which is set
+    pub live_exec: Option<(Value, Value)>,
     /// words per half in an exchange
     pub xslot: u32,
     /// the program's LDS (`xcl_lds`, 8192 dwords) and its last usable dword

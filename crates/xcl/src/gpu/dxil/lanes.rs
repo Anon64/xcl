@@ -183,6 +183,10 @@ impl Lw {
 
     /// This lane's bit of the mask (lo, hi), cached per block.
     pub fn lanebit(&mut self, lo: Value, hi: Value) -> Value {
+        // the launch EXEC once the lanes outside it have left: set in every lane still here
+        if self.live_exec == Some((lo, hi)) {
+            return self.b(true);
+        }
         let key = (self.cur(), lo, hi);
         if let Some(&v) = self.exec_cache.get(&key) {
             return v;
