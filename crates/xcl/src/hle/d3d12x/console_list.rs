@@ -849,18 +849,27 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
             } else if w0 == TRANSITIONS_MARKER {
                 let n = get(1) as usize;
                 let words = &words[(at + 2).min(words.len())..(at + 2 + 8 * n).min(words.len())];
-                if words.len() == 8 * n && n > 0 {
+                // (a depth buffer whose depth plane can have a twin rests in `depth_uav::PARK`
+                // where the title has it in UNORDERED_ACCESS, here as on every list; a compute
+                // list copies nothing)
+                let parked = (words.len() == 8 * n && super::depth_uav::any_kept()).then(|| {
+                    let mut v: Vec<[u32; 8]> = words.chunks_exact(8).map(|c| c.try_into().unwrap()).collect();
+                    let _ = super::depth_uav::plan_barriers(&mut v, false, &mut Vec::new());
+                    v
+                });
+                let (sent, m) = parked.as_ref().map_or((words, n), |v| (v.as_flattened(), v.len()));
+                if words.len() == 8 * n && m > 0 {
                     // 4-byte aligned in the stream: copy out; the resource pointers are
                     // borrowed (ManuallyDrop fields, nothing released)
-                    let mut b: Vec<u64> = vec![0; 4 * n];
-                    std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, b.as_mut_ptr() as *mut u8, 32 * n);
+                    let mut b: Vec<u64> = vec![0; 4 * m];
+                    std::ptr::copy_nonoverlapping(sent.as_ptr() as *const u8, b.as_mut_ptr() as *mut u8, 32 * m);
                     if super::title_textures::any() {
                         // each barrier: type | flags, resource, subresource | before, after
                         let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
                             b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();
                         super::title_textures::note_transitions(st.pc, &t);
                     }
-                    list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, n));
+                    list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, m));
                 }
                 out.barriers += n as u32;
                 at += 2 + 8 * n;

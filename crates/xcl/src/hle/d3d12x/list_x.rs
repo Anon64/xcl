@@ -733,6 +733,8 @@ struct ListState {
     deferred: Option<Deferred>,
     /// on a title list's first segment: the allocator its deferred segments record on (the title's may be recording another list by the submit)
     own_alloc: Option<ID3D12CommandAllocator>,
+    /// depth buffers whose depth plane and twin hold the same on this recording (`depth_uav::plan_barriers`)
+    depth_in_step: Vec<u64>,
 }
 
 /// A `Dispatch` or a dispatching `ExecuteIndirect` put off to the submit, with its arguments.
@@ -3898,6 +3900,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         s.native_bias = DepthBias::ZERO;
         s.using_fallback_pso = false;
         s.pso_dirty = false;
+        // (other queues may run between what went and what follows)
+        s.depth_in_step.clear();
     }
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
         let info = if bound_pso != 0 { device_x::base_depth_bias_info(bound_pso) } else { None };
@@ -4623,6 +4627,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
+        s.depth_in_step.clear();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::title_textures::list_reset(this as usize);
@@ -4719,14 +4724,60 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if uav_transition && !any_uav {
         out.push([2, 0, 0, 0, 0, 0, 0, 0]);
     }
+    // depth buffers whose depth plane can have a twin: in PARK where the title has them in
+    // UNORDERED_ACCESS, the twin copied around the transitions (`depth_uav`)
+    let plane_copies = super::depth_uav::any_kept().then(|| {
+        let direct = list_type(this) == D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let mut in_step = std::mem::take(&mut recording(this as usize).lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().depth_in_step);
+        let plan = super::depth_uav::plan_barriers(&mut out, direct, &mut in_step);
+        if let Some(s) = recording(this as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+            s.depth_in_step = in_step;
+        }
+        plan
+    });
     // the states uploads into textures kept in step start from once this list has run
     if super::title_textures::any() {
         let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
             out.iter().filter(|b| b[0] == 0).map(|b| ((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32))).collect();
         super::title_textures::note_transitions(this as usize, &t);
     }
+    if let Some(p) = &plane_copies {
+        plane_copies_on(this, &p.to_plane, false);
+    }
     if !out.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
+    }
+    if let Some(p) = &plane_copies {
+        plane_copies_on(this, &p.to_twin, true);
+    }
+}
+
+/// The copies between depth planes and their twins around a title's barriers
+/// (`depth_uav::plan_barriers`) on `list`: into the twins (`to_twin`, after the barriers: the
+/// buffer rests in `depth_uav::PARK`, COPY_SOURCE) or into the planes (before them: the buffer
+/// goes PARK → COPY_DEST, where the title's transition out of UNORDERED_ACCESS takes it on). The
+/// twin rests in UNORDERED_ACCESS. Whole subresources, of one format family on both sides (a
+/// D3D12 copy of a depth plane takes the whole of it).
+unsafe fn plane_copies_on(list: *mut c_void, copies: &[super::depth_uav::PlaneCopy], to_twin: bool) {
+    let barriers = |b: &[[u32; 8]]| pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, b.len() as u32, b.as_ptr());
+    let tr = |res: usize, sub: u32, before: u32, after: u32| [0, 0, res as u32, (res as u64 >> 32) as u32, sub, before, after, 0];
+    let all = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    let at = |res: usize, k: u32| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&res), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k } };
+    let copy = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION);
+    let (copy_src, copy_dst) = (D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+    for c in copies {
+        let twin = c.twin.as_raw() as usize;
+        let twin_in = if to_twin { copy_dst } else { copy_src };
+        if to_twin {
+            barriers(&[tr(twin, all, UNORDERED_ACCESS, twin_in)]);
+        } else {
+            barriers(&[tr(twin, all, UNORDERED_ACCESS, twin_in), tr(c.depth, c.sub, super::depth_uav::PARK, copy_dst)]);
+        }
+        for &k in &c.subs {
+            let (dst, src) = if to_twin { (at(twin, k), at(c.depth, k)) } else { (at(c.depth, k), at(twin, k)) };
+            copy(list, &dst, 0, 0, 0, &src, std::ptr::null());
+        }
+        barriers(&[tr(twin, all, twin_in, UNORDERED_ACCESS)]);
     }
 }
 
