@@ -637,7 +637,7 @@ impl Lw {
             guard_override: None,
             mask_override: None,
             local_masks: false,
-            writes_lds: split && crate::gpu::recomp::emit::writes_lds(insts),
+            writes_lds: split && crate::gpu::recomp::emit::lds_order_wanted() && crate::gpu::recomp::emit::writes_lds(insts),
             exchange_error: None,
             pc: 0,
         };

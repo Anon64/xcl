@@ -1325,7 +1325,7 @@ impl Em {
                 // split wave64: both halves made their LDS writes before the barrier (a half
                 // without a partner has nothing to wait for)
                 if self.x64() && self.writes_lds {
-                    self.line("xcl_x_lw = false;");
+                    self.line("xcl_x_lw = 0u;");
                 }
                 Flow::Next
             }
@@ -4604,16 +4604,16 @@ impl Em {
             return Err("GDS");
         }
         // split wave64: the console runs a wave's LDS accesses in order for all 64 lanes, the
-        // halves do not – a read or an atomic first meets the other half when either may have
-        // written LDS since they last met (`xcl_x_lw`, the same in both: they run the same
-        // instructions; every meet clears it)
+        // halves do not – a read first meets the other half when either may have written LDS
+        // since they last met, a write when either may have read it (`xcl_x_lw`, the same in
+        // both: they run the same instructions; every meet clears it)
         if self.x64() && self.writes_lds {
-            let (waits, writes) = x64_lds_order(name);
-            if waits {
-                self.line("if (xcl_x_lw) xcl_x_meet();");
+            let (wait, set) = x64_lds_order(name);
+            if wait != 0 {
+                self.line(&format!("if ((xcl_x_lw & {wait}u) != 0u) xcl_x_meet();"));
             }
-            if writes {
-                self.line("xcl_x_lw = true;");
+            if set != 0 {
+                self.line(&format!("xcl_x_lw |= {set}u;"));
             }
         }
         // ADDTID forms have no ADDR VGPR: byte address = M0[15:0] + offset16 + 4 * lane_id.
@@ -6231,26 +6231,44 @@ pub(super) fn x64_spin_for(threads: u32, env: Option<&str>) -> bool {
     threads > 64 || env.is_some_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
 
+/// `xcl_x_lw` bits: LDS written, LDS read since the halves last met.
+pub(crate) const LDS_WROTE: u32 = 1;
+pub(crate) const LDS_READ: u32 = 2;
+
 /// Split wave64: how the LDS instruction `name` (lower case) keeps the console wave's order of
-/// LDS accesses across its halves (`xcl_x_lw`): (meets the other half first when either may
-/// have written LDS since they last met, writes LDS). Loads wait, stores write, atomics (and
-/// the `src2` forms, which read LDS too) do both; the cross-lane DS forms touch no LDS.
-pub(crate) fn x64_lds_order(name: &str) -> (bool, bool) {
+/// LDS accesses across its halves (`xcl_x_lw`): (the bits after which it meets the other half
+/// first, the bits it sets). A load waits for the other half's earlier writes, a store for its
+/// earlier reads (on the console every lane reads before any lane of a later instruction
+/// writes), an atomic (and the `src2` forms, which read LDS too) for both; the cross-lane DS
+/// forms touch no LDS. A store does not wait for the other half's earlier stores.
+pub(crate) fn x64_lds_order(name: &str) -> (u32, u32) {
     if matches!(name, "ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32" | "ds_nop") || !name.starts_with("ds_") {
-        (false, false)
+        (0, 0)
     } else if name.starts_with("ds_read") {
-        (true, false)
+        (LDS_WROTE, LDS_READ)
     } else if name.starts_with("ds_write") && !name.contains("src2") {
-        (false, true)
+        (LDS_READ, LDS_WROTE)
     } else {
-        (true, true)
+        (LDS_WROTE | LDS_READ, LDS_WROTE | LDS_READ)
     }
 }
 
 /// Whether the program writes LDS (`x64_lds_order`): without that its split wave64 form
 /// needs no meet for the order of its LDS accesses.
 pub(crate) fn writes_lds(insts: &[Decoded]) -> bool {
-    insts.iter().any(|d| d.enc.name == "ENC_DS" && x64_lds_order(&d.inst.name.to_ascii_lowercase()).1)
+    insts.iter().any(|d| d.enc.name == "ENC_DS" && x64_lds_order(&d.inst.name.to_ascii_lowercase()).1 & LDS_WROTE != 0)
+}
+
+/// Whether the split wave64 form keeps the console wave's order of LDS accesses
+/// (`x64_lds_order`, both translators); `XCL_X_LDS_ORDER=0` leaves it out (the translated
+/// cache's identity tells the two apart).
+pub(crate) fn lds_order_wanted() -> bool {
+    lds_order_for(std::env::var("XCL_X_LDS_ORDER").ok().as_deref())
+}
+
+/// `lds_order_wanted` for the value `env` of `XCL_X_LDS_ORDER`: on unless it is `0`.
+pub(super) fn lds_order_for(env: Option<&str>) -> bool {
+    env.map_or(true, |v| v.trim() != "0")
 }
 
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
@@ -6268,10 +6286,10 @@ static uint xcl_xn = 0u;
 // the other half did not arrive in time (a desynchronised pair): no more exchanges, the
 // wave finishes with its own half's values instead of hanging the GPU
 static bool xcl_x_dead = false;
-// LDS written since the halves last met: the next LDS read or atomic meets first, so it sees
-// every earlier write of the console wave's lanes in either half, as the console's in-order
-// wave does
-static bool xcl_x_lw = false;
+// LDS written (1) and read (2) since the halves last met: the next LDS read meets first after a
+// write, the next write after a read, so each sees the console wave's LDS as its in-order wave
+// does (`x64_lds_order`)
+static uint xcl_x_lw = 0u;
 // The console thread (index in the group) this hardware thread stands for. The threads of a
 // group are interchangeable, but the console forms its waves from consecutive thread
 // indices and the PC GPU need not (NVIDIA does not for 3-D groups such as 8 x 8 x 4): each
@@ -6295,7 +6313,7 @@ uint xcl_x_get(uint i) { return XCL_XS(xcl_x_at(xcl_half ^ 1u, xcl_xk - 1u) + i)
 bool xcl_x_meet() {
     uint k = xcl_xk;
     xcl_xk = k + 1u;
-    xcl_x_lw = false;
+    xcl_x_lw = 0u;
     if (xcl_xn == 0u) return false;
 #if XCL_X_SPIN
     // several console waves per group: a group barrier would wait for the other console

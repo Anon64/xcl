@@ -103,10 +103,10 @@ fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
 }
 
 /// The split form keeps the console wave's order of LDS accesses (`Lw::lds_in_order`): an LDS
-/// read after a write meets the other half first (the kernel form's group barrier, a compute
-/// group's counters), a read with no write since the last meet does not, and a half without
-/// a partner and the native form never do. In a loop whose read follows the last pass's
-/// write the meet is conditional on the flag, and still validates.
+/// read after a write, and a write after a read, meet the other half first (the kernel form's
+/// group barrier, a compute group's counters); a read with no write since the last meet does
+/// not, and a half without a partner and the native form never do. In a loop the meet is
+/// conditional on the bits, and still validates.
 #[test]
 fn split_lds_reads_meet_after_writes() {
     use crate::gpu::recomp::CsInterface;
@@ -124,11 +124,13 @@ fn split_lds_reads_meet_after_writes() {
     };
     let w = syncs(&kernel(&[write], true).unwrap());
     assert_eq!(syncs(&rw), w + 1, "the read meets after the write:\n{rw}");
-    assert_eq!(syncs(&kernel(&[read, write], true).unwrap()), w, "a read before any write");
+    assert_eq!(syncs(&kernel(&[write, write], true).unwrap()), w, "a write after a write");
+    assert_eq!(syncs(&kernel(&[read, write], true).unwrap()), w + 1, "the write meets after the read");
     assert_eq!(syncs(&kernel(&[write, read, read], true).unwrap()), w + 1, "the second read: the halves met since the write");
+    assert_eq!(syncs(&kernel(&[write, read, write], true).unwrap()), w + 2, "a meet before the read and before the second write");
     let native = |list: &[Inst]| syncs(&kernel(list, false).unwrap());
     assert_eq!(native(&[write, read]), native(&[write]), "the native form");
-    // a loop: read, write, three times – the read waits from the second pass on
+    // a loop: read, write, three times – each waits for the other from the second pass on
     let looped = |body: &[Inst]| {
         let mut l: Vec<Inst> = vec![("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 131)], None)];
         l.extend_from_slice(body);
@@ -145,7 +147,7 @@ fn split_lds_reads_meet_after_writes() {
         let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
         syncs(&super::validate::disassemble(&translate(&code, o).unwrap_or_else(|e| panic!("{e}"))).unwrap())
     };
-    assert_eq!(looped(&[read, write]), looped(&[write, write]) + 1, "the loop's read meets when the flag is set");
+    assert!(looped(&[read, write]) >= looped(&[read]) + 2, "the loop's read and write meet when the bits are set");
     // compute groups: the counters' meet (two more atomics), none without a partner half
     let atomics = |threads: u32, list: &[Inst]| {
         let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };

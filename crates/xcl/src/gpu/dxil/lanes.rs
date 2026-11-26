@@ -234,24 +234,25 @@ impl Lw {
     }
 
     /// Split form, before the LDS access `name` (lower case): the console runs a wave's LDS
-    /// accesses in order for all 64 lanes, the halves do not. A read or an atomic first meets
-    /// the other half when either may have written LDS since they last met (`VAR_XLW`: the
-    /// same in both, which run the same instructions; every meet clears it), a write or an
-    /// atomic marks LDS written (`recomp::emit::x64_lds_order`, the HLSL `xcl_x_lw`). Not in
-    /// the per-lane form's bridge (`local_masks`), whose blocks one half may enter alone.
+    /// accesses in order for all 64 lanes, the halves do not. A read first meets the other half
+    /// when either may have written LDS since they last met, a write when either may have read
+    /// it (`VAR_XLW`'s bits: the same in both halves, which run the same instructions; every
+    /// meet clears them; `recomp::emit::x64_lds_order`, the HLSL `xcl_x_lw`). Not in the
+    /// per-lane form's bridge (`local_masks`), whose blocks one half may enter alone.
     pub fn lds_in_order(&mut self, name: &str) -> super::lower::LResult<()> {
         if !self.writes_lds || self.local_masks || matches!(self.partner, Partner::Missing) {
             return Ok(());
         }
-        let (waits, writes) = crate::gpu::recomp::emit::x64_lds_order(name);
-        if waits {
+        let (wait, set) = crate::gpu::recomp::emit::x64_lds_order(name);
+        if wait != 0 {
             let w = self.rd(VAR_XLW);
             // known while lowering in straight-line code: no test
             match self.s.m.const_u64(w) {
-                Some(0) => {}
+                Some(v) if v as u32 & wait == 0 => {}
                 Some(_) => self.meet_only(),
                 None => {
-                    let c = self.nz(w);
+                    let b = self.andc(w, wait);
+                    let c = self.nz(b);
                     self.guarded(c, &mut |lw| {
                         lw.meet_only();
                         Ok(())
@@ -259,9 +260,16 @@ impl Lw {
                 }
             }
         }
-        if writes {
-            let one = self.c(1);
-            self.wr(VAR_XLW, one);
+        if set != 0 {
+            let w = self.rd(VAR_XLW);
+            let v = match self.s.m.const_u64(w) {
+                Some(v) => self.c(v as u32 | set),
+                None => {
+                    let k = self.c(set);
+                    self.or(w, k)
+                }
+            };
+            self.wr(VAR_XLW, v);
         }
         Ok(())
     }
