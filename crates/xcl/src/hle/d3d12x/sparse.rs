@@ -304,29 +304,132 @@ fn zero_runs(pieces: BTreeSet<(usize, usize)>) -> Vec<(usize, usize)> {
     out
 }
 
+/// Free pool tiles partitioned by pool heap so `reuse_tile` packs the fullest live heap that
+/// still has a free tile instead of scattering allocations across nearly-empty pools that are
+/// draining towards `State::retire_free_pools`.
+#[derive(Default)]
+struct FreePools {
+    by_heap: Vec<Vec<u32>>,
+    total: usize,
+}
+
+impl FreePools {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn len(&self) -> usize {
+        self.total
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn heap_len(&self, h: usize) -> usize {
+        self.by_heap.get(h).map_or(0, Vec::len)
+    }
+
+    fn has_empty_heap(&self) -> bool {
+        self.by_heap.iter().any(|tiles| tiles.len() >= POOL_TILES as usize)
+    }
+
+    fn add_heap(&mut self, h: u32) {
+        let idx = h as usize;
+        if idx >= self.by_heap.len() {
+            self.by_heap.resize_with(idx + 1, Vec::new);
+        }
+        debug_assert!(self.by_heap[idx].is_empty());
+        self.by_heap[idx] = (1..POOL_TILES).rev().collect();
+        self.total += (POOL_TILES - 1) as usize;
+    }
+
+    fn push(&mut self, (h, t): (u32, u32)) {
+        let idx = h as usize;
+        if idx >= self.by_heap.len() {
+            self.by_heap.resize_with(idx + 1, Vec::new);
+        }
+        self.by_heap[idx].push(t);
+        self.total += 1;
+    }
+
+    fn clear_heap(&mut self, h: usize) {
+        if let Some(tiles) = self.by_heap.get_mut(h) {
+            self.total -= tiles.len();
+            tiles.clear();
+            tiles.shrink_to_fit();
+        }
+    }
+
+    /// Move every cooled tile (`>= COOL`) from `cooling` into its pool heap's free list.
+    fn drain_cooling(&mut self, cooling: &mut VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant) {
+        while cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL) {
+            if let Some((tile, _)) = cooling.pop_front() {
+                self.push(tile);
+            }
+        }
+    }
+
+    /// Take a tile from the fullest partially-used heap (`0 < len < POOL_TILES`, lowest heap index
+    /// on ties) so nearly-empty heaps stay untouched and retire; only take from an all-free heap
+    /// when no partially-used heap has a free tile.
+    fn pop_packed(&mut self) -> Option<(u32, u32)> {
+        if self.total == 0 {
+            return None;
+        }
+        let h = self
+            .by_heap
+            .iter()
+            .enumerate()
+            .filter(|(_, tiles)| !tiles.is_empty() && tiles.len() < POOL_TILES as usize)
+            .min_by_key(|(_, tiles)| tiles.len())
+            .or_else(|| self.by_heap.iter().enumerate().find(|(_, tiles)| tiles.len() >= POOL_TILES as usize))
+            .map(|(h, _)| h)?;
+        let t = self.by_heap[h].pop()?;
+        self.total -= 1;
+        Some((h as u32, t))
+    }
+
+    #[cfg(test)]
+    fn contains(&self, &(h, t): &(u32, u32)) -> bool {
+        self.by_heap.get(h as usize).is_some_and(|tiles| tiles.contains(&t))
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        for tiles in &mut self.by_heap {
+            tiles.clear();
+        }
+        self.total = 0;
+    }
+
+    #[cfg(test)]
+    fn has_pool(&self, h: u32) -> bool {
+        self.heap_len(h as usize) > 0
+    }
+}
+
 /// Whether the oldest tile of `cooling` was freed `COOL` ago or more at `now`
 fn cooled(cooling: &VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant) -> bool {
     cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL)
 }
 
-/// The pool tile to use next (`State::take_tile`): the oldest of `cooling` if it cooled, else
-/// one of `free`. None: neither, though tiles freed less than `COOL` ago may be cooling.
-fn reuse_tile(free: &mut Vec<(u32, u32)>, cooling: &mut VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant) -> Option<(u32, u32)> {
-    if cooled(cooling, now) {
-        return cooling.pop_front().map(|(t, _)| t);
-    }
-    free.pop()
+/// The pool tile to use next (`State::take_tile`): drain cooled tiles into their pool heaps and
+/// take from the fullest partially-used heap (or an all-free heap if none is partially used).
+/// None: neither, though tiles freed less than `COOL` ago may be cooling.
+fn reuse_tile(free: &mut FreePools, cooling: &mut VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant) -> Option<(u32, u32)> {
+    free.drain_cooling(cooling, now);
+    free.pop_packed()
 }
 
 /// The pool heaps (`pools` of them) all of whose tiles are in `free` or cooled in `cooling` at
 /// `now` (`State::retire_free_pools`): a tile still cooling keeps its heap.
-fn free_heaps(free: &[(u32, u32)], cooling: &VecDeque<((u32, u32), std::time::Instant)>, pools: usize, now: std::time::Instant) -> Vec<usize> {
-    let ready = cooling.iter().take_while(|&&(_, at)| now.duration_since(at) >= COOL).map(|&(t, _)| t);
-    if free.len() + ready.clone().count() < POOL_TILES as usize {
-        return Vec::new();
-    }
+fn free_heaps(free: &FreePools, cooling: &VecDeque<((u32, u32), std::time::Instant)>, pools: usize, now: std::time::Instant) -> Vec<usize> {
     let mut count = vec![0u32; pools];
-    for (h, _) in free.iter().copied().chain(ready) {
+    for (h, c) in count.iter_mut().enumerate() {
+        *c = free.heap_len(h) as u32;
+    }
+    for &((h, _), _) in cooling.iter().take_while(|&&(_, at)| now.duration_since(at) >= COOL) {
         if let Some(c) = count.get_mut(h as usize) {
             *c += 1;
         }
@@ -438,8 +541,9 @@ struct State {
     windows: Vec<(usize, ID3D12Resource)>,
     /// video-memory pool heaps (None: given back, its index free for the next one)
     pools: Vec<Option<ID3D12Heap>>,
-    /// pool tiles to use: those of a pool that were never used, and cooled ones (`cooling`)
-    free: Vec<(u32, u32)>,
+    /// pool tiles to use, partitioned by heap (`FreePools`): those of a pool that were never used,
+    /// and cooled ones (`cooling`)
+    free: FreePools,
     /// pool tiles freed (`flush_parked`, once `quarantined` lets them go, and `release_if_unused`),
     /// oldest first, with when: used again `COOL` after that at the earliest (`take_tile`).
     /// Before, a tile unmapped went to `free` and was the next one taken, mapped, cleared and
@@ -991,7 +1095,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         job_seq: 0,
         windows,
         pools: Vec::new(),
-        free: Vec::new(),
+        free: FreePools::new(),
         cooling: VecDeque::new(),
         retired: Vec::new(),
         retire_tried: std::time::Instant::now(),
@@ -1192,7 +1296,7 @@ impl State {
                 self.pools.len() as u32 - 1
             }
         };
-        self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
+        self.free.add_heap(h);
         h
     }
 
@@ -1204,13 +1308,13 @@ impl State {
         self.retire_tried = now;
         let done = unsafe { super::real::fence_completed(&self.fence) };
         self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
+        self.free.drain_cooling(&mut self.cooling, now);
         let gone: Vec<usize> = free_heaps(&self.free, &self.cooling, self.pools.len(), now).into_iter().filter(|&h| self.pools[h].is_some()).collect();
         if gone.is_empty() {
             return;
         }
-        self.free.retain(|&(h, _)| !gone.contains(&(h as usize)));
-        self.cooling.retain(|&((h, _), _)| !gone.contains(&(h as usize)));
         for h in gone {
+            self.free.clear_heap(h);
             if let Some(heap) = self.pools[h].take() {
                 self.retired.push((heap, self.value, now));
             }
@@ -4032,7 +4136,7 @@ impl State {
         s.note_queue(queue);
         let flushed = s.flush_parked();
         s.drain_quarantined();
-        if flushed || retire_due(&s.cooling, !s.retired.is_empty(), s.retire_tried, std::time::Instant::now()) {
+        if flushed || retire_due(&s.cooling, !s.retired.is_empty() || s.free.has_empty_heap(), s.retire_tried, std::time::Instant::now()) {
             s.retire_free_pools();
         }
         let t_locked = std::time::Instant::now();
@@ -4544,7 +4648,7 @@ mod tests {
                 job_seq: 0,
                 windows: vec![(base, reserved.clone())],
                 pools: Vec::new(),
-                free: Vec::new(),
+                free: FreePools::new(),
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
                 retire_tried: std::time::Instant::now(),
@@ -4835,7 +4939,7 @@ mod tests {
                 job_seq: 0,
                 windows: Vec::new(),
                 pools: Vec::new(),
-                free: Vec::new(),
+                free: FreePools::new(),
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
                 retire_tried: std::time::Instant::now(),
@@ -5071,7 +5175,7 @@ mod tests {
                 job_seq: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
-                free: Vec::new(),
+                free: FreePools::new(),
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
                 retire_tried: std::time::Instant::now(),
@@ -5196,7 +5300,7 @@ mod tests {
                 job_seq: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
-                free: Vec::new(),
+                free: FreePools::new(),
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
                 retire_tried: std::time::Instant::now(),
@@ -6746,7 +6850,7 @@ mod tests {
     fn a_freed_pool_tile_cools_before_it_is_used_again() {
         let t0 = std::time::Instant::now();
         let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
-        let mut free: Vec<(u32, u32)> = Vec::new();
+        let mut free = FreePools::new();
         let mut cooling: VecDeque<((u32, u32), std::time::Instant)> = VecDeque::new();
         cooling.push_back(((0, 5), ms(0)));
         cooling.push_back(((0, 6), ms(10)));
@@ -6867,13 +6971,70 @@ mod tests {
         let t0 = std::time::Instant::now();
         let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
         // pool 1 free but its last tile, freed at 0 ms; pool 0 free but its first, freed at 1500 ms
-        let mut free: Vec<(u32, u32)> = (0..POOL_TILES - 1).map(|t| (1, t)).collect();
-        free.extend((1..POOL_TILES).map(|t| (0, t)));
+        let mut free = FreePools::new();
+        for t in 0..POOL_TILES - 1 {
+            free.push((1, t));
+        }
+        for t in 1..POOL_TILES {
+            free.push((0, t));
+        }
         let cooling = VecDeque::from([((1, POOL_TILES - 1), ms(0)), ((0, 0), ms(1500))]);
         assert!(free_heaps(&free, &cooling, 2, ms(1999)).is_empty(), "their last tiles are cooling");
         assert_eq!(free_heaps(&free, &cooling, 2, ms(2000)), vec![1], "pool 1's cooled");
         assert_eq!(free_heaps(&free, &cooling, 2, ms(3500)), vec![0, 1]);
-        assert_eq!(free_heaps(&free[1..], &cooling, 2, ms(3500)), vec![0], "a tile of pool 1 in use");
+        let mut partial = FreePools::new();
+        for t in 1..POOL_TILES - 1 {
+            partial.push((1, t));
+        }
+        for t in 1..POOL_TILES {
+            partial.push((0, t));
+        }
+        assert_eq!(free_heaps(&partial, &cooling, 2, ms(3500)), vec![0], "a tile of pool 1 in use");
+    }
+
+    /// `reuse_tile` packs the fullest partially-used pool heap rather than handing out the oldest
+    /// cooled tile from a nearly-empty heap, so draining heaps become completely empty and retire.
+    /// Before, FIFO `cooling.pop_front()` re-pinned the nearly-empty heap with new allocations.
+    #[test]
+    fn reuse_tile_packs_fuller_heaps_so_nearly_empty_pools_retire() {
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut free = FreePools::new();
+        let mut cooling: VecDeque<((u32, u32), std::time::Instant)> = VecDeque::new();
+        // Pool 1 is almost empty (1000 tiles freed earlier at 0 ms, only 24 still live).
+        for t in 24..POOL_TILES {
+            cooling.push_back(((1, t), ms(0)));
+        }
+        // Pool 0 is mostly full (only 24 tiles freed later at 10 ms, 1000 still live).
+        for t in 0..24 {
+            cooling.push_back(((0, t), ms(10)));
+        }
+        // Allocate 24 new tiles once both have cooled: all 24 must pack into fuller pool 0,
+        // leaving draining pool 1 untouched.
+        for _ in 0..24 {
+            let (h, _) = reuse_tile(&mut free, &mut cooling, ms(2010)).expect("a packed tile");
+            assert_eq!(h, 0, "must pack into fuller pool 0 instead of re-pinning draining pool 1");
+        }
+        assert_eq!(free.heap_len(0), 0, "pool 0 is completely packed");
+        assert_eq!(free.heap_len(1), (POOL_TILES - 24) as usize, "pool 1 stayed untouched");
+
+        // When pool 1's remaining 24 tiles free and cool, all of pool 1 is free and ready to retire.
+        for t in 0..24 {
+            cooling.push_back(((1, t), ms(2100)));
+        }
+        assert_eq!(free_heaps(&free, &cooling, 2, ms(4100)), vec![1]);
+
+        // An all-free heap is skipped while a partially-used heap has space, and `has_empty_heap`
+        // reports it so `retire_due` retires it even after `cooling` has been drained.
+        free.push((0, 0));
+        free.drain_cooling(&mut cooling, ms(4100));
+        assert!(cooling.is_empty());
+        assert!(free.has_empty_heap());
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(4100)), Some((0, 0)), "partial pool 0 before all-free pool 1");
+        assert_eq!(free.heap_len(1), POOL_TILES as usize, "all-free pool 1 left intact for retirement");
+        assert!(retire_due(&cooling, free.has_empty_heap(), ms(0), ms(4100)));
+        // When no partial pool remains, the all-free pool is reused instead of creating a new heap.
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(4100)).map(|(h, _)| h), Some(1));
     }
 
     /// A GPU-view tile given back and unmapped at a submit is not the video memory of the next
@@ -6955,7 +7116,7 @@ mod tests {
             assert!(v.s.parked.is_empty());
             v.submit(&[]);
             assert!(v.s.pools[pool.0 as usize].is_none(), "retired with nothing parked");
-            assert!(v.s.cooling.is_empty() && !v.s.free.iter().any(|t| t.0 == pool.0));
+            assert!(v.s.cooling.is_empty() && !v.s.free.has_pool(pool.0));
             assert_eq!(v.s.retired.len(), 1);
         }
     }
