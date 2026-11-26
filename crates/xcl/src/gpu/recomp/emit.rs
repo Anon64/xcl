@@ -5086,7 +5086,24 @@ static uint xcl_cap = 1u << 16;
                     // waves in the group: a last, partial wave counts (96 threads: 2 of 64)
                     let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
-                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                // a dispatch with thread dimensions (`IO_THREAD_LIMIT`): a lane whose thread
+                // (the console's group, unfolded, times the group size plus its thread in the
+                // group) is at or past an axis's count is not in EXEC, as the console never
+                // starts it. A count of 0 (no limit) less 1 passes every thread: one load and a
+                // compare an axis, no branch, the same EXEC as before for every other dispatch
+                let _ = writeln!(
+                    h,
+                    "    uint scc = 0u;\n    {{\n        uint3 xcl_tl = io.Load3({}u) - 1u;\n        uint2 e0 = {}(all(xcl_gid * uint3({x}u, {y}u, {z}u) + gtid <= xcl_tl));\n        exec_lo = e0.x; exec_hi = e0.y;\n    }}",
+                    super::IO_THREAD_LIMIT[0] * 4,
+                    self.ballot_fn()
+                );
+                // a wave with no thread left (past the count in a group of several waves) is one
+                // the console does not start: it leaves (from the early-exit-safe barrier too),
+                // but not where a plain group barrier would wait for it
+                if !body.contains("GroupMemoryBarrierWithGroupSync") {
+                    let leave = if self.safe_barrier { "xcl_s_barrier_exit(); " } else { "" };
+                    let _ = writeln!(h, "    if ((exec_lo | exec_hi) == 0u) {{ {leave}return; }}");
+                }
                 for &v in &self.vgprs {
                     let init = match v {
                         0 => "gtid.x",

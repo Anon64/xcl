@@ -224,8 +224,11 @@ pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
 /// io slots (trap-temp range, after `IO_GROUP_LIMIT`) of a `DispatchX` with thread dimensions
 /// (flag 0x20): the thread count of each axis when it is not a whole number of groups (0: the
 /// last group is whole), so the program can leave the lanes past it out of EXEC. Written by
-/// D3D12.X now; read by the compute prologue later.
+/// D3D12.X; every compute prologue reads the three at once (one 12-byte load: they must stay
+/// consecutive) and leaves a lane out of its EXEC when its thread along an axis (the console's
+/// group, unfolded, times the group size plus its thread in the group) is at or past the count.
 pub const IO_THREAD_LIMIT: [usize; 3] = [115, 116, 117];
+const _: () = assert!(IO_THREAD_LIMIT[1] == IO_THREAD_LIMIT[0] + 1 && IO_THREAD_LIMIT[2] == IO_THREAD_LIMIT[0] + 2);
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)

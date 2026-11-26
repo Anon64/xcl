@@ -8106,6 +8106,61 @@ fn gpu_compute_folded_dispatch_runs_each_console_group_once() {
     }
 }
 
+/// The HLSL compute prologue leaves the lanes past a dispatch's thread limit
+/// (`IO_THREAD_LIMIT`: one 12-byte load) out of the launch EXEC, by the console's thread of the
+/// lane (the console's group, unfolded, times the group size plus `gtid`, which the split form
+/// and a 2-D group number as their waves arrive): wave32, wave64, the split form, a 2-D group;
+/// a wave left with no thread leaves, from the early-exit-safe barrier too, but not where a
+/// plain group barrier would wait for it. DXC compiles each (when it is there).
+#[test]
+fn compute_prologues_leave_the_lanes_past_a_thread_limit_out_of_exec() {
+    // global_store_dword [((s2 << 3) + v0) * 4], (s2 << 3) + v0
+    let store: [(&str, &str, &[(&str, u64)], Option<u32>); 4] = [
+        ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 2), ("SRC1", 131), ("SRC2", 256)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ];
+    for (wave64, split, threads, with_barrier) in [
+        (false, false, [64, 1, 1], false),
+        (true, false, [64, 1, 1], false),
+        (true, true, [64, 1, 1], false),
+        (true, true, [128, 1, 1], false),
+        (false, false, [8, 8, 1], false),
+        (true, false, [128, 1, 1], true),
+        (false, false, [64, 1, 1], true),
+    ] {
+        let what = format!("wave64 {wave64}, split {split}, {threads:?}, barrier {with_barrier}");
+        let cs = super::CsInterface { threads, user_sgprs: 2, tgid: [true, true, false], tg_size: false, tid_components: 2 };
+        let mut lines = store.to_vec();
+        if with_barrier {
+            lines.insert(0, ("S_BARRIER", "ENC_SOPP", &[], None));
+        }
+        let t = translate(&prog(&lines), &Options { mode: Mode::Compute(cs), wave64, split_wave64: split, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{what}: {:?}", t.unsupported_why);
+        let [x, y, z] = threads;
+        let ballot = if split { "xcl_x_ballot" } else { "ballot" };
+        for want in [
+            format!("uint3 xcl_tl = io.Load3({}u) - 1u;", super::IO_THREAD_LIMIT[0] * 4),
+            format!("uint2 e0 = {ballot}(all(xcl_gid * uint3({x}u, {y}u, {z}u) + gtid <= xcl_tl));"),
+        ] {
+            assert!(t.hlsl.contains(&want), "{what}: no {want}\n{}", t.hlsl);
+        }
+        let leaves = t.hlsl.lines().find(|l| l.contains("if ((exec_lo | exec_hi) == 0u)")).map(str::trim);
+        let safe = t.hlsl.contains("xcl_s_barrier();");
+        if with_barrier && !safe {
+            // `XCL_SAFE_BARRIER=0`: the plain group barrier, which a wave that left would hang
+            assert_eq!(leaves, None, "{what}\n{}", t.hlsl);
+        } else {
+            let want = if safe { "if ((exec_lo | exec_hi) == 0u) { xcl_s_barrier_exit(); return; }" } else { "if ((exec_lo | exec_hi) == 0u) { return; }" };
+            assert_eq!(leaves, Some(want), "{what}\n{}", t.hlsl);
+        }
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{what}: {e}\n{}", t.hlsl));
+        }
+    }
+}
+
 /// v_fract_f32 at the edges, as RDNA computes it (x - floor(x) kept below 1.0): ±inf gives
 /// NaN and a NaN stays NaN – a `min()` clamp returned 0.99999994 there on NVIDIA (HLSL min
 /// returns its non-NaN operand); a tiny negative value rounds to the largest float below 1.
