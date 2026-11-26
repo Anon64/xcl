@@ -857,6 +857,50 @@ fn direct_compute_loops_count_each_entry() {
     }
 }
 
+/// The compute entry loads the dispatch's thread limits (`recomp::IO_THREAD_LIMIT`) in one
+/// 3-dword load and lets only the lanes below them into the program. Without a group barrier the
+/// lanes past them leave at once and the running lanes' vector writes stay unguarded, as before
+/// (the one conditional branch is the entry's); with one they stay, out of EXEC, and the store
+/// is guarded. Wave32, wave64 and the split form (with and without a partner half).
+#[test]
+fn the_compute_entry_lets_only_the_lanes_below_the_thread_limits_in() {
+    use crate::gpu::recomp::{CsInterface, IO_THREAD_LIMIT};
+    let code = |barrier: bool| {
+        let mut l: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vec![
+            ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 2), ("SRC1", 134), ("SRC2", 256)], None),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 4)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+        ];
+        if barrier {
+            l.insert(0, ("S_BARRIER", "ENC_SOPP", &[], None));
+        }
+        prog(&l)
+    };
+    let load = format!("i32 {}, i32 undef, i8 7, i32 4)", IO_THREAD_LIMIT[0] * 4);
+    for (wave64, split, threads) in [(false, false, 32), (true, false, 64), (true, true, 64), (true, true, 32)] {
+        let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        // (a split wave64 of 64 threads is two hardware waves: its barrier is the HLSL path's)
+        for barrier in [false, true].into_iter().filter(|&b| !(b && split && threads == 64)) {
+            let what = format!("wave64 {wave64}, split {split}, {threads} threads, barrier {barrier}");
+            let k = super::kernel::translate_compute(&code(barrier), o, &cs).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let Ok(dis) = super::validate::disassemble(&k.dxil) else {
+                return crate::gpu::recomp::runner::skip_test("no DXC");
+            };
+            assert_eq!(dis.matches(&load).count(), 1, "{what}: the limits in one load\n{dis}");
+            if !split || threads == 32 {
+                assert_eq!(dis.matches("br i1 ").count(), if barrier { 2 } else { 1 }, "{what}\n{dis}");
+                // the entry's branch: on the group (a folded count) and, without a barrier, the
+                // lane's place inside the limits too
+                let cond = dis.lines().find_map(|l| l.trim().strip_prefix("br i1 ")).and_then(|r| r.split(',').next()).unwrap();
+                let def = dis.lines().find(|l| l.trim().starts_with(&format!("{cond} = "))).unwrap();
+                assert_eq!(def.contains("= and i1 "), !barrier, "{what}: {def}\n{dis}");
+            }
+        }
+    }
+}
+
 /// A loop of `passes` passes (0: one that only ends when its counter wraps to 0) inside one
 /// of `entries` passes; each pass stores the inner passes run so far to [v0 * 4], so what a
 /// thread stored last is what it ran before its loops (or its program) ended.
