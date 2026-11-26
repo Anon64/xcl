@@ -2576,6 +2576,18 @@ fn pc_srv(rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>)
     Some(out)
 }
 
+/// An empty acceleration structure of XCL's own in unified memory (`XCL_BVH_EMPTY`): a header
+/// whose root is a box32 node with no child, so a traversal ends at the root.
+fn empty_bvh() -> Option<u64> {
+    static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        let p = crate::gpu::uma::get()?.alloc(0x1_0000, 0x1_0000)?;
+        let data = crate::gpu::bvh::empty().data;
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len()) };
+        Some(p as u64)
+    })
+}
+
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
     let mut copy = desc.as_ref().copied();
@@ -2620,6 +2632,12 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
             // parent pointers (`bvh_want`; `XCL_BVH_WALK=0`: the 64 KiB above only)
             super::bvh_want::view_made(va);
             let w = crate::gpu::desc::bvh_words(va, true);
+            return super::console_heap::write(&slot, &[w[0], w[1], w[2], w[3], 0, 0, 0, 0]);
+        }
+        // (an all-zero descriptor is no empty structure: the shader reads its root at 0x30 of
+        // window 0)
+        if let Some(at) = empty.then(empty_bvh).flatten() {
+            let w = crate::gpu::desc::bvh_words(at, true);
             return super::console_heap::write(&slot, &[w[0], w[1], w[2], w[3], 0, 0, 0, 0]);
         }
         static N: AtomicU64 = AtomicU64::new(0);

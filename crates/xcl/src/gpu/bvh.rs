@@ -121,6 +121,15 @@ pub fn build_top(instances: &[Instance]) -> Bvh {
     Builder { data: Vec::new(), bounds, leaf_bytes: INSTANCE_BYTES, leaf: &leaf }.finish()
 }
 
+/// A structure no ray hits: its root a box32 node with no child (a top or bottom level alike).
+pub fn empty() -> Bvh {
+    let mut data = vec![0; HEADER_BYTES + BOX_BYTES];
+    let root = (HEADER_BYTES / 8) as u32 | BOX32;
+    put(&mut data, ROOT_AT, &[root]);
+    put(&mut data, HEADER_BYTES, &[INVALID; 4]);
+    Bvh { data, root }
+}
+
 fn put(out: &mut [u8], at: usize, words: &[u32]) {
     for (k, w) in words.iter().enumerate() {
         out[at + 4 * k..at + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
@@ -837,6 +846,20 @@ pub(crate) mod tests {
         assert!(is_compressed_header(&compressed));
         assert!(!is_compressed_header(&rehydrated));
         assert!(!is_compressed_header(&[]));
+    }
+
+    /// The empty structure: a ray right through its (zero) bounds reaches no child, as a top or
+    /// a bottom level.
+    #[test]
+    fn the_empty_structure_has_nothing_to_hit() {
+        let e = empty();
+        assert_eq!(word(&e.data, ROOT_AT), e.root);
+        let (o, d) = ([-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        assert_eq!(intersect_node(&e.data, e.root, 100.0, o, d, d.map(|x| 1.0 / x), true), [INVALID; 4]);
+        assert_eq!(e.trace(o, d, 100.0), None);
+        assert_eq!(e.trace_scene(&|_| None, o, d, 100.0), None);
+        let s = walk_scene(&mut space(&[(TOP_AT, e.data.clone())]), TOP_AT, &Limits::default(), &mut |_| true);
+        assert_eq!((s.top.nodes, s.referenced.len(), s.cut), (1, 0, None));
     }
 
     /// An address space of `regions` (address, bytes): a read inside one of them only.
