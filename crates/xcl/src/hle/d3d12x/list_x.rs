@@ -2365,11 +2365,14 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
     GpuWaitOutcome::Handled
 }
 
-unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)]) {
+/// The waits of a list before it goes: on the GPU where they can be, else on the CPU. Whether one
+/// was waited for on the CPU.
+unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)]) -> bool {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     static RING_DUMPED: AtomicU64 = AtomicU64::new(0);
     let timeout = wait_timeout();
     let q_ty = queue_device_and_type(queue).map_or(-1, |(_, _, t)| t.0);
+    let mut on_cpu = false;
     for w in waits {
         if w.is_satisfied() {
             sync_trace(|| format!("q{} wait {:#x} >= {:#x}: memory holds it", queue_id(queue as usize), w.va, w.value));
@@ -2379,6 +2382,7 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
             GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
             GpuWaitOutcome::FallbackCpu => {}
         }
+        on_cpu = true;
         sync_trace(|| format!("q{} wait {:#x} (op {}) {:#x}: on the CPU", queue_id(queue as usize), w.va, w.comparison, w.value));
         if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
             let cell_diag = {
@@ -2413,6 +2417,7 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
             }
         }
     }
+    on_cpu
 }
 
 /// Copy any GPU memory writes into sparse VRAM windows recorded by `lists` back into their
@@ -2455,6 +2460,22 @@ unsafe fn mapped_after_wait(queue: *mut c_void) {
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         super::sparse::before_execute(q, &[], 0x1000);
     }
+}
+
+/// `XCL_SPLIT_SPARSE=cpu` (off unless set): after a split at waits that all went to the GPU (or
+/// held already), the sparse windows are not brought up to date again (`mapped_after_wait`): the
+/// lists before and after the split went out within the submit, as an unsplit submit's do. A
+/// retail title's world split many of its ~19 submits a frame at Wait64BitValueX waits bridged to
+/// the GPU, and each split took the sparse state's lock again.
+fn split_sparse_after_cpu_waits_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPLIT_SPARSE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("cpu")))
+}
+
+/// Whether a split, whose waits were (`on_cpu`) or were not waited for on the CPU, brings the
+/// sparse windows up to date again (`only_after_cpu`: `XCL_SPLIT_SPARSE=cpu`).
+fn sparse_again_after_split(on_cpu: bool, only_after_cpu: bool) -> bool {
+    on_cpu || !only_after_cpu
 }
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
@@ -2503,9 +2524,11 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
             submit(&lists[start..i]);
         }
         let t = Instant::now();
-        wait_all_on(queue, waits, list_writes);
+        let on_cpu = wait_all_on(queue, waits, list_writes);
         let t_waited = Instant::now();
-        mapped_after_wait(queue);
+        if sparse_again_after_split(on_cpu, split_sparse_after_cpu_waits_only()) {
+            mapped_after_wait(queue);
+        }
         super::submit_cost::split(t_waited - t, t_waited.elapsed());
         start = i;
     }
@@ -3848,8 +3871,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         }
     }
 
-    if !waits.is_empty() {
-        wait_all_on(q_raw, &waits, &write64_signals);
+    if !waits.is_empty() && sparse_again_after_split(wait_all_on(q_raw, &waits, &write64_signals), split_sparse_after_cpu_waits_only()) {
         mapped_after_wait(q_raw);
     }
 
@@ -5631,6 +5653,35 @@ mod tests {
             cell64.store(0x0000_0002_0000_0001, Ordering::Release);
             assert!(w64.is_satisfied());
         }
+    }
+
+    /// `wait_all_on` says whether it waited on the CPU: not for waits that held already, yes for
+    /// one it had to wait for there (no queue: no GPU wait); the split's sparse update follows it
+    /// only with `XCL_SPLIT_SPARSE=cpu`.
+    #[test]
+    fn a_split_brings_the_sparse_windows_up_to_date_after_a_cpu_wait() {
+        let cell = Arc::new(AtomicU64::new(7));
+        let w = |value: u64| PendingWait {
+            va: Arc::as_ptr(&cell) as u64,
+            width: 8,
+            comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+            value,
+            mask: u64::MAX,
+            after_write64: false,
+        };
+        unsafe {
+            assert!(!wait_all_on(std::ptr::null_mut(), &[w(5), w(7)], &[]), "held already: no CPU wait");
+            let writer = cell.clone();
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(5));
+                writer.store(9, Ordering::Release);
+            });
+            assert!(wait_all_on(std::ptr::null_mut(), &[w(5), w(9)], &[]), "waited on the CPU");
+            t.join().unwrap();
+        }
+        assert!(sparse_again_after_split(true, true));
+        assert!(!sparse_again_after_split(false, true));
+        assert!(sparse_again_after_split(false, false) && sparse_again_after_split(true, false), "as before without the switch");
     }
 
     #[test]
