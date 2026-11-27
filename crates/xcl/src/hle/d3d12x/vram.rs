@@ -1469,16 +1469,8 @@ pub(super) unsafe fn unmap_levels(res: &ID3D12Resource, zero: &[u32]) -> u64 {
         if ranges.is_empty() {
             return 0;
         }
-        for a in &gone {
-            if let Some(i) = t.used.iter().position(|u| u == a) {
-                t.used.swap_remove(i);
-            }
-        }
-        for k in &gone_extra {
-            if let Some(i) = t.used_extra.iter().position(|u| u == k) {
-                t.used_extra.swap_remove(i);
-            }
-        }
+        remove_once_each(&mut t.used, &gone);
+        remove_once_each(&mut t.used_extra, &gone_extra);
         let freed: u64 = ranges.iter().map(|&(_, n)| n as u64).sum();
         for (sub, n) in ranges {
             pages.unmap_range(res, sub, n);
@@ -1497,6 +1489,25 @@ pub(super) unsafe fn unmap_levels(res: &ID3D12Resource, zero: &[u32]) -> u64 {
 
 /// The times `unmap_levels` gave pages back.
 static LEVELS_GIVEN_BACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `v` without one occurrence of each item of `gone` (an item named twice: two of them), in one
+/// pass: a search of `v` for each would go over it again for every page of a large level.
+fn remove_once_each<T: Copy + Eq + std::hash::Hash>(v: &mut Vec<T>, gone: &[T]) {
+    if gone.is_empty() {
+        return;
+    }
+    let mut left: std::collections::HashMap<T, u32> = std::collections::HashMap::with_capacity(gone.len());
+    for &g in gone {
+        *left.entry(g).or_insert(0) += 1;
+    }
+    v.retain(|x| match left.get_mut(x) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            false
+        }
+        _ => true,
+    });
+}
 
 /// The tiles of texture `resource` (lazy levels) that have pages: for a test.
 #[cfg(test)]
@@ -1626,6 +1637,20 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    /// `remove_once_each` takes one occurrence for each time an item is named, keeps the rest
+    /// (duplicates too) and items not named, and leaves the list as it was for nothing to take.
+    #[test]
+    fn remove_once_each_takes_one_occurrence_for_each_naming() {
+        let mut v = vec![1, 2, 3, 2, 4, 2, 5];
+        remove_once_each(&mut v, &[2, 4, 2, 9]);
+        assert_eq!(v, vec![1, 3, 2, 5]);
+        let mut w = vec![(1, 1), (1, 2)];
+        remove_once_each(&mut w, &[]);
+        assert_eq!(w, vec![(1, 1), (1, 2)]);
+        remove_once_each(&mut w, &[(1, 2), (1, 2)]);
+        assert_eq!(w, vec![(1, 1)]);
+    }
 
     /// The levels of a texture with lazy levels: a group of tiles for each level with tiles of its
     /// own and one for the packed levels; a level past the last standard one is in the packed
