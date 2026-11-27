@@ -743,10 +743,16 @@ impl Pages {
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
     /// to the pool even while the title keeps the COM object alive.
     unsafe fn unmap(&mut self, res: &ID3D12Resource, total: u32) {
+        self.unmap_range(res, 0, total);
+    }
+
+    /// `unmap` for the `n` tiles of `res` from the first one of subresource `sub` on.
+    unsafe fn unmap_range(&mut self, res: &ID3D12Resource, sub: u32, n: u32) {
+        let total = n;
         if total == 0 {
             return;
         }
-        let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+        let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
         self.queue.UpdateTileMappings(
@@ -1425,6 +1431,77 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         return fresh;
     }
     Vec::new()
+}
+
+/// The levels `zero` of `res` hold no texels now: the title took the memory from under them, as
+/// a streaming title does with the levels of a texture it no longer shows at that size. A
+/// texture placed with lazy levels gives back the pages of each group of levels that has pages
+/// and whose levels are all in `zero`, as it had none before their first texels (`map_levels`
+/// gives them pages again with their next ones): tiles without memory read as zeros, as those
+/// levels would with it (tiled resources tier 2). Its pages go back to the pools when no other
+/// texture uses them (`release_tiles`, `IDLE`). Returns the tiles that lost their pages.
+pub(super) unsafe fn unmap_levels(res: &ID3D12Resource, zero: &[u32]) -> u64 {
+    let key = res.as_raw() as usize;
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        let Some(t) = pages.targets.get_mut(&key) else { continue };
+        let (va, console_bytes, total) = (t.va, t.console_bytes, t.total);
+        let Some(lv) = t.levels.as_mut().filter(|_| t.mapped) else { return 0 };
+        let Some((first_page, own)) = owned_pages(va, console_bytes, total as usize) else { return 0 };
+        let mut ranges = Vec::new();
+        let (mut gone, mut gone_extra) = (Vec::new(), Vec::new());
+        for k in 0..lv.groups.len() {
+            if !lv.groups[k].3 || !lv.levels_of(k).all(|l| zero.contains(&l)) {
+                continue;
+            }
+            let (sub, first, n, _) = lv.groups[k];
+            lv.groups[k].3 = false;
+            ranges.push((sub, n));
+            // (the keys `bind_range` gave these tiles)
+            for i in first as usize..(first + n) as usize {
+                if i < own {
+                    gone.push(first_page + i * PAGE);
+                } else {
+                    gone_extra.push((va, i));
+                }
+            }
+        }
+        if ranges.is_empty() {
+            return 0;
+        }
+        for a in &gone {
+            if let Some(i) = t.used.iter().position(|u| u == a) {
+                t.used.swap_remove(i);
+            }
+        }
+        for k in &gone_extra {
+            if let Some(i) = t.used_extra.iter().position(|u| u == k) {
+                t.used_extra.swap_remove(i);
+            }
+        }
+        let freed: u64 = ranges.iter().map(|&(_, n)| n as u64).sum();
+        for (sub, n) in ranges {
+            pages.unmap_range(res, sub, n);
+        }
+        pages.release_tiles(gone, gone_extra, std::time::Instant::now(), false);
+        LEVEL_STATS[2].fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
+        let n = LEVELS_GIVEN_BACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() && n >= 64 {
+            let (textures, stand, mapped, _) = level_stats();
+            crate::xlog_info!("D3D12.X: level pages: {n} times a texture's levels lost their texels and gave their pages back; {textures} textures standing for {} MB have pages for {} MB", stand >> 4, mapped >> 4);
+        }
+        return freed;
+    }
+    0
+}
+
+/// The times `unmap_levels` gave pages back.
+static LEVELS_GIVEN_BACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The tiles of texture `resource` (lazy levels) that have pages: for a test.
+#[cfg(test)]
+pub(super) fn mapped_level_tiles(resource: usize) -> Option<u64> {
+    PAGES.lock().unwrap().values().flatten().find_map(|p| p.targets.get(&resource).and_then(|t| t.levels.as_ref()).map(|l| l.mapped_tiles()))
 }
 
 /// Whether `resource` is a texture whose levels get their pages one by one (`map_levels`).
