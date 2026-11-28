@@ -1101,6 +1101,7 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 
 /// #34 SetGraphicsRootSignature (PC #30)
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     let _c = super::capture::op(this, || Some(super::capture::Op::RootSig { gfx: true, rs: rs as usize }));
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
@@ -1112,16 +1113,19 @@ pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_vo
 
 /// #36 SetGraphicsRootDescriptorTable (PC #32)
 pub(super) unsafe extern "system" fn set_graphics_root_table(this: *mut c_void, i: u32, handle: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     put_in(this, true, i, 0, &(handle as u32).to_le_bytes());
 }
 
 /// #38 SetGraphicsRoot32BitConstant (PC #34)
 pub(super) unsafe extern "system" fn set_graphics_root_constant(this: *mut c_void, i: u32, value: u32, offset: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     put_in(this, true, i, offset, &value.to_le_bytes());
 }
 
 /// #40 SetGraphicsRoot32BitConstants (PC #36)
 pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     if !data.is_null() {
         let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
         put_in(this, true, i, offset, &bytes);
@@ -1131,6 +1135,7 @@ pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_vo
 /// #42 / #44 / #46 SetGraphicsRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #38 /
 /// #40 / #42)
 pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     note_address(va);
     put_in(this, true, i, 0, &va.to_le_bytes());
 }
@@ -2956,6 +2961,7 @@ fn note_no_root_signature() {
 }
 
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DrawRecord);
     let _c = capture_work(this, || super::capture::WorkKind::DispatchMesh([x, y, z]), true);
     type PcDm = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
     let pc_dm: PcDm = std::mem::transmute(super::real::orig_fn(this, 79));
@@ -3090,6 +3096,13 @@ unsafe fn mesh_work(this: *mut c_void, outcome: usize) {
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
+    let _t = super::look_stats::deep().then(|| {
+        crate::hle::api_cost::time(if signature_dispatches(sig) {
+            crate::hle::api_cost::Call::DispatchRecord
+        } else {
+            crate::hle::api_cost::Call::DrawRecord
+        })
+    });
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let dispatches = super::capture::on() && signature_dispatches(sig);
@@ -3534,6 +3547,7 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DrawRecord);
     let _c = capture_work(this, || super::capture::WorkKind::Draw { vertices, instances, first_vertex, first_instance }, true);
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
@@ -3553,6 +3567,7 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DrawRecord);
     let _c = capture_work(this, || super::capture::WorkKind::DrawIndexed { indices, instances, first_index, base_vertex, first_instance }, true);
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
@@ -3961,6 +3976,7 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
 
 /// #33 SetComputeRootSignature (PC #29)
 pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     let _c = super::capture::op(this, || Some(super::capture::Op::RootSig { gfx: false, rs: rs as usize }));
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
@@ -3971,16 +3987,19 @@ pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_voi
 
 /// #35 SetComputeRootDescriptorTable (PC #31): the table's console address, 32 bits
 pub(super) unsafe extern "system" fn set_compute_root_table(this: *mut c_void, i: u32, handle: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     put(this, i, 0, &(handle as u32).to_le_bytes());
 }
 
 /// #37 SetComputeRoot32BitConstant (PC #33)
 pub(super) unsafe extern "system" fn set_compute_root_constant(this: *mut c_void, i: u32, value: u32, offset: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     put(this, i, offset, &value.to_le_bytes());
 }
 
 /// #39 SetComputeRoot32BitConstants (PC #35)
 pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     if !data.is_null() {
         let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
         put(this, i, offset, &bytes);
@@ -3990,6 +4009,7 @@ pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_voi
 /// #41 / #43 / #45 SetComputeRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #37 /
 /// #39 / #41): the 64-bit GPU address
 pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     note_address(va);
     put(this, i, 0, &va.to_le_bytes());
 }
@@ -3998,6 +4018,7 @@ pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_vo
 /// draws on the list, a two-pass pipeline is bound in the run, between the mesh passes where it
 /// came, `on_pipeline`; another records the run first)
 pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     let deferring = DEFERRING_LISTS.load(Ordering::Relaxed) != 0 && DEFERRING.contains(this as usize);
     match on_pipeline(deferring, deferring && super::real::two_pass_of(pso as usize).is_some()) {
         OnPipeline::Queue => {
@@ -4064,6 +4085,7 @@ fn note_thread_dimensions(threads: [u32; 3], groups: [u32; 3], shape: [u32; 3]) 
 
 /// `Dispatch` / `DispatchX(x, y, z, flags)`.
 pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DispatchRecord);
     let pso = with(this, |s| s.pso);
     let _c = capture_work(this, || captured_dispatch(pso, [x, y, z], flags), false);
     // (recorded at the submit through this call, with everything below: counted there)
