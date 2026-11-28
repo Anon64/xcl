@@ -86,6 +86,8 @@ thread_local! {
     /// a backlog worker's build: whether it came from `Backlog::compute`; None once another
     /// worker took this one's place (`build_parks`)
     static PRELOAD_STEP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// explicit late-build override for off-pool workers (e.g. `dispatch_chain`'s `xcl-pso-whole`)
+    static JOB_LATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Run `p`'s build `job` on this thread (a worker's, or a bind's that took it): its time and
@@ -120,10 +122,26 @@ pub(super) fn build_is_wanted() -> bool {
 }
 
 /// This thread is a worker building a pipeline a bind waited for and went on without
-/// (`resolve_within`): nobody waits for it now, but the title's draws or dispatches with it are
-/// left out until it is built (`real::huge_compile_turn`).
+/// (`resolve_within`), or a background `xcl-pso-whole` worker (`with_late_build`): nobody waits
+/// for it now, but the title's draws or dispatches with it are left out until it is built
+/// (`real::huge_compile_turn`).
 pub(super) fn build_is_late() -> bool {
-    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.late.load(Ordering::Acquire)))
+    JOB_LATE.with(|l| l.get())
+        || BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.late.load(Ordering::Acquire)))
+}
+
+/// Run `f` with `build_is_late() == true` on the current thread, restoring the previous state on
+/// return or unwind.
+pub(super) fn with_late_build<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            JOB_LATE.with(|l| l.set(self.0));
+        }
+    }
+    let prev = JOB_LATE.with(|l| l.replace(true));
+    let _reset = Reset(prev);
+    f()
 }
 
 /// This thread is a backlog worker building a pipeline nobody has used yet: its huge driver
