@@ -1420,7 +1420,7 @@ enum TwoPassStep {
     Barrier,
 }
 
-/// The steps of a two-pass draw of `commands` commands (one for a DispatchMesh) with `records`,
+/// The steps of a two-pass draw with `commands` indirect commands or direct mesh slices,
 /// after draws that left a mesh pass reading `open` with no barrier since. `Whole` is the order
 /// the draws had before `Halves`: `two_pass_steps`, a barrier after each.
 fn two_pass_plan(commands: u32, records: Records, open: Option<u8>) -> Vec<TwoPassStep> {
@@ -2059,7 +2059,7 @@ unsafe fn defer_dispatch_mesh(this: *mut c_void, tp: &Arc<super::real::TwoPassPs
     }
     let Ok(records) = batch_region(this, region) else { return false };
     super::list_x::ensure_view_heap(this);
-    let (Ok(compute), Ok(mesh)) = (prepare_two_pass_stage(this, pso, tp, records, true), prepare_two_pass_stage(this, pso, tp, records, false)) else { return false };
+    let (Ok(compute), Ok(mesh)) = (prepare_two_pass_stage(this, pso, tp, records, true, 0), prepare_two_pass_stage(this, pso, tp, records, false, 0)) else { return false };
     let work = DeferredWork::Mesh { groups: n, mesh_groups: n * tp.mesh_groups_per_record };
     push_deferred(this, DeferredDraw { snap: DrawSnap { compute, mesh, work }, _tp: tp.clone(), _mesh_pso: held_pso(pso), _block: None, raw_pso, kind: tp.kind, size: dims });
     true
@@ -2087,7 +2087,7 @@ unsafe fn defer_execute_indirect(this: *mut c_void, tp: &Arc<super::real::TwoPas
     }
     let Ok(records) = batch_region(this, region) else { return false };
     super::list_x::ensure_view_heap(this);
-    let (Ok(compute), Ok(mesh)) = (prepare_two_pass_stage(this, pso, tp, records, true), prepare_two_pass_stage(this, pso, tp, records, false)) else { return false };
+    let (Ok(compute), Ok(mesh)) = (prepare_two_pass_stage(this, pso, tp, records, true, 0), prepare_two_pass_stage(this, pso, tp, records, false, 0)) else { return false };
     let Ok((rewrite, block, at)) = prepare_scaled_args(this, src, count, 1, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap, fb_va, fb_slot) else { return false };
     if let Some(d) = &fb_dev {
         if fb_slot != 0 {
@@ -2554,7 +2554,7 @@ unsafe fn bind_two_pass_stage(
 ) -> Result<(), String> {
     // the pair is translated with heap windows when they are on (`pso::mem_windows`): as `bind_abi`
     super::list_x::ensure_view_heap(this);
-    let stage = prepare_two_pass_stage(this, real_mesh_pso, tp, res_va, compute_pass)?;
+    let stage = prepare_two_pass_stage(this, real_mesh_pso, tp, res_va, compute_pass, 0)?;
     emit_two_pass_stage(list, &stage, compute_pass);
     Ok(())
 }
@@ -2589,7 +2589,10 @@ unsafe fn emit_two_pass_stage(list: &ID3D12GraphicsCommandList, stage: &StageBin
 
 /// The binding of a two-pass stage with the title's root arguments as they are now, written to
 /// unified memory (its io block and argument table): nothing is recorded on the list.
-unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &super::real::TwoPassPso, res_va: u64, compute_pass: bool) -> Result<StageBind, String> {
+unsafe fn prepare_two_pass_stage(
+    this: *mut c_void, real_mesh_pso: usize, tp: &super::real::TwoPassPso,
+    res_va: u64, compute_pass: bool, group_base: u32,
+) -> Result<StageBind, String> {
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let first = first_window(super::real::uma_window_va(0), u.shadowed())?;
     let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
@@ -2604,7 +2607,8 @@ unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &s
         .map_or(0, |l| if compute_pass { l.inline_ms } else { l.inline_gfx } as usize)
         .min(args.len());
     let table_at = copy(&args[inline..])?;
-    let io = two_pass_io(layout.as_deref(), &args, table_at as u64, compute_pass, u.base(), heaps);
+    let mut io = two_pass_io(layout.as_deref(), &args, table_at as u64, compute_pass, u.base(), heaps);
+    io[crate::gpu::recomp::IO_MESH_GROUP_BASE] = group_base;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs = if compute_pass { tp.compute_rs } else { tp.mesh_rs };
@@ -2924,21 +2928,52 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             if n == 0 {
                 return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
             }
-            if n < groups {
+            // Slice ordinary mesh draws that would fit a full-sized record buffer. The
+            // compute shader gets the original group ID while each slice reuses record 0.
+            let draw_groups = if tp.kind == "MS" && groups <= record_groups(RECORD_MAX, record_bytes, tp.mesh_groups_per_record) {
+                groups
+            } else {
+                n
+            };
+            let slices = draw_groups.div_ceil(n);
+            let staged = if slices > 1 {
+                // A half-buffer layout is selected only when the requested group count fits.
+                debug_assert_eq!(records, Records::Whole);
+                super::list_x::ensure_view_heap(this);
+                let mesh = prepare_two_pass_stage(this, pso, &tp, res_va, false, 0)?;
+                let compute = (0..slices)
+                    .map(|slice| prepare_two_pass_stage(this, pso, &tp, res_va, true, slice * n))
+                    .collect::<Result<Vec<_>, _>>()?;
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::xlog_info!("D3D12.X: two-pass DispatchMesh of {groups} groups in {slices} slices ({n} groups fit the record buffer)");
+                }
+                Some((mesh, compute))
+            } else {
+                None
+            };
+            if draw_groups < groups {
                 note_two_pass(TP_DIRECT_CUT);
-                note_two_pass_add(TP_DIRECT_GROUPS_DROPPED, (groups - n) as u64);
+                note_two_pass_add(TP_DIRECT_GROUPS_DROPPED, (groups - draw_groups) as u64);
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 8 {
-                    crate::xlog_warn!("D3D12.X: two-pass DispatchMesh of {groups} groups: {} past the record buffer dropped", groups - n);
+                    crate::xlog_warn!("D3D12.X: two-pass DispatchMesh of {groups} groups: {} past the record buffer dropped", groups - draw_groups);
                 }
             }
-            let plan = two_pass_plan(1, records, with(this, |s| s.record_open));
-            run_two_pass_plan(this, list, &plan, &res_buf, res_va, cap, |_, compute, va| {
-                bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
-                if compute {
-                    list.Dispatch(n, 1, 1);
+            let plan = two_pass_plan(slices, records, with(this, |s| s.record_open));
+            run_two_pass_plan(this, list, &plan, &res_buf, res_va, cap, |slice, compute, va| {
+                let first = slice * n;
+                let count = n.min(draw_groups - first);
+                if let Some((mesh, stages)) = &staged {
+                    let stage = if compute { &stages[slice as usize] } else { mesh };
+                    emit_two_pass_stage(list, stage, compute);
                 } else {
-                    pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
+                    bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
+                }
+                if compute {
+                    list.Dispatch(count, 1, 1);
+                } else {
+                    pc_dm(this, count * tp.mesh_groups_per_record, 1, 1);
                 }
                 Ok(())
             })
