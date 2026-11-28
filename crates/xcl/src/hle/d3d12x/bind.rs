@@ -323,17 +323,28 @@ fn draw_two_pass_ceiling(cap: u64, local_budget: u64) -> u64 {
 /// `draw_two_pass_ceiling` (an `XCL_TWO_PASS_MB` cap is kept as it is), else the error that skips
 /// the draw.
 unsafe fn make_two_pass_past_cap(dev: &ID3D12Device, bytes: u64, what: &str, cap: u64) -> Result<TwoPassBuf, String> {
+    make_two_pass_past_cap_with(bytes, what, cap, |ceiling| TwoPassBuf::try_make_with_cap(dev, bytes, what, ceiling))
+}
+
+/// `make_two_pass_past_cap` with the attempt at the ceiling given as `make`: the record buffer
+/// walks its smaller buckets there too, as it does under the headroom cap.
+unsafe fn make_two_pass_past_cap_with(
+    bytes: u64,
+    what: &str,
+    cap: u64,
+    make: impl FnOnce(u64) -> Result<Option<TwoPassBuf>, String>,
+) -> Result<TwoPassBuf, String> {
     let ceiling = match env_two_pass_cap() {
         Some(_) => cap,
         None => draw_two_pass_ceiling(cap, super::real::video_memory().map_or(0, |(_, _, budget)| budget)),
     };
     if ceiling > cap {
-        if let Some(b) = TwoPassBuf::try_make_with_cap(dev, bytes, what, ceiling)? {
+        if let Some(b) = make(ceiling)? {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 8 {
                 crate::xlog_info!(
                     "D3D12.X: a {what} of {} KiB goes past the {} MiB headroom cap of the two-pass buffers (up to {} MiB) instead of skipping its draw",
-                    bytes >> 10,
+                    b.bytes >> 10,
                     cap >> 20,
                     ceiling >> 20
                 );
@@ -2626,7 +2637,9 @@ unsafe fn ensure_res_buffer_with_cap(this: *mut c_void, need_bytes: u64, min_fit
                     return Ok((buf, va, cur_cap));
                 }
             }
-            make_two_pass_past_cap(&dev, need, "two-pass res buffer", budget_cap)?
+            make_two_pass_past_cap_with(need, "two-pass res buffer", budget_cap, |ceiling| {
+                acquire_res_buf_with_cap(&dev, need, min_fit_bytes, existing_cap, ceiling, std::time::Duration::ZERO)
+            })?
         }
     };
     Ok(install_res_buffer(this, entry))
@@ -7603,6 +7616,27 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
         assert!(unsafe { TwoPassBuf::try_make_with_cap(&dev, RECORD_MIN, "full cap", cap) }.unwrap().is_none(), "the headroom cap is full");
         let buf = unsafe { make_two_pass_past_cap(&dev, RECORD_MIN, "argument scratch", cap) }.expect("made past the headroom cap");
         assert_eq!(buf.bytes, RECORD_MIN);
+    }
+
+    #[test]
+    fn a_record_buffer_past_the_headroom_cap_shrinks_to_what_fits_under_the_ceiling() {
+        let _warp_guard = lock_warp_tests();
+        if env_two_pass_cap().is_some() {
+            return println!("SKIPPED a_record_buffer_past_the_headroom_cap_shrinks_to_what_fits_under_the_ceiling: XCL_TWO_PASS_MB is set");
+        }
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let alive = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed);
+        // room for 48 MiB under the ceiling, not for the 64 MiB the draw prefers
+        let room = alive + (56 << 20);
+        let buf = unsafe {
+            make_two_pass_past_cap_with(64 << 20, "two-pass res buffer", alive, |ceiling| {
+                acquire_res_buf_with_cap(&dev, 64 << 20, RECORD_MIN, 0, ceiling.min(room), std::time::Duration::ZERO)
+            })
+        }
+        .expect("a smaller bucket fits under the ceiling");
+        assert_eq!(buf.bytes, 48 << 20);
     }
 
     #[test]
